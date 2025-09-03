@@ -1,0 +1,59 @@
+# TOPAS v2 - Full CUDA ML Requirements
+# ARC Prize Neurosymbolic Solver with CUDA Support
+# Python 3.12 Compatible
+
+# Core PyTorch with CUDA (install with --index-url https://download.pytorch.org/whl/cu121)
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+
+# Essential ML/DL Libraries
+numpy>=1.26.0
+scipy>=1.16.0
+scikit-learn>=1.7.0
+pandas>=2.3.0
+matplotlib>=3.9.0
+pillow>=10.0.0
+tqdm>=4.65.0
+
+# Deep Learning Extensions
+einops>=0.8.0  # Tensor operations
+accelerate>=1.10.0  # Distributed training
+transformers>=4.56.0  # Pre-trained models
+
+# Experiment Tracking
+tensorboard>=2.20.0
+wandb>=0.21.0
+
+# ARC-Specific Dependencies
+imageio>=2.31.0  # For image I/O
+scikit-image>=0.24.0  # Image processing
+networkx>=3.3  # Graph operations
+
+# Optimization Libraries
+optuna>=4.2.0  # Hyperparameter optimization
+ray[tune]>=2.48.0  # Distributed hyperparameter tuning
+
+# Additional Utilities
+pyyaml>=6.0
+jsonlines>=4.0.0
+h5py>=3.9.0  # HDF5 file support
+msgpack>=1.0.0  # Fast serialization
+
+# Testing & Development
+pytest>=8.0.0
+pytest-cov>=6.0.0
+black>=24.0.0
+flake8>=7.0.0
+mypy>=1.13.0
+
+# CUDA Installation:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Full Installation:
+# python -m venv venv_cuda
+# source venv_cuda/bin/activate  # Linux/Mac
+# venv_cuda\Scripts\activate  # Windows
+# pip install --upgrade pip setuptools wheel
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# pip install -r requirements.txt
