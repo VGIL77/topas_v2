@@ -10,6 +10,7 @@ def run(config, state):
     from models.dsl_search import beam_search
     from trainers.augmentation.deep_program_discoverer import mine_deep_programs
     from relational_memory_neuro import RelationalMemoryNeuro
+    from validation.eval_runner import EvalRunner
     import torch
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
@@ -180,6 +181,25 @@ def run(config, state):
                 relmem.apply_post_optimizer_hooks()
             
             global_step += 1
+            
+            # === Evaluate every N search steps ===
+            if step % config.get("eval_interval_steps", 50) == 0 and step > 0:
+                try:
+                    print(f"[Phase 4] Running MCTS evaluation at step {step}...")
+                    eval_runner = EvalRunner(model=model, device=device)
+                    metrics = eval_runner.run(
+                        "ARC/arc-agi_evaluation_challenges.json", 
+                        "ARC/arc-agi_evaluation_solutions.json"
+                    )
+                    logger.log_batch(step, {
+                        "eval_mcts_exact1": metrics.get("exact@1", 0.0),
+                        "eval_mcts_exact_k": metrics.get("exact@k", 0.0), 
+                        "eval_mcts_iou": metrics.get("iou", 0.0),
+                        "phase": "4_mcts_eval"
+                    })
+                    print(f"[Phase 4] MCTS Eval - Exact@1: {metrics.get('exact@1', 0.0):.2%}, IoU: {metrics.get('iou', 0.0):.3f}")
+                except Exception as e:
+                    print(f"[Phase 4] Evaluation error at step {step}: {e}")
             
             # Logging
             if step % config.get("log_interval", 20) == 0:

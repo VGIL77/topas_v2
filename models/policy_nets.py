@@ -201,6 +201,9 @@ class OpPolicyNet(nn.Module):
     
     def __init__(self, input_dim: int = 1024, hidden_dim: int = 512, 
                  num_layers: int = 6, num_heads: int = 8, dropout: float = 0.1):
+        # Ensure hidden_dim is divisible by num_heads
+        if hidden_dim % num_heads != 0:
+            hidden_dim = ((hidden_dim + num_heads - 1) // num_heads) * num_heads
         super().__init__()
         
         self.input_dim = input_dim

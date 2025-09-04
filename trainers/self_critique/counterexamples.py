@@ -45,9 +45,29 @@ class CounterexampleGenerator:
             'symmetry_break': self._break_symmetry
         }
         
-    def generate_from_failure(self, failed_task: Task, model, n_counterexamples: int = 8) -> List[Counterexample]:
-        """Generate counterexamples from a failed task attempt"""
+    def generate_from_failure(self, failed_task: Task, model, n_counterexamples: int = 8, 
+                             planner_state: Optional[Dict] = None) -> List[Counterexample]:
+        """Generate counterexamples from a failed task attempt with planner awareness"""
         counterexamples = []
+        
+        # ✅ NEW: Planner-aware failure analysis
+        if planner_state is not None:
+            # Check if planner halted too early or too late
+            q_halt = planner_state.get("q_halt_logits")
+            if q_halt is not None:
+                halt_confidence = float(torch.sigmoid(q_halt).mean().item())
+                
+                # Generate counterexamples for premature halting
+                if halt_confidence > 0.8:  # High halt confidence but task failed
+                    counter = self._generate_deeper_search_counter(failed_task, "planner_halt_early")
+                    if counter:
+                        counterexamples.append(counter)
+                
+                # Generate counterexamples for indecisive halting  
+                elif 0.3 < halt_confidence < 0.7:  # Uncertain halting
+                    counter = self._generate_uncertainty_counter(failed_task, "planner_uncertain")
+                    if counter:
+                        counterexamples.append(counter)
         
         # Test permutation invariance
         if self._has_color_symmetry(failed_task):
@@ -399,6 +419,79 @@ class CounterexampleGenerator:
             )
         except Exception:
             return None
+
+    # ✅ NEW: Planner-aware counterexample generators
+    def _generate_deeper_search_counter(self, task: Task, failure_type: str) -> Optional[Counterexample]:
+        """Generate counterexample that should force deeper search when planner halts early"""
+        try:
+            # Create a slightly more complex variant that requires deeper reasoning
+            complex_task = self._add_complexity(task)
+            return Counterexample(
+                task=complex_task,
+                perturbation_type=failure_type,
+                perturbation_strength=1.2,
+                expected_behavior='should require deeper search despite planner halt signal',
+                should_succeed=True
+            )
+        except Exception:
+            return None
+    
+    def _generate_uncertainty_counter(self, task: Task, failure_type: str) -> Optional[Counterexample]:
+        """Generate counterexample for cases where planner is uncertain about halting"""
+        try:
+            # Create a cleaner version that should give planner more confidence
+            cleaner_task = self._simplify_input(task)
+            return Counterexample(
+                task=cleaner_task,
+                perturbation_type=failure_type,
+                perturbation_strength=0.8,
+                expected_behavior='should increase planner confidence and reduce uncertainty',
+                should_succeed=True
+            )
+        except Exception:
+            return None
+
+    def _add_complexity(self, task: Task) -> Task:
+        """Add minimal complexity to force deeper reasoning"""
+        complex_input = task.input.clone()
+        # Add one more object or pattern element
+        if complex_input.max() < 9:
+            # Add a new color in corner
+            complex_input[0, 0] = complex_input.max() + 1
+        return Task(
+            input=complex_input,
+            output=task.output.clone(),
+            constraints=task.constraints,
+            metadata={**task.metadata, 'complexity_added': True}
+        )
+    
+    def _simplify_input(self, task: Task) -> Task:
+        """Simplify input to reduce planner uncertainty"""
+        simple_input = task.input.clone()
+        # Reduce noise by making sparse areas more structured
+        mask = simple_input == 0
+        if mask.sum() > simple_input.numel() * 0.5:  # If more than 50% background
+            # Fill small isolated background pixels
+            simple_input = self._fill_isolated_pixels(simple_input)
+        return Task(
+            input=simple_input,
+            output=task.output.clone(),
+            constraints=task.constraints,
+            metadata={**task.metadata, 'simplified': True}
+        )
+
+    def _fill_isolated_pixels(self, grid: torch.Tensor) -> torch.Tensor:
+        """Fill isolated background pixels with neighboring colors"""
+        filled = grid.clone()
+        H, W = grid.shape
+        for i in range(1, H-1):
+            for j in range(1, W-1):
+                if grid[i, j] == 0:  # Background pixel
+                    neighbors = grid[i-1:i+2, j-1:j+2]
+                    non_zero = neighbors[neighbors != 0]
+                    if len(non_zero) >= 6:  # Mostly surrounded
+                        filled[i, j] = non_zero[0].item()
+        return filled
 
     def analyze_counterexample_results(self, counterexamples: List[Counterexample], model_results: List[bool]) -> Dict:
         """Analyze what types of counterexamples the model fails on"""

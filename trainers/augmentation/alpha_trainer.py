@@ -5,7 +5,8 @@ Lightweight Alpha self-play generator for Phase 1 augmentation
 import torch
 import random
 from typing import List, Dict, Any
-from models.dsl_search import DSLProgram, apply_program, CORE_OPS
+from models.dsl_search import DSLProgram, apply_program
+from models.dsl_registry import DSL_OPS
 
 def generate_self_play_traces(task: Dict[str, Any], n_games: int = 2, depth: int = 4) -> List[Dict[str, Any]]:
     """
@@ -37,7 +38,7 @@ def generate_self_play_traces(task: Dict[str, Any], n_games: int = 2, depth: int
             
             for step in range(depth):
                 # Random operation selection
-                op = random.choice(CORE_OPS[:8])  # Use basic ops only
+                op = random.choice(DSL_OPS[:8])  # Use basic ops only
                 ops.append(op)
                 
                 # Generate random parameters based on operation

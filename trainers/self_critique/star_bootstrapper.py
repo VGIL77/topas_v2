@@ -52,8 +52,8 @@ class STaRBootstrapper:
         
         self.logger = logging.getLogger(__name__)
         
-    def generate_diverse_traces(self, task, n_traces: int = 16) -> List[Trace]:
-        """Generate N diverse solution attempts for a task"""
+    def generate_diverse_traces(self, task, n_traces: int = 16, planner_op_bias: Optional[Dict] = None) -> List[Trace]:
+        """Generate N diverse solution attempts for a task with optional planner guidance"""
         
         traces = []
         temperatures = np.linspace(self.temperature_range[0], self.temperature_range[1], n_traces)
@@ -65,8 +65,12 @@ class STaRBootstrapper:
         for i in range(n_traces):
             temp = temperatures[i]
             
+            # ✅ NEW: Use planner op_bias as prior for some traces
+            use_planner_bias = planner_op_bias is not None and i < n_traces // 2  # Use bias for first half
+            current_op_bias = planner_op_bias if use_planner_bias else None
+            
             # Generate trace with varied sampling
-            trace = self._generate_single_trace(task, temperature=temp, attempt_id=i)
+            trace = self._generate_single_trace(task, temperature=temp, attempt_id=i, op_bias=current_op_bias)
             
             if trace:
                 # Check for diversity
@@ -77,6 +81,11 @@ class STaRBootstrapper:
                 if prog_hash not in program_hashes or ops_hash not in operation_sequences:
                     trace.confidence += self.diversity_weight * (1.0 - len(program_hashes) / n_traces)
                 
+                # ✅ NEW: Add planner alignment bonus
+                if use_planner_bias and current_op_bias:
+                    alignment_bonus = self._compute_planner_alignment(trace.operations, current_op_bias)
+                    trace.confidence += 0.1 * alignment_bonus
+                
                 program_hashes.add(prog_hash)
                 operation_sequences.add(ops_hash)
                 traces.append(trace)
@@ -85,10 +94,12 @@ class STaRBootstrapper:
         traces = self._rank_traces_by_quality(traces, task)
         
         self.logger.info(f"Generated {len(traces)} traces with diversity {len(program_hashes)/max(1,len(traces)):.3f}")
+        if planner_op_bias:
+            self.logger.info(f"Used planner op_bias for {n_traces//2} traces")
         
         return traces
     
-    def _generate_single_trace(self, task, temperature: float = 0.8, attempt_id: int = 0) -> Optional[Trace]:
+    def _generate_single_trace(self, task, temperature: float = 0.8, attempt_id: int = 0, op_bias: Optional[Dict] = None) -> Optional[Trace]:
         """Generate a single trace with specified temperature"""
         
         try:
@@ -485,3 +496,25 @@ class STaRBootstrapper:
         metrics['confidence_spread'] = np.std(confidences) if confidences else 0.0
         
         return metrics
+    
+    def _compute_planner_alignment(self, operations: List[str], op_bias: Dict[str, float]) -> float:
+        """Compute alignment between trace operations and planner op_bias"""
+        
+        if not operations or not op_bias:
+            return 0.0
+        
+        alignment_score = 0.0
+        total_weight = 0.0
+        
+        # Check how well trace operations align with planner preferences
+        for op in operations:
+            if op in op_bias:
+                # Higher bias = higher alignment when operation is used
+                alignment_score += op_bias[op]
+                total_weight += 1.0
+            else:
+                # Penalize operations not in planner bias
+                alignment_score += 0.1
+                total_weight += 1.0
+        
+        return alignment_score / max(total_weight, 1.0)

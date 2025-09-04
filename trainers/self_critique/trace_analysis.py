@@ -49,6 +49,16 @@ class TraceFeatures:
     pattern_complexity: float
     logical_consistency: float
     
+    # ✅ NEW: Planner features
+    planner_halt_confidence: float = 0.0
+    planner_entropy: float = 0.0
+    planner_alignment: float = 0.0
+    
+    # ✅ NEW: RelMem features  
+    relmem_inherit_loss: float = 0.0
+    relmem_inverse_loss: float = 0.0
+    relmem_concept_count: int = 0
+    
 @dataclass
 class PatternCluster:
     """Cluster of similar successful patterns"""
@@ -99,7 +109,7 @@ class TraceAnalyzer:
         
         self.logger = logging.getLogger(__name__)
         
-    def analyze_trace(self, trace, task=None) -> TraceFeatures:
+    def analyze_trace(self, trace, task=None, planner_metrics=None, relmem_metrics=None) -> TraceFeatures:
         """Extract comprehensive features from a trace"""
         
         features = TraceFeatures(
@@ -131,7 +141,17 @@ class TraceAnalyzer:
             # Success predictors
             grid_coverage=self._compute_grid_coverage(trace),
             pattern_complexity=self._compute_pattern_complexity(trace),
-            logical_consistency=self._compute_logical_consistency(trace)
+            logical_consistency=self._compute_logical_consistency(trace),
+            
+            # ✅ NEW: Planner features
+            planner_halt_confidence=planner_metrics.get('q_halt_mean', 0.0) if planner_metrics else 0.0,
+            planner_entropy=planner_metrics.get('entropy', 0.0) if planner_metrics else 0.0,
+            planner_alignment=self._compute_planner_trace_alignment(trace, planner_metrics),
+            
+            # ✅ NEW: RelMem features
+            relmem_inherit_loss=relmem_metrics.get('inherit', 0.0) if relmem_metrics else 0.0,
+            relmem_inverse_loss=relmem_metrics.get('inverse', 0.0) if relmem_metrics else 0.0,
+            relmem_concept_count=self._estimate_concept_count(trace, relmem_metrics)
         )
         
         return features
@@ -934,3 +954,46 @@ class TraceAnalyzer:
             'structural': ['extract', 'overlay', 'connect', 'separate'],
             'pattern': ['repeat', 'tile', 'extend', 'shrink']
         }
+    
+    # ✅ NEW: Helper methods for planner and RelMem features
+    def _compute_planner_trace_alignment(self, trace, planner_metrics) -> float:
+        """Compute how well trace aligns with planner expectations"""
+        
+        if not planner_metrics or not hasattr(trace, 'operations'):
+            return 0.0
+        
+        # Simple heuristic: higher entropy = more uncertainty = lower alignment
+        entropy = planner_metrics.get('entropy', 0.0)
+        halt_confidence = planner_metrics.get('q_halt_mean', 0.5)
+        
+        # High halt confidence + low entropy = good alignment
+        if halt_confidence > 0.7 and entropy < 0.5:
+            return 0.9
+        elif halt_confidence < 0.3 or entropy > 1.0:
+            return 0.1
+        else:
+            # Interpolate based on confidence and entropy
+            conf_score = halt_confidence
+            entropy_score = max(0, 1 - entropy)
+            return (conf_score + entropy_score) / 2
+    
+    def _estimate_concept_count(self, trace, relmem_metrics) -> int:
+        """Estimate number of relational concepts used in trace"""
+        
+        if not relmem_metrics:
+            return 0
+            
+        # Heuristic: lower inherit/inverse losses suggest more stable concepts
+        inherit_loss = relmem_metrics.get('inherit', 1.0)
+        inverse_loss = relmem_metrics.get('inverse', 1.0)
+        
+        # More stable relations = more concepts being used effectively
+        stability = max(0, 2 - inherit_loss - inverse_loss)
+        
+        # Estimate concept count based on trace complexity and stability
+        if hasattr(trace, 'operations') and trace.operations:
+            base_concepts = len(set(trace.operations))  # Unique operations
+            concept_multiplier = min(3.0, 1 + stability)  # Stability boost
+            return int(base_concepts * concept_multiplier)
+        
+        return max(1, int(stability * 2))  # Minimum fallback

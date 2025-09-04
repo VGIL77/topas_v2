@@ -34,52 +34,27 @@ from models.utils import (
     compute_eval_metrics
 )
 
-# EBR and constraints - from parent directory
+# Required imports - no fallbacks, fail hard on missing components
 sys.path.insert(0, parent_dir)
-try:
-    from energy_refinement import EnergyRefiner
-    from arc_constraints import ARCGridConstraints
-    from dream_engine import DreamEngine, DreamConfig
-    from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, neuro_hodge_penalty
-    from schedulers.ucb_scheduler import EnhancedUCBTaskScheduler
-    from relational_memory_neuro import RelationalMemoryNeuro
-    _HAS_ALL_COMPONENTS = True
-except ImportError as e:
-    print(f"Import warning: {e}")
-    _HAS_ALL_COMPONENTS = False
-    # Minimal fallbacks with proper signatures
-    class EnergyRefiner:
-        def __init__(self, *args, **kwargs): pass
-        def __call__(self, *args, **kwargs): return args[0] if args else None
-    
-    class ARCGridConstraints:
-        def __init__(self, *args, **kwargs): pass
-    
-    class DreamConfig:
-        def __init__(self, *args, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-    
-    class DreamEngine:
-        def __init__(self, *args, **kwargs): pass
-        def attach_relmem(self, *args): pass
-    
-    class EnhancedUCBTaskScheduler:
-        def __init__(self, *args, **kwargs): pass
-        def update_task_stats(self, *args, **kwargs): pass
-        def select_task(self, *args, **kwargs): return None
-    
-    class RelationalMemoryNeuro:
-        def __init__(self, *args, **kwargs): 
-            self.N = 2048
-            self.D = 512
-            self.relations = ["translate", "flip_h", "color_map"]
-        def __call__(self, *args, **kwargs): return args[0], None
-        def apply_hebbian(self): pass
-        def apply_wta(self): pass
-        def inverse_loss(self): return torch.tensor(0.0)
 
-# DSL head is always available
+# Core components
+from energy_refinement import EnergyRefiner
+from trainers.arc_constraints import ARCGridConstraints
+from dream_engine import DreamEngine, DreamConfig
+from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, neuro_hodge_penalty
+from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler
+from relational_memory_neuro import RelationalMemoryNeuro
+from models.dsl_registry import DSL_OPS
+
+# HRM Planner imports - no fallbacks
+hrm_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../docs/HRM-main'))
+if hrm_path not in sys.path:
+    sys.path.append(hrm_path)
+from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+from models.losses import ACTLossHead
+
+_HAS_HRM_PLANNER = True
+_HAS_ALL_COMPONENTS = True
 _HAS_SIMPLE_DSL = True
 
 NUM_COLORS = 10
@@ -372,6 +347,7 @@ class ModelConfig:
     # Search
     max_dsl_depth: int = 6
     max_beam_width: int = 12
+    dsl_vocab_size: int = 41  # Number of DSL operations
     
     # Refinement
     use_ebr: bool = True
@@ -524,7 +500,7 @@ class TopasARC60M(nn.Module):
         self.scheduler = None
         if self.config.use_scheduler:
             try:
-                from schedulers.ucb_scheduler import EnhancedUCBTaskScheduler, SchedulerConfig
+                from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler, SchedulerConfig
                 # Initialize with config object
                 sched_config = SchedulerConfig(
                     empowerment_weight=0.05,
@@ -545,6 +521,45 @@ class TopasARC60M(nn.Module):
         # Task tracking for scheduler
         self.task_history = {}  # task_id -> performance history
         self.strategy_usage = {}  # strategy -> usage count
+        
+        # === HRM Planner Rail ===
+        hrm_cfg = dict(
+            batch_size=1,
+            seq_len=30*30,          # Flattened ARC grid
+            vocab_size=10,          # ARC colors
+            num_puzzle_identifiers=1000,  # Map ARC task ids → puzzle ids
+            puzzle_emb_ndim=128,
+            H_cycles=3, L_cycles=4,
+            H_layers=4, L_layers=4,
+            hidden_size=512,
+            expansion=3.0,
+            num_heads=8,
+            pos_encodings="rope",
+            halt_max_steps=6,
+            halt_exploration_prob=0.1,
+            forward_dtype="bfloat16"
+        )
+        if _HAS_HRM_PLANNER:
+            try:
+                self.planner = HierarchicalReasoningModel_ACTV1(hrm_cfg)
+                self.planner_loss_head = ACTLossHead(self.planner, loss_type="softmax_cross_entropy")
+                # Projection from planner latent → DSL op bias
+                self.planner_op_bias = nn.Linear(hrm_cfg["hidden_size"], len(DSL_OPS))
+                self._has_planner = True
+                if self.config.verbose:
+                    print(f"[TOPAS] HRM Planner initialized: {len(DSL_OPS)} operations")
+            except Exception as e:
+                if self.config.verbose:
+                    print(f"[TOPAS] Warning: HRM Planner initialization failed: {e}")
+                self.planner = None
+                self.planner_loss_head = None
+                self.planner_op_bias = None
+                self._has_planner = False
+        else:
+            self.planner = None
+            self.planner_loss_head = None
+            self.planner_op_bias = None
+            self._has_planner = False
         
         # Pretraining support
         self._pretraining_mode = self.config.pretraining_mode
@@ -596,6 +611,13 @@ class TopasARC60M(nn.Module):
         except Exception:
             # Any other error, fall back to CPU
             return "cpu"
+
+    def grid_to_tokens(self, grid: torch.LongTensor) -> torch.LongTensor:
+        """
+        Flatten grid into token sequence of color ids [0..9].
+        Input: [B,H,W]  →  Output: [B,H*W]
+        """
+        return grid.view(grid.size(0), -1).clamp(0, 9)
     
     @property
     def device(self) -> str:
@@ -715,7 +737,14 @@ class TopasARC60M(nn.Module):
                 # Infer relations from demo and add to relman (registry-guarded)
                 from models.dsl_registry import DSL_OPS
                 inferred = self._infer_relations_from_demo(din, dout)
-                for rel, params in inferred:
+                for item in inferred:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        rel, params = item
+                    elif isinstance(item, str):
+                        rel, params = item, {}
+                    else:
+                        print(f"[WARN] Invalid relation format: {item}")
+                        continue
                     if rel in DSL_OPS:
                         self.relman.add(src, rel, dst, w=0.6, params=params)
                         print(f"[RELATIONS] Added {rel} from {src[:8]} -> {dst[:8]} (w=0.6)")
@@ -883,6 +912,54 @@ class TopasARC60M(nn.Module):
             rail_path.append("DSL")
             retry_count += 1
             
+            # === HRM Planner step ===
+            if self._has_planner and self.planner is not None:
+                try:
+                    tokens = self.grid_to_tokens(test_grid)  # [B, seq_len]
+                    puzzle_ids = torch.zeros(tokens.size(0), dtype=torch.long, device=tokens.device)  # TODO: map ARC task_id
+                    planner_batch = {"inputs": tokens, "labels": tokens, "puzzle_identifiers": puzzle_ids}
+
+                    carry = self.planner.initial_carry(planner_batch)
+                    carry, outputs = self.planner(carry=carry, batch=planner_batch)
+
+                    q_halt = outputs.get("q_halt_logits")
+                    q_continue = outputs.get("q_continue_logits")
+
+                    halted = (q_halt > q_continue) if q_halt is not None and q_continue is not None else torch.tensor(False)
+
+                    # Adjust search budget dynamically
+                    if halted.any():
+                        depth = min(depth, 3)  # Reduce search depth
+                        beam_w = min(beam_w, 8)  # Reduce beam width
+                        if self.config.verbose:
+                            print(f"[HRM] Planner halted early, reducing search: depth={depth}, beam={beam_w}")
+                    else:
+                        # Keep original depth/beam from config
+                        pass
+
+                    # Planner latent → op bias for DSL
+                    planner_op_bias = {}
+                    if "z_H" in outputs and self.planner_op_bias is not None:
+                        z_H = outputs["z_H"]
+                        op_bias_logits = F.softmax(self.planner_op_bias(z_H), dim=-1)
+                        # Convert to dict mapping DSL_OPS to bias values
+                        for i, op in enumerate(DSL_OPS):
+                            if i < op_bias_logits.size(-1):
+                                planner_op_bias[op] = float(op_bias_logits[0, i].item())
+                        if self.config.verbose and planner_op_bias:
+                            top_ops = sorted(planner_op_bias.items(), key=lambda x: x[1], reverse=True)[:3]
+                            print(f"[HRM] Top planner op bias: {top_ops}")
+                    
+                    beam_depth_used = depth  # Update tracking variables
+                    beam_width_used = beam_w
+
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"[HRM] Planner step failed: {e}, continuing without planner guidance")
+                    planner_op_bias = {}
+            else:
+                planner_op_bias = {}
+            
             # Get detected operation bias from relation manager
             from models.dsl_registry import DSL_OPS
             op_bias = self.relman.op_bias()
@@ -901,6 +978,11 @@ class TopasARC60M(nn.Module):
                 # Combine by max (conservative): never reduce existing bias
                 for k, v in rel_bias.items():
                     op_bias[k] = max(op_bias.get(k, 0.0), v)
+            
+            # Combine planner op_bias with existing bias (additive)
+            for k, v in planner_op_bias.items():
+                op_bias[k] = op_bias.get(k, 0.0) + v * 0.5  # Scale planner bias to 50%
+            
             # Filter op_bias to only include valid registry ops
             op_bias = {k: v for k, v in op_bias.items() if k in DSL_OPS}
             print(f"[RAIL-DSL] Starting DSL search: depth={depth}, beam={beam_w}")
@@ -1709,7 +1791,7 @@ class TopasARC60M(nn.Module):
                     return x.softmax(dim=1).argmax(dim=1)
                 @staticmethod
                 def backward(ctx, grad_output):
-                    return grad_output.unsqueeze(1).expand_as(logits)
+                    return grad_output.unsqueeze(1).expand_as(refined_logits)
             
             grid_refined = ArgmaxSTE.apply(refined_logits)
             grid_refined = torch.clamp(grid_refined, 0, NUM_COLORS-1)
@@ -2029,7 +2111,7 @@ class TopasARC60M(nn.Module):
         
         try:
             # Create constraint object
-            from arc_constraints import ARCGridConstraints
+            from trainers.arc_constraints import ARCGridConstraints
             constraint_obj = ARCGridConstraints()
             
             # Prepare prior tensors

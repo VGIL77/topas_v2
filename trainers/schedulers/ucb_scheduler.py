@@ -12,10 +12,7 @@ import math
 from dataclasses import dataclass, asdict
 
 # Import sophisticated difficulty estimator
-try:
-    from schedulers.difficulty_estimator import DifficultyEstimator
-except ImportError:
-    from difficulty_estimator import DifficultyEstimator
+from trainers.schedulers.difficulty_estimator import DifficultyEstimator
 
 logger = logging.getLogger(__name__)
 

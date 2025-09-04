@@ -61,8 +61,8 @@ class ConsistencyEnforcer:
         
         self.logger = logging.getLogger(__name__)
         
-    def compute_consistency_loss(self, trace1, trace2) -> Tuple[torch.Tensor, ConsistencyMetrics]:
-        """Compute consistency loss between two valid traces"""
+    def compute_consistency_loss(self, trace1, trace2, relmem_vectors1=None, relmem_vectors2=None) -> Tuple[torch.Tensor, ConsistencyMetrics]:
+        """Compute consistency loss between two valid traces with RelMem awareness"""
         
         # Grid consistency
         grid_loss, grid_consistency = self._compute_grid_consistency(trace1, trace2)
@@ -76,20 +76,34 @@ class ConsistencyEnforcer:
         # Reasoning consistency
         reason_loss, reason_consistency = self._compute_reasoning_consistency(trace1, trace2)
         
+        # ✅ NEW: RelMem consistency (relational structure should be similar for equivalent traces)
+        relmem_loss, relmem_consistency = self._compute_relmem_consistency(relmem_vectors1, relmem_vectors2)
+        
+        # Updated weights to include RelMem
+        weights = {
+            'grid': 0.35,
+            'probability': 0.15, 
+            'operation': 0.2,
+            'reasoning': 0.15,
+            'relmem': 0.15  # New weight for relational consistency
+        }
+        
         # Weighted total loss
         total_loss = (
-            self.weights['grid'] * grid_loss +
-            self.weights['probability'] * prob_loss +
-            self.weights['operation'] * op_loss +
-            self.weights['reasoning'] * reason_loss
+            weights['grid'] * grid_loss +
+            weights['probability'] * prob_loss +
+            weights['operation'] * op_loss +
+            weights['reasoning'] * reason_loss +
+            weights['relmem'] * relmem_loss
         )
         
         # Overall consistency score
         overall_consistency = (
-            self.weights['grid'] * grid_consistency +
-            self.weights['probability'] * prob_consistency +
-            self.weights['operation'] * op_consistency +
-            self.weights['reasoning'] * reason_consistency
+            weights['grid'] * grid_consistency +
+            weights['probability'] * prob_consistency +
+            weights['operation'] * op_consistency +
+            weights['reasoning'] * reason_consistency +
+            weights['relmem'] * relmem_consistency
         )
         
         # Identify inconsistency sources
@@ -102,7 +116,10 @@ class ConsistencyEnforcer:
             inconsistency_sources.append('operation_difference')
         if reason_consistency < self.tolerances['reasoning_semantic']:
             inconsistency_sources.append('reasoning_mismatch')
+        if relmem_consistency < 0.8:  # RelMem consistency threshold
+            inconsistency_sources.append('relational_mismatch')
         
+        # Extended metrics with RelMem
         metrics = ConsistencyMetrics(
             grid_consistency=grid_consistency,
             probability_consistency=prob_consistency,
@@ -111,6 +128,9 @@ class ConsistencyEnforcer:
             overall_consistency=overall_consistency,
             inconsistency_sources=inconsistency_sources
         )
+        
+        # Add RelMem consistency to metrics (extend dataclass dynamically)
+        metrics.relmem_consistency = relmem_consistency
         
         return total_loss, metrics
     
@@ -227,6 +247,44 @@ class ConsistencyEnforcer:
         loss = torch.tensor(1.0 - overall_consistency, requires_grad=True)
         
         return loss, overall_consistency
+    
+    def _compute_relmem_consistency(self, relmem_vectors1, relmem_vectors2) -> Tuple[torch.Tensor, float]:
+        """Compute RelMem consistency - similar tasks should have similar relational structure"""
+        
+        if relmem_vectors1 is None or relmem_vectors2 is None:
+            return torch.tensor(0.0, requires_grad=True), 1.0
+        
+        try:
+            # Convert to tensors if needed
+            if not isinstance(relmem_vectors1, torch.Tensor):
+                relmem_vectors1 = torch.tensor(relmem_vectors1, dtype=torch.float32)
+            if not isinstance(relmem_vectors2, torch.Tensor):
+                relmem_vectors2 = torch.tensor(relmem_vectors2, dtype=torch.float32)
+            
+            # Ensure same shape
+            if relmem_vectors1.shape != relmem_vectors2.shape:
+                min_dim = min(relmem_vectors1.size(-1), relmem_vectors2.size(-1))
+                relmem_vectors1 = relmem_vectors1[..., :min_dim]
+                relmem_vectors2 = relmem_vectors2[..., :min_dim]
+            
+            # Cosine similarity for relational structure
+            cos_sim = F.cosine_similarity(
+                relmem_vectors1.flatten(), 
+                relmem_vectors2.flatten(), 
+                dim=0
+            ).clamp(-1, 1)
+            
+            # Convert to consistency score [0, 1]
+            consistency_score = (cos_sim + 1) / 2
+            
+            # L2 loss for training
+            l2_loss = F.mse_loss(relmem_vectors1, relmem_vectors2)
+            
+            return l2_loss, consistency_score.item()
+            
+        except Exception as e:
+            self.logger.warning(f"RelMem consistency computation failed: {e}")
+            return torch.tensor(0.0, requires_grad=True), 1.0
     
     def _compute_structural_consistency(self, grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
         """Compute structural similarity between grids"""

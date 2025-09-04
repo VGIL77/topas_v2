@@ -10,6 +10,7 @@ def run(config, state):
     from trainers.train_logger import TrainLogger
     from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler, SchedulerConfig
     from trainers.schedulers.difficulty_estimator import DifficultyEstimator
+    from validation.eval_runner import EvalRunner
     import torch
     import torch.nn.functional as F
 
@@ -159,6 +160,26 @@ def run(config, state):
             avg_loss = epoch_loss / num_steps
             logger.log_epoch(epoch, "6_neuro_priors", avg_loss, {"steps": num_steps})
             print(f"[Phase 6] Epoch {epoch} - Avg Loss: {avg_loss:.4f}")
+            
+            # === Evaluate at curriculum progression points ===
+            if (epoch + 1) % config.get("eval_interval_epochs", 1) == 0:
+                try:
+                    print(f"[Phase 6] Running evaluation after epoch {epoch+1}...")
+                    eval_runner = EvalRunner(model=model, device=device)
+                    metrics = eval_runner.run(
+                        "ARC/arc-agi_evaluation_challenges.json",
+                        "ARC/arc-agi_evaluation_solutions.json"
+                    )
+                    logger.log_batch(global_step, {
+                        "eval_neuropriors_exact1": metrics.get("exact@1", 0.0),
+                        "eval_neuropriors_exact_k": metrics.get("exact@k", 0.0),
+                        "eval_neuropriors_iou": metrics.get("iou", 0.0),
+                        "phase": "6_neuropriors_eval",
+                        "epoch": epoch
+                    })
+                    print(f"[Phase 6] Neuro-Priors Eval - Exact@1: {metrics.get('exact@1', 0.0):.2%}, IoU: {metrics.get('iou', 0.0):.3f}")
+                except Exception as e:
+                    print(f"[Phase 6] Evaluation error after epoch {epoch}: {e}")
     
     # Update state
     state.update({

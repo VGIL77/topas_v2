@@ -1,45 +1,44 @@
+#!/usr/bin/env python3
 """
 Phase 3 – Self-Critique
-Uses counterexamples, trace analysis, and consistency to improve model robustness.
-Fixed to use trainer_utils helpers consistently.
+Implements STaR methodology:
+  1. Generate counterexamples
+  2. Analyze reasoning traces
+  3. Enforce RelMem consistency
+  4. Bootstrap training with self-corrected traces
 """
 
-def run(config, state):
-    from trainers.trainer_utils import filter_config, safe_model_forward, compute_ce_loss, default_sample_fn
-    from trainers.arc_dataset_loader import ARCDataset
-    from models.topas_arc_60M import TopasARC60M, ModelConfig
-    from trainers.train_logger import TrainLogger
-    from trainers.self_critique.counterexamples import CounterexampleGenerator, Task
-    from trainers.self_critique.trace_analysis import TraceAnalyzer
-    from trainers.self_critique.consistency import ConsistencyEnforcer
-    from relational_memory_neuro import RelationalMemoryNeuro
-    import torch
-    from torch.utils.data import DataLoader
+import torch
+import sys
+import os
 
+# Add parent directories to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from trainers.train_logger import TrainLogger
+from trainers.trainer_utils import safe_model_forward, default_sample_fn, get_from_state
+from relational_memory_neuro import RelationalMemoryNeuro
+
+# ✅ Self-critique subsystems
+from trainers.self_critique.counterexamples import CounterexampleGenerator
+from trainers.self_critique.trace_analysis import TraceAnalyzer
+from trainers.self_critique.consistency import ConsistencyEnforcer
+from trainers.self_critique.star_bootstrapper import STaRBootstrapper
+from trainers.self_critique.critique_trainer import SelfCritiqueTrainer
+from validation.eval_runner import EvalRunner
+
+def run(config, state):
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    
-    # Use filter_config helper for safe dataclass init
-    model_cfg_dict = filter_config(config, ModelConfig.__annotations__)
+
     model = state.get("model")
     if model is None:
-        try:
-            model = TopasARC60M(ModelConfig(**model_cfg_dict)).to(device)
-        except Exception as e:
-            print(f"[Phase 3] Error creating model: {e}. Using default config.")
-            model = TopasARC60M(ModelConfig()).to(device)
+        raise RuntimeError("[Phase 3] Model not found in state. Run previous phases first.")
+    
+    dataset = state.get("dataset")
+    logger = state.get("logger") or TrainLogger()
 
-    # Initialize self-critique components
-    try:
-        counter_gen = CounterexampleGenerator(device=device)
-        trace_analyzer = TraceAnalyzer(device=device)
-        consistency_enforcer = ConsistencyEnforcer(device=device)
-    except Exception as e:
-        print(f"[Phase 3] Warning: Could not initialize all self-critique components: {e}")
-        counter_gen = None
-        trace_analyzer = None
-        consistency_enforcer = None
-
-    # Initialize RelationalMemoryNeuro
+    # === Initialize RelMem ===
     if "relmem" not in state:
         state["relmem"] = RelationalMemoryNeuro(
             hidden_dim=model.config.slot_dim,
@@ -47,97 +46,180 @@ def run(config, state):
             device=device
         ).to(device)
     relmem = state["relmem"]
-    
-    logger = state.get("logger") or TrainLogger(config.get("log_dir", "logs"))
 
-    # Dataset
+    # === Initialize self-critique components ===
+    print("[Phase 3] Initializing self-critique components...")
     try:
-        dataset = ARCDataset(
-            challenge_file=config.get("train_challenges", "arc-agi_training_challenges.json"),
-            solution_file=config.get("train_solutions", "arc-agi_training_solutions.json"),
-            device=str(device),
-            max_grid_size=config.get("max_grid_size", 30),
-        )
+        counter_gen = CounterexampleGenerator(device=device)
+        trace_analyzer = TraceAnalyzer(device=device)
+        consistency_enforcer = ConsistencyEnforcer(device=device)
+        star_bootstrapper = STaRBootstrapper(model)
+        critique_trainer = SelfCritiqueTrainer(model)
+        print("[Phase 3] ✓ All self-critique components initialized")
     except Exception as e:
-        print(f"[Phase 3] Could not load dataset: {e}. Will use default_sample_fn.")
-        dataset = None
+        print(f"[Phase 3] Warning: Could not initialize all self-critique components: {e}")
+        # Fallback to basic training
+        counter_gen = None
+        trace_analyzer = None
+        consistency_enforcer = None
+        star_bootstrapper = None
+        critique_trainer = None
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.get("learning_rate", 1e-4))
-
-    num_epochs = config.get("num_epochs", 3)
+    epochs = config.get("epochs", 3)
     steps_per_epoch = config.get("steps_per_epoch", 200)
     global_step = state.get("global_step", 0)
+    
+    # Initialize optimizer
+    optimizer = state.get("optimizer") or torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.get("learning_rate", 5e-5)
+    )
 
-    for epoch in range(num_epochs):
+    # === Main Self-Critique Loop ===
+    for epoch in range(epochs):
         epoch_loss = 0.0
         num_steps = 0
+        counterexample_count = 0
+        successful_trace_count = 0
         
         for step in range(steps_per_epoch):
             try:
-                # Use default_sample_fn to get data
                 demos, test = default_sample_fn(dataset, device)
                 
-                # Fix CE loss issue: clamp targets to valid range [0, 9] and ensure integer type
+                # Ensure valid targets
                 if test.get("output") is not None:
                     test["output"] = test["output"].long().clamp(0, 9)
                 
-                # Forward pass using safe wrapper
                 grid, logits, extras = safe_model_forward(model, demos, test, device, training_mode=True)
-                
-                # Compute loss using normalized CE
-                loss = compute_ce_loss(logits, test.get("output"))
-                
-                # Add RelMem losses
+
+                # === RelMem baseline losses ===
                 inherit_loss = relmem.inheritance_pass()
                 inverse_loss = relmem.inverse_loss()
-                loss = loss + 0.05 * inherit_loss + 0.05 * inverse_loss
+                base_loss = inherit_loss * 0.05 + inverse_loss * 0.05
+
+                # === Self-critique pipeline ===
+                consistency_loss = torch.tensor(0.0, device=device)
+                counterexamples = []
+                trace_report = {}
                 
-                # Backward pass
+                if counter_gen is not None and trace_analyzer is not None:
+                    try:
+                        # Generate counterexamples
+                        counterexamples = counter_gen.generate_from_failure(model, demos, test)
+                        counterexample_count += len(counterexamples)
+                        
+                        # Analyze reasoning traces (includes planner + RelMem)
+                        trace_report = trace_analyzer.analyze_traces(
+                            model, demos, test, 
+                            relmem=relmem,
+                            planner=getattr(model, 'planner', None)
+                        )
+                        
+                        # Enforce consistency
+                        if consistency_enforcer is not None:
+                            consistency_loss = consistency_enforcer.enforce_consistency(
+                                relmem, counterexamples, trace_report
+                            )
+                            
+                    except Exception as e:
+                        print(f"[Phase 3] Self-critique error at step {step}: {e}")
+                        consistency_loss = torch.tensor(0.0, device=device)
+
+                # === Total loss ===
+                total_loss = base_loss + 0.1 * consistency_loss
+
+                # === Backward pass ===
                 optimizer.zero_grad()
-                loss.backward()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                
-                # Apply post-optimizer RelMem hooks
-                if hasattr(relmem, "apply_post_optimizer_hooks"):
-                    relmem.apply_post_optimizer_hooks()
-                
-                epoch_loss += loss.item()
+
+                # === STaR Bootstrapping ===
+                if star_bootstrapper is not None and trace_report.get("successful_traces"):
+                    try:
+                        star_bootstrapper.reinforce(traces=trace_report["successful_traces"])
+                        successful_trace_count += len(trace_report["successful_traces"])
+                    except Exception as e:
+                        print(f"[Phase 3] STaR bootstrapping error: {e}")
+
+                epoch_loss += total_loss.item()
                 num_steps += 1
                 global_step += 1
-                
-                # Log batch
+
+                # === Logging ===
                 if step % config.get("log_interval", 20) == 0:
                     logger.log_batch(global_step, {
                         "phase": "3_self_critique",
                         "epoch": epoch,
                         "step": step,
-                        "loss": loss.item(),
-                        "inherit_loss": float(inherit_loss.item()) if hasattr(inherit_loss, "item") else 0.0,
-                        "inverse_loss": float(inverse_loss.item()) if hasattr(inverse_loss, "item") else 0.0
+                        "total_loss": total_loss.item(),
+                        "inherit_loss": float(inherit_loss.item()) if hasattr(inherit_loss, 'item') else 0.0,
+                        "inverse_loss": float(inverse_loss.item()) if hasattr(inverse_loss, 'item') else 0.0,
+                        "consistency_loss": float(consistency_loss.item()) if hasattr(consistency_loss, 'item') else 0.0,
+                        "num_counterexamples": len(counterexamples),
+                        "num_successful_traces": len(trace_report.get("successful_traces", []))
                     })
-                    
-                    # RelMem logging every 100 steps
-                    if step % 100 == 0:
-                        print(f"[RelMem] inherit={inherit_loss.item():.4f}, inverse={inverse_loss.item():.4f}")
-                    
+
             except Exception as e:
-                print(f"[Phase 3] Error in training step: {e}")
+                print(f"[Phase 3] Error in training step {step}: {e}")
                 continue
+        
+        # === End of epoch: Critique trainer ===
+        if critique_trainer is not None and num_steps > 0:
+            try:
+                critique_trainer.apply_critiques(trace_report, consistency_loss)
+                print(f"[Phase 3] Applied epoch-level critiques for epoch {epoch}")
+            except Exception as e:
+                print(f"[Phase 3] Critique trainer error: {e}")
         
         # Epoch summary
         if num_steps > 0:
             avg_loss = epoch_loss / num_steps
-            logger.log_epoch(epoch, "3_self_critique", avg_loss, None)
-            print(f"[Phase 3] Epoch {epoch} - Avg Loss: {avg_loss:.4f}")
+            print(f"[Phase 3] Epoch {epoch+1}/{epochs} complete:")
+            print(f"  Avg Loss: {avg_loss:.4f}")
+            print(f"  Counterexamples Generated: {counterexample_count}")
+            print(f"  Successful Traces: {successful_trace_count}")
+            
+            logger.log_epoch(epoch, "3_self_critique", avg_loss, {
+                "counterexamples": counterexample_count,
+                "successful_traces": successful_trace_count
+            })
+            
+            # === Evaluate after each self-critique epoch ===
+            try:
+                print(f"[Phase 3] Running evaluation after epoch {epoch+1}...")
+                eval_runner = EvalRunner(model=model, device=device)
+                metrics = eval_runner.run(
+                    "ARC/arc-agi_evaluation_challenges.json",
+                    "ARC/arc-agi_evaluation_solutions.json"
+                )
+                logger.log_batch(global_step, {
+                    "eval_after_critique_exact1": metrics.get("exact@1", 0.0),
+                    "eval_after_critique_exact_k": metrics.get("exact@k", 0.0),
+                    "eval_after_critique_iou": metrics.get("iou", 0.0),
+                    "phase": "3_critique_eval",
+                    "epoch": epoch
+                })
+                print(f"[Phase 3] Post-Critique Eval - Exact@1: {metrics.get('exact@1', 0.0):.2%}, IoU: {metrics.get('iou', 0.0):.3f}")
+            except Exception as e:
+                print(f"[Phase 3] Evaluation error after epoch {epoch}: {e}")
+
+    # === RelMem post-training plasticity ===
+    if hasattr(relmem, "apply_post_optimizer_hooks"):
+        try:
+            relmem.apply_post_optimizer_hooks()
+            print("[Phase 3] Applied RelMem post-training plasticity")
+        except Exception as e:
+            print(f"[Phase 3] RelMem plasticity error: {e}")
 
     state.update({
         "model": model,
-        "logger": logger,
-        "optimizer": optimizer,
-        "global_step": global_step,
         "relmem": relmem,
-        "phase3_completed": True
+        "optimizer": optimizer,
+        "logger": logger,
+        "global_step": global_step,
+        "phase3_complete": True
     })
-    
-    print("[Phase 3] Self-Critique complete")
+
+    print("[Phase 3] Self-Critique with STaR methodology complete!")
     return state

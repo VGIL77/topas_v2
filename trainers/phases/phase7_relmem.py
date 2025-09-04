@@ -7,6 +7,7 @@ Fixed to use trainer_utils helpers consistently.
 def run(config, state):
     from trainers.trainer_utils import default_sample_fn, safe_model_forward, compute_ce_loss
     from trainers.train_logger import TrainLogger
+    from validation.eval_runner import EvalRunner
     import torch
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
@@ -109,6 +110,25 @@ def run(config, state):
             avg_loss = epoch_loss / num_steps
             logger.log_epoch(epoch, "7_relmem", avg_loss, {"steps": num_steps})
             print(f"[Phase 7] Epoch {epoch} - Avg Loss: {avg_loss:.4f}")
+            
+            # === Evaluate at the end of each RelMem epoch ===
+            try:
+                print(f"[Phase 7] Running evaluation after epoch {epoch+1}...")
+                eval_runner = EvalRunner(model=model, device=device)
+                metrics = eval_runner.run(
+                    "ARC/arc-agi_evaluation_challenges.json",
+                    "ARC/arc-agi_evaluation_solutions.json"
+                )
+                logger.log_batch(global_step, {
+                    "eval_relmem_exact1": metrics.get("exact@1", 0.0),
+                    "eval_relmem_exact_k": metrics.get("exact@k", 0.0),
+                    "eval_relmem_iou": metrics.get("iou", 0.0),
+                    "phase": "7_relmem_eval",
+                    "epoch": epoch
+                })
+                print(f"[Phase 7] RelMem Eval - Exact@1: {metrics.get('exact@1', 0.0):.2%}, IoU: {metrics.get('iou', 0.0):.3f}")
+            except Exception as e:
+                print(f"[Phase 7] Evaluation error after epoch {epoch}: {e}")
     
     state.update({
         "model": model,
