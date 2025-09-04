@@ -1,0 +1,139 @@
+{
+  "global": {
+    "device": "cuda",
+    "log_dir": "logs/a100_full_v3/",
+    "checkpoint_dir": "checkpoints/a100_full_v3/",
+    "epochs": 120,
+    "steps_per_epoch": 600,
+    "batch_size": 16,
+    "num_workers": 4,
+    "use_amp": true,
+    "eval_interval": 2
+  },
+
+  "phase1_policy_distill": {
+    "steps": 8000,
+    "min_beam_score": 0.2,
+    "self_play_interval": 50,
+    "learning_rate": 1e-4,
+    "log_interval": 20,
+    "use_planner": true,
+    "planner_freeze": true,
+    "planner_kl_weight": 0.5,
+    "relmem_loss_weight": 0.05
+  },
+
+  "phase2_meta_learning": {
+    "algo": "maml",
+    "meta_lr": 1e-4,
+    "inner_steps": 3,
+    "num_epochs": 10,
+    "tasks_per_meta_batch": 16,
+    "log_interval": 10,
+    "use_planner_gating": true
+  },
+
+  "phase3_self_critique": {
+    "enable_counterexamples": true,
+    "epochs": 3,
+    "batch_size": 2,
+    "max_counterexamples": 3,
+    "bootstrap_weight": 0.5,
+    "learning_rate": 5e-5,
+    "log_interval": 10
+  },
+
+  "phase4_mcts_alpha": {
+    "steps": 400,
+    "mcts_depth": 12,
+    "deep_mining_interval": 200,
+    "learning_rate": 1e-4,
+    "log_interval": 20
+  },
+
+  "phase5_dream_scaled": {
+    "epochs": 5,
+    "steps_per_epoch": 400,
+    "dream_interval": 100,
+    "log_interval": 25
+  },
+
+  "phase6_neuro_priors": {
+    "epochs": 5,
+    "steps_per_epoch": 400,
+    "verbose": true,
+    "learning_rate": 1e-4,
+    "exploration_weight": 2.0,
+    "empowerment_weight": 0.3,
+    "sync_weight": 0.2,
+    "use_difficulty_estimator": true,
+    "feature_dim": 128,
+    "hidden_dim": 256,
+    "num_difficulty_levels": 5,
+    "w_phi": 0.1,
+    "w_kappa": 0.1,
+    "w_cge": 0.1,
+    "log_interval": 20
+  },
+
+  "phase7_relmem": {
+    "epochs": 5,
+    "steps_per_epoch": 400,
+    "inverse_loss_w": 0.05,
+    "max_concepts": 4096,
+    "rank": 16,
+    "wta_frac": 0.1,
+    "wta_warmup_updates": 50,
+    "hebbian_interval": 1,
+    "wta_interval": 10,
+    "learning_rate": 1e-4,
+    "log_interval": 20
+  },
+
+  "phase8_sgi_optimizer": {
+    "epochs": 2,
+    "steps_per_epoch": 400,
+    "sharpness": 0.1,
+    "base_lr": 1e-4,
+    "log_interval": 25
+  },
+
+  "phase9_ensemble_solver": {
+    "steps": 100,
+    "num_experts": 4,
+    "strategies": ["neural", "dsl", "hybrid"],
+    "voting_method": "weighted",
+    "confidence_threshold": 0.7,
+    "log_interval": 10
+  },
+
+  "phase10_production": {
+    "epochs": 20,
+    "steps_per_epoch": 600,
+    "dream_interval": 100,
+    "eval_interval": 2,
+    "learning_rate": 5e-5,
+    "log_interval": 50,
+    "optimizer_config": {
+      "base_lr": 1e-4,
+      "max_lr": 2e-3,
+      "clip_grad": 1.0,
+      "weight_decay": 1e-5
+    },
+    "ensemble_config": {
+      "num_samples": 5,
+      "temperature": 0.9,
+      "use_self_consistency": true
+    }
+  },
+
+  "train_challenges": "ARC/arc-agi_training_challenges.json",
+  "train_solutions": "ARC/arc-agi_training_solutions.json",
+  "eval_challenges": "ARC/arc-agi_evaluation_challenges.json",
+  "eval_solutions": "ARC/arc-agi_evaluation_solutions.json",
+
+  "phase0_mode": false,
+  "strict": true,
+  "dry_run": false,
+  "validate_between_phases": true
+}
