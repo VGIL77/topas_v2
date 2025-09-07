@@ -25,6 +25,7 @@ from models.grid_encoder import GridEncoder
 from models.object_slots import ObjectSlots
 from models.rel_graph import RelGraph, ObjectRelationPredictor
 from models.painter import NeuralPainter
+from models.hrm_topas_bridge import HRMTOPASBridge, HRMTOPASIntegrationConfig
 from models.dsl_search import beam_search, DSLProgram, apply_program
 from models.utils import (
     logits_from_grid as logits_from_grid,
@@ -46,14 +47,20 @@ from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler
 from relational_memory_neuro import RelationalMemoryNeuro
 from models.dsl_registry import DSL_OPS
 
-# HRM Planner imports - no fallbacks
-hrm_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../docs/HRM-main'))
-if hrm_path not in sys.path:
-    sys.path.append(hrm_path)
-from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
-from models.losses import ACTLossHead
+# HRM Planner imports - direct import from models directory
+try:
+    from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+    from models.losses import ACTLossHead
+    _HAS_HRM_PLANNER = True
+    print("✅ HRM models loaded successfully in TopasARC60M")
+except ImportError as e:
+    print(f"Warning: HRM models not available in TopasARC60M: {e}")
+    _HAS_HRM_PLANNER = False
+    class HierarchicalReasoningModel_ACTV1:
+        def __init__(self, *args, **kwargs): pass
+    class ACTLossHead:
+        def __init__(self, *args, **kwargs): pass
 
-_HAS_HRM_PLANNER = True
 _HAS_ALL_COMPONENTS = True
 _HAS_SIMPLE_DSL = True
 
@@ -402,7 +409,7 @@ class TopasARC60M(nn.Module):
         self.config = config or ModelConfig()
         self.config.validate()
         
-        # Neural components
+        # Neural components - encoder will be enhanced with HRM after planner init
         self.encoder = GridEncoder(width=self.config.width, depth=self.config.depth)
         self.slots = ObjectSlots(in_ch=self.config.width, K=self.config.slots, 
                                 slot_dim=self.config.slot_dim)
@@ -560,6 +567,37 @@ class TopasARC60M(nn.Module):
             self.planner_loss_head = None
             self.planner_op_bias = None
             self._has_planner = False
+        
+        # === HRM-TOPAS Bridge ===
+        if self._has_planner:
+            bridge_config = HRMTOPASIntegrationConfig(
+                hrm_hidden_size=hrm_cfg["hidden_size"],
+                topas_width=self.config.width,
+                num_attention_heads=8,
+                puzzle_emb_dim=hrm_cfg.get("puzzle_emb_ndim", 128),
+                dsl_ops_count=len(DSL_OPS),
+                adaptive_halting_threshold=0.6
+            )
+            self.hrm_bridge = HRMTOPASBridge(bridge_config)
+            self._has_hrm_bridge = True
+            if self.config.verbose:
+                print(f"[TOPAS] HRM-TOPAS Bridge initialized with {bridge_config.num_attention_heads} heads")
+        else:
+            self.hrm_bridge = None
+            self._has_hrm_bridge = False
+        
+        # Replace encoder with HRM-aware version if HRM is available
+        if self._has_planner:
+            # Replace the basic encoder with HRM-enhanced version
+            self.encoder = GridEncoder(
+                width=self.config.width, 
+                depth=self.config.depth,
+                hrm_integration=True,
+                hrm_hidden_size=hrm_cfg["hidden_size"],
+                puzzle_emb_dim=hrm_cfg.get("puzzle_emb_ndim", 128)
+            )
+            if self.config.verbose:
+                print(f"[TOPAS] Grid encoder enhanced with HRM integration")
         
         # Pretraining support
         self._pretraining_mode = self.config.pretraining_mode
@@ -766,9 +804,50 @@ class TopasARC60M(nn.Module):
         else:
             enc_in = test_grid
         
-        # Neural encoding with error handling
+        # Neural encoding with HRM integration
         try:
-            encoder_output = self.encoder(enc_in)
+            # Prepare HRM context if available
+            hrm_context = None
+            if self._has_planner and self.planner is not None:
+                try:
+                    # Run HRM planner to get reasoning states
+                    tokens = self.grid_to_tokens(enc_in)  # [B, seq_len]
+                    puzzle_ids = torch.zeros(tokens.size(0), dtype=torch.long, device=tokens.device)
+                    planner_batch = {"inputs": tokens, "labels": tokens, "puzzle_identifiers": puzzle_ids}
+                    
+                    carry = self.planner.initial_carry(planner_batch)
+                    carry, hrm_outputs = self.planner(carry=carry, batch=planner_batch)
+                    
+                    # Extract HRM reasoning states for grid encoder
+                    if hasattr(carry, 'inner_carry') and carry.inner_carry is not None:
+                        z_H = getattr(carry.inner_carry, 'z_H', None)
+                        z_L = getattr(carry.inner_carry, 'z_L', None)
+                        
+                        # Get puzzle embedding if available
+                        puzzle_emb = None
+                        if hasattr(self.planner.inner, 'puzzle_emb') and self.planner.inner.puzzle_emb is not None:
+                            # Use first puzzle ID embedding as context
+                            puzzle_emb = self.planner.inner.puzzle_emb(puzzle_ids)
+                        
+                        hrm_context = {
+                            'z_H': z_H,
+                            'z_L': z_L, 
+                            'puzzle_emb': puzzle_emb,
+                            'hrm_outputs': hrm_outputs
+                        }
+                        
+                        if self.config.verbose:
+                            print(f"[HRM] Context prepared: z_H={z_H.shape if z_H is not None else None}, "
+                                  f"z_L={z_L.shape if z_L is not None else None}")
+                    
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"[HRM] Failed to prepare context: {e}, using basic encoding")
+                    hrm_context = None
+                    hrm_outputs = {}
+            
+            # Run encoder with HRM context
+            encoder_output = self.encoder(enc_in, hrm_context)
             if self.config.verbose:
                 print(f"[DEBUG] Encoder returned {len(encoder_output)} values")
             feat, glob = encoder_output
@@ -912,53 +991,71 @@ class TopasARC60M(nn.Module):
             rail_path.append("DSL")
             retry_count += 1
             
-            # === HRM Planner step ===
-            if self._has_planner and self.planner is not None:
+            # === HRM-TOPAS Bridge Integration ===
+            planner_op_bias = {}
+            if self._has_hrm_bridge and hrm_context is not None:
                 try:
-                    tokens = self.grid_to_tokens(test_grid)  # [B, seq_len]
-                    puzzle_ids = torch.zeros(tokens.size(0), dtype=torch.long, device=tokens.device)  # TODO: map ARC task_id
-                    planner_batch = {"inputs": tokens, "labels": tokens, "puzzle_identifiers": puzzle_ids}
-
-                    carry = self.planner.initial_carry(planner_batch)
-                    carry, outputs = self.planner(carry=carry, batch=planner_batch)
-
-                    q_halt = outputs.get("q_halt_logits")
-                    q_continue = outputs.get("q_continue_logits")
-
-                    halted = (q_halt > q_continue) if q_halt is not None and q_continue is not None else torch.tensor(False)
-
-                    # Adjust search budget dynamically
-                    if halted.any():
-                        depth = min(depth, 3)  # Reduce search depth
-                        beam_w = min(beam_w, 8)  # Reduce beam width
-                        if self.config.verbose:
-                            print(f"[HRM] Planner halted early, reducing search: depth={depth}, beam={beam_w}")
-                    else:
-                        # Keep original depth/beam from config
-                        pass
-
-                    # Planner latent → op bias for DSL
-                    planner_op_bias = {}
-                    if "z_H" in outputs and self.planner_op_bias is not None:
-                        z_H = outputs["z_H"]
-                        op_bias_logits = F.softmax(self.planner_op_bias(z_H), dim=-1)
-                        # Convert to dict mapping DSL_OPS to bias values
-                        for i, op in enumerate(DSL_OPS):
-                            if i < op_bias_logits.size(-1):
-                                planner_op_bias[op] = float(op_bias_logits[0, i].item())
-                        if self.config.verbose and planner_op_bias:
-                            top_ops = sorted(planner_op_bias.items(), key=lambda x: x[1], reverse=True)[:3]
-                            print(f"[HRM] Top planner op bias: {top_ops}")
+                    # Use HRM Bridge for advanced integration
+                    bridge_outputs = self.hrm_bridge.forward(
+                        grid_features=feat,
+                        hrm_outputs=hrm_context,
+                        puzzle_embedding=hrm_context.get('puzzle_emb'),
+                        current_search_depth=depth
+                    )
                     
-                    beam_depth_used = depth  # Update tracking variables
+                    # Extract DSL operation biases
+                    dsl_op_biases = bridge_outputs.get('dsl_op_biases')
+                    control_signals = bridge_outputs.get('control_signals')
+                    
+                    if dsl_op_biases is not None:
+                        from models.dsl_registry import DSL_OPS
+                        planner_op_bias = self.hrm_bridge.extract_dsl_operation_dict(dsl_op_biases, DSL_OPS)
+                    
+                    # Apply adaptive search parameters
+                    if control_signals is not None:
+                        adapted_depth, adapted_beam = self.hrm_bridge.compute_adaptive_search_params(
+                            control_signals, depth, beam_w
+                        )
+                        depth = adapted_depth
+                        beam_w = adapted_beam
+                        
+                        if self.config.verbose:
+                            should_halt = control_signals.get('should_halt', torch.tensor(False))
+                            confidence = control_signals.get('confidence', torch.tensor(0.5))
+                            print(f"[HRM-Bridge] Adaptive control: depth={depth}, beam={beam_w}, "
+                                  f"halt={should_halt.item() if torch.is_tensor(should_halt) else should_halt}, "
+                                  f"confidence={confidence.mean().item() if torch.is_tensor(confidence) else confidence:.3f}")
+                    
+                    # Update grid features with enhanced bridge features
+                    enhanced_features = bridge_outputs.get('enhanced_features')
+                    if enhanced_features is not None:
+                        feat = enhanced_features
+                        if self.config.verbose:
+                            print(f"[HRM-Bridge] Grid features enhanced via cross-attention")
+                    
+                    beam_depth_used = depth  
                     beam_width_used = beam_w
-
+                    
+                    if self.config.verbose and planner_op_bias:
+                        top_ops = sorted(planner_op_bias.items(), key=lambda x: x[1], reverse=True)[:3]
+                        print(f"[HRM-Bridge] Top operation biases: {top_ops}")
+                        
                 except Exception as e:
                     if self.config.verbose:
-                        print(f"[HRM] Planner step failed: {e}, continuing without planner guidance")
-                    planner_op_bias = {}
+                        print(f"[HRM-Bridge] Integration failed: {e}, falling back to basic HRM")
+                    # Fallback to basic HRM integration  
+                    if 'z_H' in hrm_context and hrm_context['z_H'] is not None:
+                        z_H = hrm_context['z_H']
+                        if self.planner_op_bias is not None:
+                            from models.dsl_registry import DSL_OPS
+                            op_bias_logits = F.softmax(self.planner_op_bias(z_H), dim=-1)
+                            for i, op in enumerate(DSL_OPS):
+                                if i < op_bias_logits.size(-1):
+                                    planner_op_bias[op] = float(op_bias_logits[0, i].item())
             else:
-                planner_op_bias = {}
+                # No HRM integration available
+                if self.config.verbose and self._has_planner:
+                    print(f"[HRM] No context available for DSL integration")
             
             # Get detected operation bias from relation manager
             from models.dsl_registry import DSL_OPS

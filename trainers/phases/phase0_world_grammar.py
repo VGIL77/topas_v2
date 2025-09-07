@@ -1,12 +1,15 @@
 """
-Phase 0 – World Grammar Pretrain
-Warm up encoder/painter rails on synthetic ARC grammar tasks.
-Implements robust batching, demo normalization, CE loss, and correct logging.
+Phase 0 – World Grammar Pretrain with HRM Integration
+Train directly on ARC-AGI data with curriculum learning and HRM puzzle embeddings.
+Implements ARC data loading, curriculum progression, and HRM task identity features.
 """
 
 from typing import Any, Dict, List, Tuple, Optional
 import os
 import sys
+import json
+import random
+import numpy as np
 
 # Try to make both repo layouts work (with/without "trainers." prefix)
 def _import_datasets():
@@ -16,6 +19,21 @@ def _import_datasets():
     except Exception:
         from trainers.arc_dataset_loader import SyntheticGrammarDataset, ARCDataset  # type: ignore
         return SyntheticGrammarDataset, ARCDataset
+
+# HRM imports for puzzle embedding
+try:
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../../docs/HRM-main'))
+    from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+    _HAS_HRM = True
+except ImportError:
+    _HAS_HRM = False
+    class HierarchicalReasoningModel_ACTV1:
+        def __init__(self, *args, **kwargs): pass
+        def initial_carry(self, *args): return {}
+        def __call__(self, *args, **kwargs): return {}, {"puzzle_embedding": torch.randn(1, 128)}
+        def to(self, device): return self
 
 def _import_logger():
     try:
@@ -158,6 +176,162 @@ def _canonize_grid(x, device, num_colors: int = 10):
     x = torch.nn.functional.one_hot(x, num_classes=num_colors).permute(0,3,1,2).float()
     return x
 
+def _load_arc_tasks_with_curriculum(arc_data_path: str, curriculum_level: int = 0) -> List[Dict]:
+    """
+    Load ARC tasks with curriculum learning progression.
+    
+    Args:
+        arc_data_path: Path to ARC data directory (e.g., "ARC-AGI/data/training")
+        curriculum_level: 0 (easy) to 4 (hard)
+    
+    Returns:
+        List of task dictionaries sorted by difficulty
+    """
+    tasks = []
+    
+    if not os.path.exists(arc_data_path):
+        print(f"[Phase 0] ARC data path not found: {arc_data_path}")
+        return tasks
+    
+    # Load all task files
+    for filename in os.listdir(arc_data_path):
+        if filename.endswith('.json'):
+            filepath = os.path.join(arc_data_path, filename)
+            try:
+                with open(filepath, 'r') as f:
+                    task_data = json.load(f)
+                    task_data['task_id'] = filename.replace('.json', '')
+                    tasks.append(task_data)
+            except Exception as e:
+                print(f"[Phase 0] Failed to load {filename}: {e}")
+                continue
+    
+    # Sort tasks by difficulty (curriculum learning)
+    def _calculate_difficulty(task):
+        """Calculate task difficulty based on grid size, number of objects, etc."""
+        difficulty = 0
+        
+        # Check training examples for complexity
+        train_examples = task.get('train', [])
+        for example in train_examples:
+            input_grid = example.get('input', [])
+            output_grid = example.get('output', [])
+            
+            # Grid size factor
+            input_size = len(input_grid) * len(input_grid[0]) if input_grid else 0
+            output_size = len(output_grid) * len(output_grid[0]) if output_grid else 0
+            difficulty += (input_size + output_size) / 200.0  # Normalize by ~average size
+            
+            # Number of unique colors (complexity)
+            input_colors = set()
+            output_colors = set()
+            for row in input_grid:
+                input_colors.update(row)
+            for row in output_grid:
+                output_colors.update(row)
+            difficulty += (len(input_colors) + len(output_colors)) / 20.0
+        
+        # Number of training examples (more examples = easier to learn pattern)
+        difficulty -= len(train_examples) * 0.1
+        
+        return max(0.0, difficulty)
+    
+    # Sort by difficulty
+    tasks_with_difficulty = [(task, _calculate_difficulty(task)) for task in tasks]
+    tasks_with_difficulty.sort(key=lambda x: x[1])
+    
+    # Select tasks based on curriculum level
+    total_tasks = len(tasks_with_difficulty)
+    if curriculum_level == 0:  # Easiest 20%
+        selected_tasks = tasks_with_difficulty[:int(total_tasks * 0.2)]
+    elif curriculum_level == 1:  # Easiest 40%
+        selected_tasks = tasks_with_difficulty[:int(total_tasks * 0.4)]
+    elif curriculum_level == 2:  # Easiest 60%
+        selected_tasks = tasks_with_difficulty[:int(total_tasks * 0.6)]
+    elif curriculum_level == 3:  # Easiest 80%
+        selected_tasks = tasks_with_difficulty[:int(total_tasks * 0.8)]
+    else:  # All tasks
+        selected_tasks = tasks_with_difficulty
+    
+    result_tasks = [task for task, _ in selected_tasks]
+    print(f"[Phase 0] Curriculum level {curriculum_level}: Selected {len(result_tasks)} tasks (difficulty range: {selected_tasks[0][1]:.2f} - {selected_tasks[-1][1]:.2f})")
+    
+    return result_tasks
+
+def _create_puzzle_embedding(task_data: Dict, puzzle_embedder=None):
+    """Create HRM-style puzzle embedding for task identity."""
+    import torch
+    
+    if puzzle_embedder is not None and _HAS_HRM:
+        # Use actual HRM puzzle embedder
+        try:
+            # Convert task to tokens for HRM processing
+            train_grids = []
+            for example in task_data.get('train', []):
+                input_grid = torch.tensor(example['input'], dtype=torch.long)
+                train_grids.append(input_grid.flatten())
+            
+            if train_grids:
+                # Use first training example as task representation
+                tokens = train_grids[0].unsqueeze(0)  # [1, seq_len]
+                puzzle_ids = torch.zeros(1, dtype=torch.long)
+                
+                batch = {
+                    "inputs": tokens,
+                    "labels": tokens,
+                    "puzzle_identifiers": puzzle_ids
+                }
+                carry = puzzle_embedder.initial_carry(batch)
+                carry, outputs = puzzle_embedder(carry=carry, batch=batch)
+                
+                if "puzzle_embedding" in outputs:
+                    return outputs["puzzle_embedding"]
+        except Exception as e:
+            print(f"[Phase 0] HRM puzzle embedding failed: {e}")
+    
+    # Fallback: create simple hash-based embedding
+    task_id = task_data.get('task_id', 'unknown')
+    
+    # Create deterministic embedding from task features
+    feature_vector = []
+    
+    # Hash task ID to create base embedding
+    import hashlib
+    hash_val = int(hashlib.md5(task_id.encode()).hexdigest()[:8], 16)
+    np.random.seed(hash_val % (2**31))
+    base_embedding = np.random.randn(64)
+    
+    # Add task-specific features
+    train_examples = task_data.get('train', [])
+    if train_examples:
+        # Average grid sizes
+        avg_input_size = np.mean([len(ex['input']) * len(ex['input'][0]) for ex in train_examples])
+        avg_output_size = np.mean([len(ex['output']) * len(ex['output'][0]) for ex in train_examples])
+        
+        # Color diversity
+        all_colors = set()
+        for ex in train_examples:
+            for row in ex['input'] + ex['output']:
+                all_colors.update(row)
+        color_diversity = len(all_colors)
+        
+        # Task complexity features
+        complexity_features = np.array([
+            avg_input_size / 100.0,  # Normalize grid size
+            avg_output_size / 100.0,
+            color_diversity / 10.0,  # Normalize color count
+            len(train_examples) / 10.0  # Normalize example count
+        ])
+        
+        # Combine with base embedding
+        full_embedding = np.concatenate([base_embedding, complexity_features])[:128]
+        if len(full_embedding) < 128:
+            full_embedding = np.pad(full_embedding, (0, 128 - len(full_embedding)))
+    else:
+        full_embedding = np.pad(base_embedding, (0, 64))[:128]
+    
+    return torch.tensor(full_embedding, dtype=torch.float32)
+
 def _painter_only_forward(base_model, demo_in, demo_out, device):
     """
     Painter-only forward pass:
@@ -267,24 +441,49 @@ def run(config: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         logger = TrainLogger(log_path=log_path, verbose=True)
         state["logger"] = logger
 
-    # === Dataset ===
-    dataset_name = (config.get("dataset", "synthetic") or "synthetic").lower()
-    if dataset_name in ("arc", "arcdataset"):
-        challenge_file = config.get("challenge_file", "arc-agi_training_challenges.json")
-        solution_file = config.get("solution_file", "arc-agi_training_solutions.json")
-        if not os.path.exists(challenge_file) and os.path.exists(os.path.join("ARC", "arc-agi_training-challenges.json")):
-            # try common subdir
-            challenge_file = os.path.join("ARC", "arc-agi_training-challenges.json")
-            solution_file = os.path.join("ARC", "arc-agi_training-solutions.json")
-        dataset = ARCDataset(challenge_file, solution_file, device=str(device))
-    else:
+    # === Dataset with Curriculum Learning ===
+    # Force use of ARC data as specified in requirements
+    arc_data_path = config.get("arc_data_path", "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training")
+    curriculum_level = config.get("curriculum_level", 0)  # Start with easiest tasks
+    
+    print(f"[Phase 0] Using ARC-AGI data with curriculum learning (level {curriculum_level})")
+    
+    # Load tasks with curriculum
+    arc_tasks = _load_arc_tasks_with_curriculum(arc_data_path, curriculum_level)
+    
+    if not arc_tasks:
+        print("[Phase 0] No ARC tasks loaded! Falling back to synthetic data for testing.")
         dataset = SyntheticGrammarDataset(
-            num_samples=int(config.get("dataset_size", 200)),
-            max_grid_size=int(config.get("max_grid_size", 30)),
+            num_samples=int(config.get("dataset_size", 50)),
+            max_grid_size=int(config.get("max_grid_size", 15)),  # Start smaller for curriculum
             device=str(device),
         )
+    else:
+        # Use ARC tasks directly
+        dataset = None  # We'll handle iteration manually
+    
+    # Initialize HRM puzzle embedder if available
+    puzzle_embedder = None
+    if _HAS_HRM and config.get("use_hrm_embeddings", True):
+        try:
+            hrm_config = {
+                'batch_size': 1, 'seq_len': 400, 'vocab_size': 10,
+                'num_puzzle_identifiers': 1000, 'puzzle_emb_ndim': 128,
+                'H_cycles': 2, 'L_cycles': 2, 'H_layers': 2, 'L_layers': 2,
+                'hidden_size': 256, 'expansion': 2.0, 'num_heads': 4,
+                'pos_encodings': "rope", 'halt_max_steps': 4,
+                'halt_exploration_prob': 0.1, 'forward_dtype': "bfloat16"
+            }
+            puzzle_embedder = HierarchicalReasoningModel_ACTV1(hrm_config).to(device)
+            print(f"[Phase 0] Initialized HRM puzzle embedder")
+        except Exception as e:
+            print(f"[Phase 0] Failed to initialize HRM puzzle embedder: {e}")
+            puzzle_embedder = None
 
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    if dataset is not None:
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    else:
+        dataloader = None
 
     # === Training loop ===
     epochs = int(config.get("epochs", 1))
@@ -295,53 +494,85 @@ def run(config: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     for epoch in range(epochs):
         epoch_loss = 0.0
         num_batches = 0
+        
+        if arc_tasks:
+            # Train on ARC tasks directly
+            random.shuffle(arc_tasks)
+            task_iterator = arc_tasks[:int(config.get("steps_per_epoch", 200))]
+        else:
+            # Use synthetic dataloader
+            task_iterator = dataloader
 
-        for batch_idx, batch_data in enumerate(dataloader):
+        for batch_idx, item in enumerate(task_iterator):
             # MASTER'S WISDOM: Respect steps_per_epoch to prevent runaway training
             if batch_idx >= int(config.get("steps_per_epoch", 200)):
                 break
             
-            # --- Unpack dataloader batch (robust against collate quirks) ---
-            # Expect 4-tuple
-            try:
-                demos, test_inputs, test_outputs, task_ids = batch_data
-            except Exception:
-                # Some DataLoader configs return a single element already unbatched
-                if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
-                    demos, test_inputs, test_outputs, task_ids = batch_data
-                else:
-                    # Skip malformed batch
-                    continue
-
-            # De-batch for batch_size=1
-            try:
-                demos = demos[0]
-            except Exception:
-                pass
-
-            if isinstance(test_inputs, list) and len(test_inputs) > 0:
-                test_inputs = test_inputs[0]
-            if isinstance(test_outputs, list) and len(test_outputs) > 0:
-                test_outputs = test_outputs[0]
-            if isinstance(task_ids, (list, tuple)) and len(task_ids) > 0:
-                task_id = task_ids[0]
-            else:
-                task_id = task_ids
-
-            # --- Normalize demos to list of (in,out) pairs ---
-            demo_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
-            if isinstance(demos, (list, tuple)) and len(demos) == 2 and torch.is_tensor(demos[0]):
-                # Synthetic single pair got collated into [in, out]
-                demo_pairs = [(demos[0], demos[1])]
-            elif isinstance(demos, (list, tuple)):
-                # Already a list of pairs (ARCDataset)
+            if arc_tasks:
+                # --- Process ARC task directly ---
+                task_data = item
+                task_id = task_data.get('task_id', f'task_{batch_idx}')
+                
+                # Create puzzle embedding for task identity
+                puzzle_embedding = _create_puzzle_embedding(task_data, puzzle_embedder)
+                
+                # Extract training examples as demo pairs
                 demo_pairs = []
-                for entry in demos:
-                    if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                        demo_pairs.append((entry[0], entry[1]))
+                train_examples = task_data.get('train', [])
+                
+                for example in train_examples:
+                    try:
+                        input_grid = torch.tensor(example['input'], dtype=torch.long).to(base_model_device)
+                        output_grid = torch.tensor(example['output'], dtype=torch.long).to(base_model_device)
+                        demo_pairs.append((input_grid, output_grid))
+                    except Exception as e:
+                        print(f"[Phase 0] Failed to process example in {task_id}: {e}")
+                        continue
+                
+                if not demo_pairs:
+                    continue
             else:
-                # Skip malformed
-                continue
+                # --- Unpack synthetic dataloader batch (robust against collate quirks) ---
+                batch_data = item
+                try:
+                    demos, test_inputs, test_outputs, task_ids = batch_data
+                except Exception:
+                    # Some DataLoader configs return a single element already unbatched
+                    if isinstance(batch_data, (list, tuple)) and len(batch_data) == 4:
+                        demos, test_inputs, test_outputs, task_ids = batch_data
+                    else:
+                        # Skip malformed batch
+                        continue
+
+                # De-batch for batch_size=1
+                try:
+                    demos = demos[0]
+                except Exception:
+                    pass
+
+                if isinstance(test_inputs, list) and len(test_inputs) > 0:
+                    test_inputs = test_inputs[0]
+                if isinstance(test_outputs, list) and len(test_outputs) > 0:
+                    test_outputs = test_outputs[0]
+                if isinstance(task_ids, (list, tuple)) and len(task_ids) > 0:
+                    task_id = task_ids[0]
+                else:
+                    task_id = task_ids
+
+                # --- Normalize demos to list of (in,out) pairs ---
+                demo_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+                if isinstance(demos, (list, tuple)) and len(demos) == 2 and torch.is_tensor(demos[0]):
+                    # Synthetic single pair got collated into [in, out]
+                    demo_pairs = [(demos[0], demos[1])]
+                elif isinstance(demos, (list, tuple)):
+                    # Already a list of pairs (ARCDataset)
+                    demo_pairs = []
+                    for entry in demos:
+                        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                            demo_pairs.append((entry[0], entry[1]))
+                else:
+                    # Skip malformed
+                    continue
 
             # --- Iterate demo pairs, compute loss, average ---
             valid_pairs = 0
@@ -413,4 +644,12 @@ def run(config: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     state["model"] = base_model
     state["logger"] = logger
     state["phase0_completed"] = True
+    
+    # Add HRM-specific state
+    if puzzle_embedder is not None:
+        state["puzzle_embedder"] = puzzle_embedder
+    state["curriculum_level"] = curriculum_level
+    state["arc_tasks_processed"] = len(arc_tasks) if arc_tasks else 0
+    
+    print(f"[Phase 0] Completed! Processed {state['arc_tasks_processed']} ARC tasks at curriculum level {curriculum_level}")
     return state

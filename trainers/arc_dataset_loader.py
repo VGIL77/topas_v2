@@ -21,20 +21,38 @@ def load_arc_json(challenge_file: str, solution_file: Optional[str] = None):
     Load ARC challenge and solution JSON files
     
     Args:
-        challenge_file: Path to challenges JSON
+        challenge_file: Path to challenges JSON or directory containing JSON files
         solution_file: Optional path to solutions JSON
     
     Returns:
         Tuple of (challenges dict, solutions dict or None)
     """
-    with open(challenge_file, 'r') as f:
-        challenges = json.load(f)
+    challenges = {}
+    solutions = {}
     
-    if solution_file and os.path.exists(solution_file):
-        with open(solution_file, 'r') as f:
-            solutions = json.load(f)
-    else:
+    # Check if it's a directory (individual task files) or a single JSON file
+    if os.path.isdir(challenge_file):
+        # Load individual JSON files from directory
+        json_files = [f for f in os.listdir(challenge_file) if f.endswith('.json')]
+        for json_file in json_files:
+            task_id = json_file.replace('.json', '')
+            file_path = os.path.join(challenge_file, json_file)
+            with open(file_path, 'r') as f:
+                task_data = json.load(f)
+                challenges[task_id] = task_data
+        
+        # For directory format, solutions are in the same file
         solutions = None
+    else:
+        # Original format: single JSON file
+        with open(challenge_file, 'r') as f:
+            challenges = json.load(f)
+        
+        if solution_file and os.path.exists(solution_file):
+            with open(solution_file, 'r') as f:
+                solutions = json.load(f)
+        else:
+            solutions = None
     
     return challenges, solutions
 

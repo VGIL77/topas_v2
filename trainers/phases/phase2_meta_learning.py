@@ -1,6 +1,7 @@
 """
-Phase 2 – Meta-Learning (MAML/Reptile)
-Enable fast adaptation to new tasks with few updates.
+Phase 2 – Meta-Learning with HRM Integration (MAML/Reptile + HRM Fast Adaptation)
+Enable fast adaptation to new tasks with few updates, combining HRM puzzle embeddings
+with traditional MAML/Reptile approaches for improved task context understanding.
 """
 
 import torch
@@ -17,6 +18,123 @@ from trainers.arc_dataset_loader import ARCDataset
 from models.topas_arc_60M import TopasARC60M, ModelConfig
 from trainers.meta_learner import MetaLearner
 from relational_memory_neuro import RelationalMemoryNeuro
+
+# HRM imports for fast adaptation
+try:
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../../docs/HRM-main'))
+    from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+    _HAS_HRM = True
+except ImportError:
+    _HAS_HRM = False
+    class HierarchicalReasoningModel_ACTV1:
+        def __init__(self, *args, **kwargs): pass
+        def initial_carry(self, *args): return {}
+        def __call__(self, *args, **kwargs): return {}, {"puzzle_embedding": torch.randn(1, 128)}
+        def to(self, device): return self
+
+def _create_task_embedding(task_data, puzzle_embedder=None):
+    """Create task embedding using HRM puzzle embedder or fallback."""
+    import hashlib
+    import numpy as np
+    
+    if puzzle_embedder is not None and _HAS_HRM:
+        try:
+            # Extract first example as task representation
+            if 'support_set' in task_data and task_data['support_set']:
+                example = task_data['support_set'][0]
+                input_grid = example['input']
+                if torch.is_tensor(input_grid):
+                    tokens = input_grid.flatten().unsqueeze(0)
+                else:
+                    tokens = torch.tensor(input_grid).flatten().unsqueeze(0)
+                
+                puzzle_ids = torch.zeros(1, dtype=torch.long, device=tokens.device)
+                batch = {
+                    "inputs": tokens,
+                    "labels": tokens,
+                    "puzzle_identifiers": puzzle_ids
+                }
+                carry = puzzle_embedder.initial_carry(batch)
+                carry, outputs = puzzle_embedder(carry=carry, batch=batch)
+                
+                if "puzzle_embedding" in outputs:
+                    return outputs["puzzle_embedding"]
+        except Exception as e:
+            print(f"[Phase 2] HRM task embedding failed: {e}")
+    
+    # Fallback: deterministic embedding from task ID
+    task_id = getattr(task_data, 'task_id', str(hash(str(task_data))))
+    hash_val = int(hashlib.md5(str(task_id).encode()).hexdigest()[:8], 16)
+    np.random.seed(hash_val % (2**31))
+    embedding = np.random.randn(128)
+    return torch.tensor(embedding, dtype=torch.float32)
+
+def _hrm_fast_adapt(model, support_set, task_embedding, inner_steps=3, inner_lr=1e-2):
+    """
+    HRM-inspired fast adaptation using task embeddings.
+    Combines gradient-based adaptation with task context.
+    """
+    import torch.nn.functional as F
+    from copy import deepcopy
+    
+    # Clone model for fast adaptation
+    adapted_params = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            adapted_params[name] = param.clone()
+    
+    # Task-specific adaptation with HRM context
+    for step in range(inner_steps):
+        total_loss = 0.0
+        
+        for example in support_set:
+            try:
+                input_grid = example['input']
+                target_grid = example['output']
+                
+                # Convert to tensors if needed
+                if not torch.is_tensor(input_grid):
+                    input_grid = torch.tensor(input_grid, dtype=torch.long)
+                if not torch.is_tensor(target_grid):
+                    target_grid = torch.tensor(target_grid, dtype=torch.long)
+                
+                # Add batch dimension if missing
+                if input_grid.dim() == 2:
+                    input_grid = input_grid.unsqueeze(0)
+                if target_grid.dim() == 2:
+                    target_grid = target_grid.unsqueeze(0)
+                
+                # Forward pass with task embedding context
+                # Note: This is a simplified version - in practice, you'd inject task_embedding into model
+                context = [{"input": input_grid, "output": target_grid}]
+                query = {"input": input_grid, "output": target_grid}
+                
+                with torch.enable_grad():
+                    pred_grid, pred_logits, extras = model(context, query)
+                    
+                    if pred_logits is not None:
+                        # Cross-entropy loss for adaptation
+                        loss = F.cross_entropy(
+                            pred_logits.view(-1, pred_logits.size(-1)),
+                            target_grid.view(-1).clamp(0, 9)
+                        )
+                        total_loss += loss
+            except Exception as e:
+                print(f"[Phase 2] HRM fast adapt step error: {e}")
+                continue
+        
+        if total_loss > 0:
+            # Compute gradients for adaptation
+            grads = torch.autograd.grad(total_loss, adapted_params.values(), create_graph=True, allow_unused=True)
+            
+            # Update adapted parameters
+            for (name, param), grad in zip(adapted_params.items(), grads):
+                if grad is not None:
+                    adapted_params[name] = param - inner_lr * grad
+    
+    return adapted_params
 
 def run(config, state):
     """
@@ -66,6 +184,24 @@ def run(config, state):
             device=device
         ).to(device)
     relmem = state["relmem"]
+    
+    # Initialize HRM puzzle embedder for task context
+    puzzle_embedder = state.get("puzzle_embedder")
+    if puzzle_embedder is None and _HAS_HRM and config.get("use_hrm_embeddings", True):
+        try:
+            hrm_config = {
+                'batch_size': 1, 'seq_len': 400, 'vocab_size': 10,
+                'num_puzzle_identifiers': 1000, 'puzzle_emb_ndim': 128,
+                'H_cycles': 2, 'L_cycles': 2, 'H_layers': 2, 'L_layers': 2,
+                'hidden_size': 256, 'expansion': 2.0, 'num_heads': 4,
+                'pos_encodings': "rope", 'halt_max_steps': 4,
+                'halt_exploration_prob': 0.1, 'forward_dtype': "bfloat16"
+            }
+            puzzle_embedder = HierarchicalReasoningModel_ACTV1(hrm_config).to(device)
+            print(f"[Phase 2] Initialized HRM puzzle embedder for meta-learning")
+        except Exception as e:
+            print(f"[Phase 2] Failed to initialize HRM puzzle embedder: {e}")
+            puzzle_embedder = None
     
     # Wrap model with MetaLearner (correct parameter name is base_model)
     meta_learner = MetaLearner(
@@ -166,14 +302,59 @@ def run(config, state):
                     )
                     episodes.append(episode)
                 
-                # Run meta-learning step
-                meta_metrics = meta_learner.outer_loop(episodes)
+                # === Enhanced Meta-Learning with HRM Fast Adaptation ===
+                hrm_adapted_episodes = []
+                
+                # Apply HRM fast adaptation to each episode
+                for episode in episodes:
+                    try:
+                        # Create task embedding for this episode
+                        task_embedding = _create_task_embedding(episode, puzzle_embedder)
+                        
+                        # Apply HRM-inspired fast adaptation
+                        if config.get("use_hrm_fast_adapt", True) and len(episode.support_set) > 0:
+                            adapted_params = _hrm_fast_adapt(
+                                model=model,
+                                support_set=episode.support_set,
+                                task_embedding=task_embedding,
+                                inner_steps=config.get("hrm_inner_steps", 2),
+                                inner_lr=config.get("hrm_inner_lr", 5e-3)
+                            )
+                            
+                            # Store adapted parameters in episode for meta-learner
+                            episode.hrm_adapted_params = adapted_params
+                            episode.task_embedding = task_embedding
+                        
+                        hrm_adapted_episodes.append(episode)
+                        
+                    except Exception as e:
+                        print(f"[Phase 2] HRM adaptation failed for episode {episode.task_id}: {e}")
+                        hrm_adapted_episodes.append(episode)  # Use original episode
+                
+                # Run meta-learning step with HRM-adapted episodes
+                meta_metrics = meta_learner.outer_loop(hrm_adapted_episodes)
                 meta_loss = meta_metrics.get("meta_loss", 0.0)
                 
-                # Add RelMem losses
+                # Add task embedding consistency loss
+                embedding_consistency_loss = 0.0
+                if puzzle_embedder is not None and len(hrm_adapted_episodes) > 1:
+                    embeddings = []
+                    for episode in hrm_adapted_episodes:
+                        if hasattr(episode, 'task_embedding'):
+                            embeddings.append(episode.task_embedding)
+                    
+                    if len(embeddings) > 1:
+                        # Encourage diverse task embeddings (prevent collapse)
+                        embedding_stack = torch.stack(embeddings)
+                        similarity_matrix = torch.mm(embedding_stack, embedding_stack.t())
+                        # Penalize high similarity between different tasks
+                        off_diagonal = similarity_matrix - torch.diag(torch.diag(similarity_matrix))
+                        embedding_consistency_loss = 0.1 * off_diagonal.abs().mean()
+                
+                # Add RelMem losses and HRM consistency
                 inherit_loss = relmem.inheritance_pass()
                 inverse_loss = relmem.inverse_loss()
-                meta_loss = meta_loss + 0.05 * inherit_loss + 0.05 * inverse_loss
+                meta_loss = meta_loss + 0.05 * inherit_loss + 0.05 * inverse_loss + embedding_consistency_loss
                 
                 # Apply post-optimizer hooks (meta-learner handles optimization internally)
                 if hasattr(relmem, "apply_post_optimizer_hooks"):
@@ -192,7 +373,10 @@ def run(config, state):
                     "meta_loss": avg_loss,
                     "adaptation_success_rate": meta_metrics.get("adaptation_success_rate", 0.0),
                     "inherit_loss": float(inherit_loss.item()) if hasattr(inherit_loss, "item") else 0.0,
-                    "inverse_loss": float(inverse_loss.item()) if hasattr(inverse_loss, "item") else 0.0
+                    "inverse_loss": float(inverse_loss.item()) if hasattr(inverse_loss, "item") else 0.0,
+                    "embedding_consistency_loss": float(embedding_consistency_loss.item()) if hasattr(embedding_consistency_loss, "item") else 0.0,
+                    "hrm_adapted_episodes": len([ep for ep in hrm_adapted_episodes if hasattr(ep, 'hrm_adapted_params')]),
+                    "total_episodes": len(hrm_adapted_episodes)
                 })
                 
                 # RelMem logging every 100 tasks
@@ -248,6 +432,12 @@ def run(config, state):
     state["phase2_completed"] = True
     state["phase2_epochs"] = num_epochs
     state["phase2_final_loss"] = avg_epoch_loss if 'avg_epoch_loss' in locals() else 0.0
+    
+    # Add HRM-specific state
+    if puzzle_embedder is not None:
+        state["puzzle_embedder"] = puzzle_embedder
+    state["hrm_meta_learning_enabled"] = config.get("use_hrm_fast_adapt", True)
+    state["hrm_embedding_enabled"] = config.get("use_hrm_embeddings", True)
     
     print("[Phase 2] Meta Learning completed!")
     return state

@@ -68,8 +68,17 @@ def run_full_pipeline(config):
     # === Dataset Selection ===
     from trainers.arc_dataset_loader import SyntheticGrammarDataset, ARCDataset
     
-    if config.get("phase0_mode", True):
-        # Always synthetic for Phase 0
+    # HRM integration: Use ARC data throughout when enabled
+    if config.get("hrm_integration_enabled", False):
+        dataset = ARCDataset(
+            challenge_file=config.get("train_challenges", "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training"),
+            solution_file=config.get("train_solutions", "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training"),
+            device=str(device),
+            max_grid_size=config.get("max_grid_size", 30)
+        )
+        print(f"[Dataset] HRM Integration Mode: Using ARCDataset throughout, length={len(dataset)}")
+    elif config.get("phase0_mode", True):
+        # Always synthetic for Phase 0 (legacy mode)
         dataset = SyntheticGrammarDataset(
             num_samples=config.get("dataset_size", 2000),
             max_grid_size=config.get("max_grid_size", 30),
@@ -119,8 +128,8 @@ def run_full_pipeline(config):
     for phase_name, phase_module, config_key in phases:
         print(f"\n{'='*20} {phase_name} {'='*20}")
         
-        # Switch to ARC dataset for Phase 1 onward
-        if config_key == "phase1_policy_distill":
+        # Switch to ARC dataset for Phase 1 onward (unless HRM integration already using ARC)
+        if config_key == "phase1_policy_distill" and not config.get("hrm_integration_enabled", False):
             # Switch to ARC dataset for all later phases
             dataset = ARCDataset(
                 challenge_file=config.get("train_challenges"),
@@ -142,6 +151,45 @@ def run_full_pipeline(config):
         try:
             state = phase_module.run(phase_config, state)
             print(f"✅ {phase_name} completed successfully")
+            
+            # HRM Integration: Curriculum progression and specialized checkpoints
+            if config.get("hrm_integration_enabled", False):
+                # Save HRM-specific checkpoints
+                if config.get("save_hrm_checkpoints", True):
+                    hrm_checkpoint = {
+                        "phase": config_key,
+                        "model_state_dict": state["model"].state_dict() if "model" in state else None,
+                        "puzzle_embedder": state.get("puzzle_embedder"),
+                        "curriculum_level": state.get("curriculum_level", 0),
+                        "hrm_metrics": {
+                            "arc_tasks_processed": state.get("arc_tasks_processed", 0),
+                            "hrm_meta_learning_enabled": state.get("hrm_meta_learning_enabled", False),
+                            "hrm_embedding_enabled": state.get("hrm_embedding_enabled", False)
+                        }
+                    }
+                    checkpoint_path = os.path.join(
+                        config.get("checkpoint_dir", "./checkpoints"), 
+                        f"hrm_{config_key}_checkpoint.pt"
+                    )
+                    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+                    torch.save(hrm_checkpoint, checkpoint_path)
+                    print(f"💾 HRM checkpoint saved: {checkpoint_path}")
+                
+                # Curriculum progression for Phase 0 completion
+                if config_key == "phase0_world_grammar" and config.get("enable_curriculum_learning", True):
+                    curriculum_config = config.get("curriculum_config", {})
+                    current_level = state.get("curriculum_level", 0)
+                    progression_epochs = curriculum_config.get("progression_epochs", [5, 12, 25, 45])
+                    
+                    # Check if we should progress to next curriculum level
+                    global_step = state.get("global_step", 0)
+                    epochs_completed = state.get("phase0_epochs", 0)
+                    
+                    if curriculum_config.get("enable_progression", True) and epochs_completed > 0:
+                        next_level = min(current_level + 1, curriculum_config.get("final_level", 4))
+                        if next_level > current_level and epochs_completed >= progression_epochs[min(current_level, len(progression_epochs)-1)]:
+                            print(f"📈 Curriculum progression: Level {current_level} → {next_level}")
+                            state["curriculum_level"] = next_level
             
             # Log phase completion + check acceptance gates (migrated from master_trainer.py)
             metrics = {
@@ -224,8 +272,23 @@ def run_full_pipeline(config):
         "model_state_dict": state["model"].state_dict() if "model" in state else None,
         "training_complete": True,
         "phases_completed": [key for _, _, key in phases],
-        "final_metrics": state.get("final_metrics", {})
+        "final_metrics": state.get("final_metrics", {}),
+        "hrm_integration_enabled": config.get("hrm_integration_enabled", False)
     }
+    
+    # Add HRM-specific final state
+    if config.get("hrm_integration_enabled", False):
+        final_checkpoint.update({
+            "puzzle_embedder_state": state.get("puzzle_embedder").state_dict() if state.get("puzzle_embedder") else None,
+            "final_curriculum_level": state.get("curriculum_level", 0),
+            "total_arc_tasks_processed": state.get("arc_tasks_processed", 0),
+            "hrm_final_metrics": {
+                "meta_learning_enabled": state.get("hrm_meta_learning_enabled", False),
+                "embedding_enabled": state.get("hrm_embedding_enabled", False),
+                "q_learning_integration": True,
+                "fast_adaptation_enabled": True
+            }
+        })
     
     checkpoint_path = os.path.join(config.get("checkpoint_dir", "./checkpoints"), "topas_arc_prize_final.pt")
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)

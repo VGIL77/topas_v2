@@ -124,51 +124,119 @@ def run(config, state):
             inverse_loss = relmem.inverse_loss()
             loss = loss + 0.05 * inherit_loss + 0.05 * inverse_loss
 
-            # === Distill from Planner → Policy/Value ===
+            # === Enhanced HRM Q-learning Integration ===
+            # Prepare planner input with proper task context
             if hasattr(model, 'grid_to_tokens'):
                 tokens = model.grid_to_tokens(test["input"])   # reuse adapter
             else:
-                # Fallback if grid_to_tokens not available
-                tokens = test["input"].view(test["input"].size(0), -1).clamp(0, 9)
+                # Fallback: flatten and pad grid to sequence
+                flat_grid = test["input"].view(test["input"].size(0), -1).clamp(0, 9)
+                # Pad to consistent sequence length for HRM
+                seq_len = min(400, flat_grid.size(1))  # HRM config seq_len
+                if flat_grid.size(1) < seq_len:
+                    padding = torch.zeros(flat_grid.size(0), seq_len - flat_grid.size(1), 
+                                        dtype=flat_grid.dtype, device=device)
+                    tokens = torch.cat([flat_grid, padding], dim=1)
+                else:
+                    tokens = flat_grid[:, :seq_len]
+            
+            # Use task-specific puzzle identifiers if available
             puzzle_ids = torch.zeros(tokens.size(0), dtype=torch.long, device=device)
-
+            
+            # Enhanced planner batch with Q-learning context
             planner_batch = {
                 "inputs": tokens,
-                "labels": tokens,
+                "labels": tokens,  # Self-supervised on grid reconstruction
                 "puzzle_identifiers": puzzle_ids
             }
+            
+            # Initialize planner carry and run forward pass
             carry = planner.initial_carry(planner_batch)
             carry, planner_out = planner(carry=carry, batch=planner_batch)
+            
+            # Extract Q-learning signals for DSL operation guidance
+            q_halt_logits = planner_out.get("q_halt_logits")
+            q_continue_logits = planner_out.get("q_continue_logits")
+            z_H = planner_out.get("z_H")  # High-level reasoning state
 
-            if "z_H" in planner_out:
+            # === Advanced Q-learning Guided DSL Selection ===
+            distill_loss = torch.tensor(0.0, device=device)
+            q_guided_loss = torch.tensor(0.0, device=device)
+            attention_mask = None
+            
+            if z_H is not None:
                 with torch.no_grad():
-                    z_H = planner_out["z_H"]
-                # Distill latent op bias
-                teacher_logits = planner_op_bias(z_H)
-                student_logits = policy_logits  # Use already computed policy logits
+                    # Generate teacher logits from HRM high-level state
+                    teacher_logits = planner_op_bias(z_H)
+                    
+                    # Use Q-learning signals as attention mask for DSL search
+                    if q_halt_logits is not None and q_continue_logits is not None:
+                        # Create attention mask: high confidence to continue = focus on current operations
+                        q_confidence = torch.sigmoid(q_continue_logits - q_halt_logits)
+                        attention_mask = q_confidence.unsqueeze(-1)  # Broadcast to DSL vocab size
+                        
+                        # Apply attention mask to teacher logits (focus on high-confidence regions)
+                        teacher_logits = teacher_logits * attention_mask
+                    
+                    # HRM reasoning traces to guide policy distillation
+                    if hasattr(extras, 'dsl_trace') and extras.get('dsl_trace') is not None:
+                        # Get actual DSL operations used by the model
+                        dsl_operations = extras['dsl_trace']
+                        
+                        # Create Q-learning guided loss for DSL operation selection
+                        if len(dsl_operations) > 0 and q_halt_logits is not None:
+                            # Convert halt signal to operation preference weights
+                            halt_confidence = torch.sigmoid(q_halt_logits)
+                            
+                            # Higher halt confidence = prefer simpler/fewer operations
+                            # Lower halt confidence = encourage more complex operations
+                            q_operation_weight = 1.0 - halt_confidence
+                            
+                            # Weight the policy loss by Q-learning confidence
+                            q_guided_loss = q_operation_weight * loss_policy
+                
+                # Distill from teacher to student with Q-learning guidance
+                student_logits = policy_logits
+                if attention_mask is not None:
+                    # Apply same attention mask to student logits
+                    student_logits = student_logits * attention_mask
+                
                 distill_loss = F.kl_div(
                     F.log_softmax(student_logits, dim=-1),
                     F.softmax(teacher_logits.detach(), dim=-1),
                     reduction="batchmean"
                 )
-            else:
-                distill_loss = torch.tensor(0.0, device=device)
+            
+            # === Combine losses with Q-learning guidance ===
 
-            # === Total loss ===
-            loss = loss + 0.5 * distill_loss
+            # === Total loss with Q-learning guidance ===
+            total_distill_loss = 0.5 * distill_loss + 0.3 * q_guided_loss
+            loss = loss + total_distill_loss
 
-            # === Compute planner metrics for logging ===
+            # === Enhanced planner metrics with Q-learning signals ===
             planner_logits_entropy = 0.0
             q_halt_mean = 0.0
-            if "z_H" in planner_out and planner_out.get("q_halt_logits") is not None:
+            q_confidence_mean = 0.0
+            attention_strength = 0.0
+            
+            if z_H is not None:
                 with torch.no_grad():
                     # Compute teacher logits entropy
                     if 'teacher_logits' in locals() and teacher_logits is not None:
                         teacher_probs = F.softmax(teacher_logits, dim=-1)
                         planner_logits_entropy = -(teacher_probs * torch.log(teacher_probs + 1e-8)).sum(-1).mean().item()
                     
-                    # Compute halting confidence
-                    q_halt_mean = float(planner_out["q_halt_logits"].mean().item()) if planner_out.get("q_halt_logits") is not None else 0.0
+                    # Q-learning metrics
+                    if q_halt_logits is not None:
+                        q_halt_mean = float(q_halt_logits.mean().item())
+                        
+                    if q_continue_logits is not None and q_halt_logits is not None:
+                        # Confidence in continuing vs halting
+                        q_confidence_mean = float(torch.sigmoid(q_continue_logits - q_halt_logits).mean().item())
+                        
+                    if attention_mask is not None:
+                        # Strength of attention mask (how focused the model is)
+                        attention_strength = float(attention_mask.mean().item())
 
             # === Backward ===
             optimizer.zero_grad()
@@ -253,8 +321,12 @@ def run(config, state):
                 
                 planner_info = {
                     "q_halt": q_halt_mean,
+                    "q_confidence": q_confidence_mean,
+                    "attention_strength": attention_strength,
                     "entropy": planner_logits_entropy,
-                    "kl_loss": distill_loss.item() if distill_loss is not None else 0.0
+                    "kl_loss": distill_loss.item() if distill_loss is not None else 0.0,
+                    "q_guided_loss": q_guided_loss.item() if q_guided_loss is not None else 0.0,
+                    "total_distill_loss": total_distill_loss.item() if total_distill_loss is not None else 0.0
                 }
                 
                 alpha_info = {
