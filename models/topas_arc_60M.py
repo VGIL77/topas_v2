@@ -438,6 +438,14 @@ class TopasARC60M(nn.Module):
         # Painter fallback
         self.painter = NeuralPainter(width=self.config.width)
         
+        # Slot to logits head for pretraining
+        self.num_colors = getattr(self.config, "num_colors", NUM_COLORS)
+        self.slot_to_logits = nn.Sequential(
+            nn.Linear(self.config.slot_dim, self.config.slot_dim),
+            nn.GELU(),
+            nn.Linear(self.config.slot_dim, self.num_colors),
+        )
+        
         # DSL and refinement
         self.ebr = EnergyRefiner(
             min_steps=3,
@@ -2095,16 +2103,87 @@ class TopasARC60M(nn.Module):
         if not self._pretraining_mode:
             raise RuntimeError("Model must be in pretraining mode to use forward_pretraining")
         
-        # Extract neural features
-        features = self.get_neural_features(test_grid)
+        # Normalize input if needed
+        if test_grid.dtype != torch.float32:
+            enc_in = test_grid.float() / (NUM_COLORS - 1)
+        else:
+            enc_in = test_grid
         
-        # Get painter prediction (final grid)
-        grid_pred, _, _ = self.painter(features['feat'])
+        # Get encoder features
+        feat, glob = self.encoder(enc_in)
+        
+        # Get slots and attention from ObjectSlots
+        slots_output = self.slots(feat)
+        
+        # Robust unpacking to get slot_vecs and attention
+        if torch.is_tensor(slots_output):
+            slot_vecs = slots_output
+            attn = None
+        elif isinstance(slots_output, (list, tuple)):
+            slot_vecs = slots_output[0]
+            attn = slots_output[1] if len(slots_output) >= 2 else None
+        else:
+            raise TypeError(f"Unexpected slots_output type: {type(slots_output)}")
+        
+        # Normalize slot_vecs to [B, K, D]
+        if slot_vecs.dim() == 2:   # [B, D] → assume K=1
+            slot_vecs = slot_vecs.unsqueeze(1)
+        
+        # Generate per-slot logits [B, K, C]
+        slot_logits = self.slot_to_logits(slot_vecs)
+        
+        B = slot_logits.size(0)
+        K = slot_logits.size(1)
+        C = self.num_colors
+        
+        # Get actual grid dimensions from input
+        if test_grid.dim() == 2:  # [H, W]
+            H, W = test_grid.shape
+        elif test_grid.dim() == 3:  # [B, H, W] or [C, H, W]
+            if test_grid.size(0) == B:  # [B, H, W]
+                H, W = test_grid.shape[-2:]
+            else:  # [C, H, W]
+                H, W = test_grid.shape[-2:]
+        else:
+            H, W = test_grid.shape[-2:]
+        
+        # Generate per-pixel logits using attention
+        if attn is not None:
+            # Normalize attention shape
+            if attn.dim() == 4:  # [B, K, H, W]
+                attn_flat = attn.view(B, K, H*W)
+            elif attn.dim() == 3:  # Already [B, K, H*W]
+                attn_flat = attn
+            else:
+                # Fallback: uniform attention
+                attn_flat = torch.ones(B, K, H*W, device=slot_vecs.device) / K
+            
+            # Normalize attention over slots
+            attn_flat = torch.softmax(attn_flat, dim=1)  # [B, K, H*W]
+            
+            # Mix slot logits with attention: [B, K, C] x [B, K, P] -> [B, C, P]
+            pixel_logits = torch.einsum("bkc,bkp->bcp", slot_logits, attn_flat)
+            logits = pixel_logits.permute(0, 2, 1).contiguous()  # [B, P, C]
+            logits = logits.view(B, H*W, C)  # [B, H*W, C]
+        else:
+            # Fallback: broadcast slot logits uniformly
+            # Average over slots and repeat for each pixel
+            avg_logits = slot_logits.mean(dim=1)  # [B, C]
+            logits = avg_logits.unsqueeze(1).expand(B, H*W, C)  # [B, H*W, C]
+        
+        # Get painter prediction (for comparison)
+        grid_pred, _, _ = self.painter(feat)
+        
+        # Extract full neural features
+        features = self.get_neural_features(test_grid)
         
         # Prepare predictions dictionary
         predictions = {
+            'logits': logits,  # [B, H*W, C] for cross-entropy loss
             'grid': grid_pred,
-            'features': features
+            'features': features,
+            'slot_vecs': slot_vecs,
+            'slot_logits': slot_logits
         }
         
         return predictions
