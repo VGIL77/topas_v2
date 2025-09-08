@@ -92,15 +92,15 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         
         **kwargs
     ), split=split)
+    # Windows can be finicky with worker pickling; start with conservative settings
+    is_windows = (os.name == "nt")
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-
-        num_workers=1,
-        prefetch_factor=8,
-
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=0 if is_windows else 1,
+        prefetch_factor=None if is_windows else 8,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=False if is_windows else True,
     )
     return dataloader, dataset.metadata
 
@@ -121,17 +121,21 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
-        model: nn.Module = model_cls(model_cfg)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+    # Select device (respect torchrun LOCAL_RANK when present)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
-        # Broadcast parameters from rank 0
-        if world_size > 1:
-            with torch.no_grad():
-                for param in list(model.parameters()) + list(model.buffers()):
-                    dist.broadcast(param, src=0)
+    model: nn.Module = model_cls(model_cfg)
+    model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+    model = model.to(device)
+    if "DISABLE_COMPILE" not in os.environ:
+        model = torch.compile(model, dynamic=False)  # type: ignore
+
+    # Broadcast parameters from rank 0 (after placement), if distributed
+    if world_size > 1:
+        with torch.no_grad():
+            for param in list(model.parameters()) + list(model.buffers()):
+                dist.broadcast(param, src=0)
 
     # Optimizers and lr
     optimizers = [
@@ -171,7 +175,13 @@ def cosine_schedule_with_warmup_lr_lambda(
 
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     # Estimated total training steps
-    total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    raw_steps = (
+        config.epochs
+        * train_metadata.total_groups
+        * train_metadata.mean_puzzle_examples
+        / max(1, config.global_batch_size)
+    )
+    total_steps = max(1, int(math.ceil(raw_steps)))
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size=world_size)
@@ -207,9 +217,9 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
 
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+    if train_state.step >= train_state.total_steps:
+        return  # graceful stop
     train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
-        return
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
@@ -300,7 +310,12 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
+                model_device = next(train_state.model.parameters()).device
+                metric_values = torch.zeros(
+                    (len(set_ids), len(metrics.values())),
+                    dtype=torch.float32,
+                    device=model_device,
+                )
                 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
