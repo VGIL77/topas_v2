@@ -59,17 +59,30 @@ def run_full_pipeline(config):
     
     print(f"[Config] Strict mode: {config.get('strict', False)}")
     
-    # Initialize shared state
-    state = {
-        "logger": TrainLogger(config.get("log_dir", "./logs/arc_prize")),
-        "global_step": 0
-    }
+    # Check if initial_state was provided (from HRM-TOPAS integration)
+    if "initial_state" in config:
+        print("✅ Using provided initial_state with HRM-TOPAS integration")
+        state = config["initial_state"].copy()
+        # Ensure logger is set if not provided
+        if "logger" not in state:
+            state["logger"] = TrainLogger(config.get("log_dir", "./logs/arc_prize"))
+    else:
+        print("⚠️  No initial_state provided, creating fresh state")
+        # Initialize shared state
+        state = {
+            "logger": TrainLogger(config.get("log_dir", "./logs/arc_prize")),
+            "global_step": 0
+        }
     
     # === Dataset Selection ===
     from trainers.arc_dataset_loader import SyntheticGrammarDataset, ARCDataset
     
-    # HRM integration: Use ARC data throughout when enabled
-    if config.get("hrm_integration_enabled", False):
+    # Use dataset from initial_state if provided, otherwise create fresh dataset
+    if "dataset" in state:
+        dataset = state["dataset"]
+        print(f"[Dataset] Using provided dataset from initial_state, length={len(dataset)}")
+    elif config.get("hrm_integration_enabled", False):
+        # HRM integration: Use ARC data throughout when enabled
         dataset = ARCDataset(
             challenge_file=config.get("train_challenges", "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training"),
             solution_file=config.get("train_solutions", "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training"),
@@ -77,6 +90,7 @@ def run_full_pipeline(config):
             max_grid_size=config.get("max_grid_size", 30)
         )
         print(f"[Dataset] HRM Integration Mode: Using ARCDataset throughout, length={len(dataset)}")
+        state["dataset"] = dataset
     elif config.get("phase0_mode", True):
         # Always synthetic for Phase 0 (legacy mode)
         dataset = SyntheticGrammarDataset(

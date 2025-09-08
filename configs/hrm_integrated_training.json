@@ -1,0 +1,220 @@
+{
+  "global": {
+    "device": "cuda",
+    "log_dir": "logs/hrm_integrated_v1/",
+    "checkpoint_dir": "checkpoints/hrm_integrated_v1/",
+    "epochs": 120,
+    "steps_per_epoch": 400,
+    "batch_size": 8,
+    "num_workers": 4,
+    "use_amp": true,
+    "eval_interval": 2,
+    "save_checkpoint_interval": 5
+  },
+
+  "phase0_world_grammar": {
+    "epochs": 3,
+    "steps_per_epoch": 300,
+    "arc_data_path": "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
+    "curriculum_level": 0,
+    "use_hrm_embeddings": true,
+    "painter_only": true,
+    "use_dsl": false,
+    "use_ebr": false,
+    "use_relations": false,
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0,
+    "log_interval": 25
+  },
+
+  "phase1_policy_distill": {
+    "steps": 6000,
+    "min_beam_score": 0.2,
+    "self_play_interval": 50,
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0,
+    "log_interval": 20,
+    "eval_interval_steps": 1000,
+    "use_planner": true,
+    "planner_freeze": true,
+    "planner_kl_weight": 0.5,
+    "planner_q_guided_weight": 0.3,
+    "relmem_loss_weight": 0.05,
+    "hrm_attention_mask": true,
+    "hrm_q_learning_guidance": true
+  },
+
+  "phase2_meta_learning": {
+    "algo": "maml",
+    "meta_lr": 1e-4,
+    "inner_lr": 1e-2,
+    "inner_steps": 3,
+    "num_epochs": 8,
+    "tasks_per_meta_batch": 12,
+    "log_interval": 10,
+    "use_planner_gating": true,
+    "use_hrm_fast_adapt": true,
+    "use_hrm_embeddings": true,
+    "hrm_inner_steps": 2,
+    "hrm_inner_lr": 5e-3,
+    "embedding_consistency_weight": 0.1
+  },
+
+  "phase3_self_critique": {
+    "enable_counterexamples": true,
+    "epochs": 4,
+    "batch_size": 2,
+    "max_counterexamples": 3,
+    "bootstrap_weight": 0.5,
+    "learning_rate": 5e-5,
+    "weight_decay": 1.0,
+    "log_interval": 10,
+    "use_hrm_reasoning": true
+  },
+
+  "phase4_mcts_alpha": {
+    "steps": 500,
+    "mcts_depth": 12,
+    "deep_mining_interval": 200,
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0,
+    "log_interval": 20,
+    "use_hrm_guidance": true
+  },
+
+  "phase5_dream_scaled": {
+    "epochs": 6,
+    "steps_per_epoch": 400,
+    "dream_interval": 100,
+    "log_interval": 25,
+    "use_task_embeddings": true
+  },
+
+  "phase6_neuro_priors": {
+    "epochs": 6,
+    "steps_per_epoch": 400,
+    "verbose": true,
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0,
+    "exploration_weight": 2.0,
+    "empowerment_weight": 0.3,
+    "sync_weight": 0.2,
+    "use_difficulty_estimator": true,
+    "feature_dim": 128,
+    "hidden_dim": 256,
+    "num_difficulty_levels": 5,
+    "w_phi": 0.1,
+    "w_kappa": 0.1,
+    "w_cge": 0.1,
+    "log_interval": 20,
+    "hrm_prior_guidance": true
+  },
+
+  "phase7_relmem": {
+    "epochs": 6,
+    "steps_per_epoch": 400,
+    "inverse_loss_w": 0.05,
+    "max_concepts": 4096,
+    "rank": 16,
+    "wta_frac": 0.1,
+    "wta_warmup_updates": 50,
+    "hebbian_interval": 1,
+    "wta_interval": 10,
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0,
+    "log_interval": 20,
+    "hrm_memory_integration": true
+  },
+
+  "phase8_sgi_optimizer": {
+    "epochs": 3,
+    "steps_per_epoch": 400,
+    "sharpness": 0.1,
+    "base_lr": 1e-4,
+    "weight_decay": 1.0,
+    "log_interval": 25
+  },
+
+  "phase9_ensemble_solver": {
+    "steps": 150,
+    "num_experts": 5,
+    "strategies": ["neural", "dsl", "hybrid", "hrm_guided"],
+    "voting_method": "weighted",
+    "confidence_threshold": 0.7,
+    "log_interval": 10,
+    "hrm_ensemble_weighting": true
+  },
+
+  "phase10_production": {
+    "epochs": 25,
+    "steps_per_epoch": 600,
+    "dream_interval": 100,
+    "eval_interval": 2,
+    "learning_rate": 5e-5,
+    "weight_decay": 1.0,
+    "log_interval": 50,
+    "optimizer_config": {
+      "base_lr": 1e-4,
+      "max_lr": 2e-3,
+      "clip_grad": 1.0,
+      "weight_decay": 1e-5
+    },
+    "ensemble_config": {
+      "num_samples": 8,
+      "temperature": 0.9,
+      "use_self_consistency": true,
+      "hrm_consensus_weighting": true
+    }
+  },
+
+  "train_challenges": "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
+  "train_solutions": "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
+  "eval_challenges": "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/evaluation",
+  "eval_solutions": "/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/evaluation",
+
+  "hrm_config": {
+    "batch_size": 1,
+    "seq_len": 400,
+    "vocab_size": 10,
+    "num_puzzle_identifiers": 1000,
+    "puzzle_emb_ndim": 128,
+    "H_cycles": 3,
+    "L_cycles": 4,
+    "H_layers": 4,
+    "L_layers": 4,
+    "hidden_size": 512,
+    "expansion": 3.0,
+    "num_heads": 8,
+    "pos_encodings": "rope",
+    "halt_max_steps": 6,
+    "halt_exploration_prob": 0.1,
+    "forward_dtype": "bfloat16",
+    "learning_rate": 1e-4,
+    "weight_decay": 1.0
+  },
+
+  "curriculum_config": {
+    "enable_progression": true,
+    "initial_level": 0,
+    "progression_epochs": [5, 12, 25, 45],
+    "final_level": 4,
+    "difficulty_threshold": 0.7
+  },
+
+  "model_config": {
+    "slot_dim": 128,
+    "dsl_vocab_size": 64,
+    "use_dsl": true,
+    "use_ebr": true,
+    "use_relations": true,
+    "painter_only_phase0": true
+  },
+
+  "phase0_mode": true,
+  "strict": true,
+  "dry_run": false,
+  "validate_between_phases": true,
+  "enable_curriculum_learning": true,
+  "hrm_integration_enabled": true,
+  "save_hrm_checkpoints": true
+}
