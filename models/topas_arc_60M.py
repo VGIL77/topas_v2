@@ -853,15 +853,31 @@ class TopasARC60M(nn.Module):
             feat, glob = encoder_output
             
             slots_output = self.slots(feat)
+            # Accept all known signatures from ObjectSlots:
+            #  (a) Tensor:                slot_vecs [B, K, D]
+            #  (b) (slot_vecs, attn)
+            #  (c) (slot_vecs, attn, hier_features)
             if self.config.verbose:
-                print(f"[DEBUG] Slots returned {len(slots_output)} values")
-            
-            if len(slots_output) == 2:
-                slot_vecs, _ = slots_output
-            elif len(slots_output) == 3:
-                slot_vecs, _, _ = slots_output  # Unpack all 3 values
+                try:
+                    _desc = f"type={type(slots_output)}, len={len(slots_output) if isinstance(slots_output,(list,tuple)) else 'n/a'}"
+                except Exception:
+                    _desc = f"type={type(slots_output)}"
+                print(f"[DEBUG] Slots return {_desc}")
+
+            if torch.is_tensor(slots_output):
+                slot_vecs = slots_output
+            elif isinstance(slots_output, (list, tuple)):
+                if len(slots_output) >= 1:
+                    slot_vecs = slots_output[0]
+                else:
+                    raise ValueError("ObjectSlots returned empty sequence")
             else:
-                raise ValueError(f"Unexpected slots output length: {len(slots_output)}")
+                raise TypeError(f"Unexpected slots_output type: {type(slots_output)}")
+
+            # Normalize to [B, K, D]
+            if slot_vecs.dim() == 2:   # e.g., [B, D] → assume K=1
+                slot_vecs = slot_vecs.unsqueeze(1)
+            assert slot_vecs.dim() == 3, f"Expected slot_vecs [B,K,D], got {tuple(slot_vecs.shape)}"
             slots_rel = self.reln(slot_vecs)
             pooled = slots_rel.mean(dim=1)
             
@@ -2029,7 +2045,22 @@ class TopasARC60M(nn.Module):
         
         # Extract features using model components
         feat, glob = self.encoder(enc_in)
-        slot_vecs, _ = self.slots(feat)
+        
+        # Robust unpacking for ObjectSlots output
+        slots_output = self.slots(feat)
+        if torch.is_tensor(slots_output):
+            slot_vecs = slots_output
+        elif isinstance(slots_output, (list, tuple)):
+            if len(slots_output) >= 1:
+                slot_vecs = slots_output[0]
+            else:
+                raise ValueError("ObjectSlots returned empty sequence")
+        else:
+            raise TypeError(f"Unexpected slots_output type: {type(slots_output)}")
+        
+        # Normalize to [B, K, D]
+        if slot_vecs.dim() == 2:   # e.g., [B, D] → assume K=1
+            slot_vecs = slot_vecs.unsqueeze(1)
         slots_rel = self.reln(slot_vecs)
         pooled = slots_rel.mean(dim=1)
         
