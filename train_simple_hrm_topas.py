@@ -48,8 +48,11 @@ def create_models(device):
         "H_layers": 4,
         "L_layers": 4,
         "hidden_size": 512,
+        "expansion": 3.0,
         "num_heads": 8,
+        "pos_encodings": "rope",
         "halt_max_steps": 6,
+        "halt_exploration_prob": 0.1,
         "forward_dtype": "bfloat16",
     }
     hrm_model = HierarchicalReasoningModel_ACTV1(hrm_config).to(device)
@@ -140,7 +143,7 @@ def main():
     topas_model, hrm_model = create_models(device)
 
     dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
 
     optimizer = optim.AdamW(topas_model.parameters(), lr=1e-4, weight_decay=1e-5)
     scaler = torch.amp.GradScaler()
