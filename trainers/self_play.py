@@ -82,11 +82,12 @@ class SelfPlayBuffer:
         Kaggle-safe helper to generate puzzles from demos using wormhole mining.
         Only applies transformations to existing ARC training data.
         """
-        if not demos:
-            return []
-        
-        # Use existing generate_from_wormhole logic
-        return self.generate_from_wormhole(demos, wormhole, themes=None, top_k=top_k)
+        try:
+            gen = self.generate_from_wormhole(demos, wormhole, themes=None, top_k=top_k)
+        except Exception:
+            gen = []
+        print(f"[SelfPlay] generate_batch produced={len(gen)} (wormhole={'yes' if wormhole is not None else 'no'})")
+        return gen[:top_k] if gen else []
     
     def sample_batch(self, n: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Sample n items from the buffer"""

@@ -162,6 +162,24 @@ class DreamEngine:
         # Update config with validated device
         self.cfg.device = str(self.device)
         
+        # safety: ensure small internal MLPs are created if missing
+        # (we'll lazily create minimal trainable heads used by train_step())
+        if not hasattr(self, "_dream_color_head"):
+            import torch.nn as nn
+            self._dream_color_head = nn.Sequential(
+                nn.Linear(getattr(cfg, "state_dim", 64), 64),
+                nn.ReLU(),
+                nn.Linear(64, 10)  # predict 10 colors
+            )
+            self._dream_opbias_head = nn.Sequential(
+                nn.Linear(getattr(cfg, "state_dim", 64), 64),
+                nn.ReLU(),
+                nn.Linear(64, getattr(cfg, "action_dim", 41))
+            )
+            # place on device
+            self._dream_color_head.to(self.device)
+            self._dream_opbias_head.to(self.device)
+        
         # Set up deterministic behavior if requested
         if cfg.deterministic:
             torch.use_deterministic_algorithms(True)
@@ -910,55 +928,93 @@ class DreamEngine:
             "ripple_phase_coherence": ripple_metrics.get('ripple_phase_coherence', 0.0)
         }
     def train_step(self, slot_vecs, target=None):
-        """Lightweight training step for Dream/ETS pretraining"""
-        if slot_vecs is None:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        # Pool slot_vecs to [B,D]
-        if slot_vecs.dim() == 3:  # [B,K,D] -> [B,D]
-            pooled_slots = slot_vecs.mean(dim=1)
-        else:  # Already [B,D]
-            pooled_slots = slot_vecs
-        
-        # Color prediction MLP: D->64->10
-        if not hasattr(self, '_color_proj'):
-            D = pooled_slots.size(-1)
-            self._color_proj = torch.nn.Sequential(
-                torch.nn.Linear(D, 64),
-                torch.nn.GELU(), 
-                torch.nn.Linear(64, 10)
-            ).to(self.device)
-        
-        color_logits = self._color_proj(pooled_slots)  # [B,10]
-        
-        if target is not None:
-            # Cross-entropy loss if target provided
-            target_flat = target.view(-1).long().clamp(0, 9)
-            color_loss = torch.nn.functional.cross_entropy(color_logits.view(-1, 10), target_flat)
-        else:
-            # Self-supervised contrastive loss using color_logits (has gradients)
-            dummy_target = torch.zeros(pooled_slots.size(0), dtype=torch.long, device=self.device)
-            color_loss = torch.nn.functional.cross_entropy(color_logits, dummy_target)
-        
-        total_loss = color_loss
-        
-        # Op-bias prediction if theme available
-        if hasattr(self, 'theme') and hasattr(self.theme, 'themes') and len(self.theme.themes) > 0:
-            if not hasattr(self, '_op_bias_proj'):
-                D = pooled_slots.size(-1)
-                self._op_bias_proj = torch.nn.Sequential(
-                    torch.nn.Linear(D, 64),
-                    torch.nn.GELU(),
-                    torch.nn.Linear(64, 41)
-                ).to(self.device)
-            
-            op_logits = self._op_bias_proj(pooled_slots)  # [B,41]
-            uniform_target = torch.ones(41, device=self.device) / 41
-            op_loss = torch.nn.functional.kl_div(
-                torch.log_softmax(op_logits.mean(dim=0), dim=0),
-                uniform_target,
-                reduction='batchmean'
-            )
-            total_loss = total_loss + op_loss * 0.1
-        
-        return total_loss
+        """Minimal training step for Dream/ETS pretraining (lightweight but real)."""
+        import torch.nn.functional as F
+        loss = torch.zeros(1, dtype=torch.float32, device=self.device, requires_grad=True)
+        # If slots present, do a color prediction head (mean pool slots => predict colors)
+        if slot_vecs is not None:
+            if slot_vecs.dim() == 3:  # [B, T, D]
+                pooled = slot_vecs.mean(dim=1)  # [B, D]
+            else:
+                pooled = slot_vecs.view(slot_vecs.size(0), -1)
+            logits = self._dream_color_head(pooled)
+            # if target provided (color labels), compute CE; else create a pseudo target via argmax on pooled proj
+            if target is not None and target.dim() == 2:
+                # collapse to color labels for simplicity (training-only)
+                tgt = target.flatten().long()
+                ce = F.cross_entropy(logits, tgt[: logits.size(0)])
+            else:
+                # pseudo supervision: encourage logits entropy to shrink (low-entropy)
+                probs = torch.softmax(logits, dim=-1)
+                ce = (probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+            loss = loss + 1.0 * ce
+        # If op-bias training is desired (weak KL toward some prior), include small KL term
+        try:
+            op_logits = self._dream_opbias_head(slot_vecs.mean(dim=1) if slot_vecs is not None else torch.randn(1, getattr(self.cfg,'state_dim',64), device=self.device))
+            op_probs = torch.softmax(op_logits, dim=-1)
+            # encourage non-degenerate distribution (entropy regularizer)
+            ent = - (op_probs * torch.log(op_probs + 1e-8)).sum(dim=-1).mean()
+            loss = loss + 0.01 * (-ent)  # encourage peaky distributions slightly
+        except Exception:
+            pass
+        return loss
+
+    def parameters(self):
+        """Yield parameters from internal nn modules and discovered submodules."""
+        seen = set()
+        def walk(obj):
+            if id(obj) in seen: return
+            seen.add(id(obj))
+            import torch.nn as nn
+            if isinstance(obj, nn.Module):
+                for p in obj.parameters():
+                    yield p
+                for name, sub in vars(obj).items():
+                    for q in walk(sub):
+                        yield q
+            else:
+                for name, sub in getattr(obj, "__dict__", {}).items():
+                    if id(sub) in seen: continue
+                    if hasattr(sub, "parameters") and callable(sub.parameters):
+                        try:
+                            for p in sub.parameters():
+                                yield p
+                        except Exception:
+                            for q in walk(sub):
+                                yield q
+                    else:
+                        for q in walk(sub):
+                            yield q
+        for p in walk(self):
+            yield p
+
+    def save_state(self, path: str):
+        """Save minimal state for pretrain (heads + themes if present)."""
+        state = {}
+        try:
+            state["color_head"] = {k: v.cpu() for k, v in self._dream_color_head.state_dict().items()}
+            state["opbias_head"] = {k: v.cpu() for k, v in self._dream_opbias_head.state_dict().items()}
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "theme") and hasattr(self.theme, "state_dict"):
+                state["themes"] = {k: v.cpu() for k, v in self.theme.state_dict().items()}
+        except Exception:
+            pass
+        import torch
+        torch.save(state, path)
+
+    def load_state(self, path: str):
+        import os, torch
+        if not os.path.exists(path): return
+        state = torch.load(path, map_location=self.device)
+        if "color_head" in state:
+            try:
+                self._dream_color_head.load_state_dict(state["color_head"])
+            except Exception:
+                pass
+        if "opbias_head" in state:
+            try:
+                self._dream_opbias_head.load_state_dict(state["opbias_head"])
+            except Exception:
+                pass

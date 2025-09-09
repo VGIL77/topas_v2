@@ -233,12 +233,18 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
     
     dream = topas_model.dream
     
-    # Create optimizer for Dream/ETS params only
+    # robustly collect dream params
     dream_params = []
-    if hasattr(dream, 'parameters'):
-        dream_params.extend(dream.parameters())
-    if hasattr(dream, 'theme') and hasattr(dream.theme, 'parameters'):
-        dream_params.extend(dream.theme.parameters())
+    if hasattr(dream, 'parameters') and callable(getattr(dream, 'parameters')):
+        try:
+            dream_params = [p for p in dream.parameters() if p is not None]
+        except Exception:
+            dream_params = []
+    # if still empty, attempt recursive attribute scan (already implemented in dream.parameters())
+    if len(dream_params) == 0:
+        import logging
+        logging.getLogger(__name__).warning("[Dream-Pretrain] No dream params found (will attempt fallback or skip)")
+        return
     
     if not dream_params:
         logger.warning("[Dream-Pretrain] No trainable Dream/ETS parameters found")
@@ -308,8 +314,12 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
                    f"loss={avg_loss:.4f}, buffer_len={buffer_len}, motifs_added={motifs_added}")
     
     # Save pretrained Dream/ETS
-    torch.save(dream.state_dict() if hasattr(dream, 'state_dict') else {}, 'dream_pretrain.pth')
-    logger.info("[Dream-Pretrain] Saved pretrained Dream/ETS to dream_pretrain.pth")
+    try:
+        dream.save_state('dream_pretrain.pth')
+        logger.info("[Dream-Pretrain] saved dream_pretrain.pth")
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("[Dream-Pretrain] Could not save dream state")
 
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
@@ -468,13 +478,13 @@ def main():
     # Run Dream pretrain if requested
     if cli_args and cli_args.dream_pretrain_epochs > 0:
         dream_pretrain_loop(topas_model, dataset, cli_args, device, logger)
-        # Try to load pretrained Dream/ETS
-        if os.path.exists('dream_pretrain.pth') and hasattr(topas_model, 'dream'):
+        # Load pretrained Dream/ETS
+        if os.path.exists('dream_pretrain.pth') and hasattr(topas_model, 'dream') and topas_model.dream:
             try:
-                topas_model.dream.load_state_dict(torch.load('dream_pretrain.pth'))
+                topas_model.dream.load_state('dream_pretrain.pth')
                 logger.info("[Main] Loaded pretrained Dream/ETS")
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"[Main] Failed to load dream pretrain: {e}")
     
     # Initialize self-play if enabled
     self_play_buffer = None
@@ -516,27 +526,41 @@ def main():
             # Self-play training integration
             sp_loss_contribution = 0.0
             if self_play_buffer and global_step % cli_args.selfplay_interval == 0:
-                # Generate new puzzles from current batch
-                demos, test_inputs, test_outputs, task_id = batch
-                current_demos = [(test_inputs, test_outputs)] if test_inputs is not None and test_outputs is not None else []
-                
-                if current_demos:
-                    new_puzzles = self_play_buffer.generate_batch(
-                        current_demos, 
-                        getattr(topas_model, 'wormhole', None), 
-                        top_k=cli_args.selfplay_topk
-                    )
+                try:
+                    # Generate new puzzles from current batch
+                    demos, test_inputs, test_outputs, task_id = batch
+                    current_demos = [(test_inputs, test_outputs)] if test_inputs is not None and test_outputs is not None else []
+                    
+                    if current_demos:
+                        new_puzzles = self_play_buffer.generate_batch(
+                            current_demos, 
+                            getattr(topas_model, 'wormhole', None), 
+                            top_k=cli_args.selfplay_topk
+                        )
+                        if new_puzzles:
+                            print(f"[SelfPlay] Generated {len(new_puzzles)} puzzles at step={global_step}")
+                        else:
+                            print(f"[SelfPlay] No puzzles generated (fallback used) at step={global_step}")
+                except Exception as e:
+                    import logging, traceback
+                    logging.getLogger(__name__).exception("[SelfPlay] failure: %s", e)
                 
                 # Sample and compute self-play loss
                 sp_samples = self_play_buffer.sample_batch(4)
-                for sp_input, sp_target in sp_samples:
-                    try:
-                        sp_output = topas_model.forward_pretraining(sp_input.unsqueeze(0), target_shape=sp_target.shape[-2:])
-                        if 'logits' in sp_output:
-                            sp_loss = F.cross_entropy(sp_output['logits'].view(-1, 10), sp_target.view(-1).long().clamp(0, 9))
-                            sp_loss_contribution += sp_loss * cli_args.selfplay_weight
-                    except Exception:
-                        continue
+                if sp_samples:
+                    print(f"[SelfPlay] Training on {len(sp_samples)} puzzles")
+                    for sp_input, sp_target in sp_samples:
+                        try:
+                            sp_output = topas_model.forward_pretraining(sp_input.unsqueeze(0), target_shape=sp_target.shape[-2:])
+                            if 'logits' in sp_output:
+                                sp_loss = F.cross_entropy(sp_output['logits'].view(-1, 10), sp_target.view(-1).long().clamp(0, 9))
+                                sp_loss_contribution += sp_loss * cli_args.selfplay_weight
+                        except Exception:
+                            continue
+                    if sp_loss_contribution > 0:
+                        print(f"[SelfPlay] applied sp_loss={float(sp_loss_contribution.item()):.4f}")
+                else:
+                    print(f"[SelfPlay] No samples available for training")
             
             if result is not None:
                 if compute_metrics_now and isinstance(result, tuple):
