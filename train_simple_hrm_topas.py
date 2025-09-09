@@ -516,6 +516,37 @@ def main():
             
             result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now, global_step=global_step)
             
+            # Self-play training integration
+            if self_play_buffer and global_step % cli_args.selfplay_interval == 0:
+                sp_samples = self_play_buffer.sample_batch(4)  # Small batch size
+                if sp_samples:
+                    sp_loss_total = 0.0
+                    for sp_input, sp_target in sp_samples:
+                        try:
+                            # Forward pass on self-play sample
+                            with torch.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
+                                sp_output = topas_model.forward_pretraining(
+                                    sp_input.unsqueeze(0), 
+                                    target_shape=sp_target.shape[-2:]
+                                )
+                                if 'logits' in sp_output and sp_output['logits'] is not None:
+                                    sp_logits = sp_output['logits']
+                                    sp_target_flat = sp_target.view(-1).long().clamp(0, 9)
+                                    sp_loss = F.cross_entropy(
+                                        sp_logits.view(-1, 10)[:sp_target_flat.size(0)], 
+                                        sp_target_flat
+                                    )
+                                    sp_loss_total += sp_loss * cli_args.selfplay_weight
+                        except Exception:
+                            continue  # Skip failed samples
+                    
+                    # Backward pass for self-play loss
+                    if sp_loss_total > 0:
+                        optimizer.zero_grad()
+                        sp_loss_total.backward()
+                        torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=1.0)
+                        optimizer.step()
+            
             if result is not None:
                 if compute_metrics_now and isinstance(result, tuple):
                     loss, metrics = result
@@ -568,13 +599,30 @@ def main():
                     avg_em_refined = sum(epoch_metrics['exact_match_refined']) / len(epoch_metrics['exact_match_refined'])
                     summary += f", EM_ebr={avg_em_refined:.2%}"
                 
-                # Track best metrics
+                # Track best metrics and save checkpoints
                 if avg_em > best_em:
                     best_em = avg_em
                     print(f"🎯 New best EM: {best_em:.2%}")
+                    
+                    # Save best EM checkpoint with metric in filename
+                    best_em_filename = f"best_em_{best_em*100:.1f}.pt"
+                    torch.save(topas_model.state_dict(), best_em_filename)
+                    print(f"💾 Saved best EM checkpoint: {best_em_filename}")
+                    
                 if avg_acc > best_acc:
                     best_acc = avg_acc
                     print(f"🎯 New best accuracy: {best_acc:.2%}")
+                    
+                    # Save best accuracy checkpoint with metric in filename
+                    best_acc_filename = f"best_acc_{best_acc*100:.1f}.pt"
+                    torch.save(topas_model.state_dict(), best_acc_filename)
+                    print(f"💾 Saved best accuracy checkpoint: {best_acc_filename}")
+                
+                # Periodic evaluation checkpoints (every eval_interval epochs)
+                if cli_args and hasattr(cli_args, 'eval_interval') and (epoch + 1) % cli_args.eval_interval == 0:
+                    eval_filename = f"eval_epoch_{epoch+1}_em_{avg_em*100:.1f}.pt"
+                    torch.save(topas_model.state_dict(), eval_filename)
+                    print(f"📊 Saved evaluation checkpoint: {eval_filename}")
             
             print(summary)
 
@@ -606,6 +654,36 @@ def main():
                                 epoch_metrics.setdefault('exact_match_refined', []).append(float(em_ebr))
                             # log other stats
                             logging.info("[Dream-Trainer] Full dream stats keys: %s", list(stats.keys()))
+                        
+                        # Generate self-play puzzles after dream cycle
+                        if self_play_buffer and cli_args and cli_args.selfplay_enable:
+                            try:
+                                # Sample recent training examples for transformation
+                                recent_samples = []
+                                sample_count = 0
+                                for batch_idx, batch in enumerate(dataloader):
+                                    if sample_count >= cli_args.selfplay_topk:
+                                        break
+                                    try:
+                                        demos, test_inputs, test_outputs, task_id = batch
+                                        if test_inputs is not None and test_outputs is not None:
+                                            recent_samples.append((test_inputs, test_outputs))
+                                            sample_count += 1
+                                    except:
+                                        continue
+                                
+                                if recent_samples and hasattr(topas_model, 'wormhole'):
+                                    new_puzzles = self_play_buffer.generate_from_wormhole(
+                                        recent_samples, 
+                                        topas_model.wormhole,
+                                        themes=getattr(topas_model.dream, 'theme', None) if hasattr(topas_model, 'dream') else None,
+                                        top_k=cli_args.selfplay_topk
+                                    )
+                                    if new_puzzles:
+                                        print(f"🎮 Generated {len(new_puzzles)} self-play puzzles (buffer: {len(self_play_buffer.buffer)})")
+                                        
+                            except Exception as e:
+                                print(f"⚠️  Self-play generation failed: {e}")
                     else:
                         logging.info("[Dream-Trainer] Dream disabled in model config; skipping full cycle.")
         except Exception:

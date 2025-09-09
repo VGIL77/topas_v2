@@ -1965,7 +1965,18 @@ class TopasARC60M(nn.Module):
             B, C, H, W = logits.shape
             cons = ARCGridConstraints(expect_symmetry=None, color_hist=None, sparsity=None)
             
-            refined_logits = self.ebr(logits, cons, priors)  # differentiable
+            # Get theme priors for EBR gating
+            theme_embed = self._get_theme_embed_from_dream(extras)
+            theme_priors = self._generate_theme_priors(theme_embed, extras)
+            
+            # Apply theme prior scaling
+            scaled_priors = priors.copy()
+            for key in ['phi', 'kappa', 'cge']:
+                if key in scaled_priors:
+                    scale = theme_priors.get('symmetry' if key == 'phi' else 'connectivity', 1.0)
+                    scaled_priors[key] = scaled_priors[key] * scale
+            
+            refined_logits = self.ebr(logits, cons, scaled_priors)  # differentiable
             
             class ArgmaxSTE(torch.autograd.Function):
                 @staticmethod
@@ -2000,6 +2011,25 @@ class TopasARC60M(nn.Module):
             elif hasattr(theme_obj, 'themes') and len(theme_obj.themes) > 0:
                 return theme_obj.themes[0].embedding
         return torch.zeros(self.config.slot_dim, device=next(self.parameters()).device)
+    
+    def _generate_theme_priors(self, theme_embed, extras):
+        """Generate simple priors from theme embedding for EBR gating"""
+        theme_priors = {'symmetry': 1.0, 'connectivity': 1.0}
+        
+        if theme_embed is not None and theme_embed.numel() > 0:
+            # Extract simple priors from theme embedding
+            embed_norm = torch.norm(theme_embed).item()
+            embed_mean = theme_embed.mean().item()
+            
+            # Symmetry prior: based on embedding regularity
+            symmetry_score = 1.0 + 0.3 * abs(embed_mean)  # Boost if theme has clear bias
+            theme_priors['symmetry'] = min(2.0, max(0.5, symmetry_score))
+            
+            # Connectivity prior: based on embedding magnitude
+            connectivity_score = 1.0 + 0.2 * min(embed_norm, 2.0)  # Boost for stronger themes
+            theme_priors['connectivity'] = min(1.5, max(0.7, connectivity_score))
+        
+        return theme_priors
     
     @torch.no_grad()
     def run_dream_cycle(self, demos_programs=None, tokens: Optional[torch.Tensor] = None):
@@ -2521,8 +2551,18 @@ class TopasARC60M(nn.Module):
                 except:
                     pass
                 
-                # Run EBR refinement
-                refined_logits_4d = self.ebr(logits_4d, constraint_obj, priors)
+                # Run EBR refinement with theme priors
+                theme_embed = self._get_theme_embed_from_dream(extras)
+                theme_priors = self._generate_theme_priors(theme_embed, extras)
+                
+                # Apply theme prior scaling
+                scaled_priors = priors.copy()
+                for key in ['phi', 'kappa', 'cge']:
+                    if key in scaled_priors:
+                        scale = theme_priors.get('symmetry' if key == 'phi' else 'connectivity', 1.0)
+                        scaled_priors[key] = scaled_priors[key] * scale
+                
+                refined_logits_4d = self.ebr(logits_4d, constraint_obj, scaled_priors)
                 refined_grid = refined_logits_4d.argmax(dim=1)  # [B, H, W]
                 
                 outputs["refined_grid"] = refined_grid
