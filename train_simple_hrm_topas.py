@@ -18,6 +18,7 @@ import threading
 import time
 import json
 import traceback
+import numpy as np
 from typing import Optional, Dict, Any
 from pathlib import Path
 from trainers.arc_dataset_loader import ARCDataset
@@ -232,6 +233,20 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         return
     
     dream = topas_model.dream
+    # Move dream to the same device as the model
+    if hasattr(dream, 'device'):
+        # Update device and move internal modules
+        dream.device = device
+        # Move internal modules if they exist
+        if hasattr(dream, '_dream_color_head') and dream._dream_color_head is not None:
+            dream._dream_color_head = dream._dream_color_head.to(device)
+        if hasattr(dream, '_dream_theme_head') and dream._dream_theme_head is not None:
+            dream._dream_theme_head = dream._dream_theme_head.to(device)
+        if hasattr(dream, 'nmda') and dream.nmda is not None:
+            for attr_name in dir(dream.nmda):
+                attr = getattr(dream.nmda, attr_name)
+                if isinstance(attr, torch.nn.Module):
+                    setattr(dream.nmda, attr_name, attr.to(device))
     
     # robustly collect dream params
     dream_params = []
@@ -265,25 +280,52 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         motifs_added = 0
         buffer_len = 0
         
-        for batch_idx, (demos, test_grid, target_grid) in enumerate(dataloader):
+        for batch_idx, batch in enumerate(dataloader):
+            demos, test_grid, target_grid, task_id = batch
             if batch_idx >= cli_args.dream_pretrain_batches:
                 break
+                
+            # Convert test_grid to tensor if it's not already
+            if not isinstance(test_grid, torch.Tensor):
+                if isinstance(test_grid, list):
+                    test_grid = test_grid[0] if len(test_grid) > 0 else torch.zeros((1, 3, 3))
+                    
+            # Ensure tensor is on the right device
+            test_grid = test_grid.to(device)
+            if target_grid is not None and not isinstance(target_grid, torch.Tensor):
+                target_grid = torch.tensor(target_grid) if isinstance(target_grid, (list, np.ndarray)) else target_grid
+                target_grid = target_grid.to(device)
                 
             # Get slot features from model (no grad if frozen)
             with torch.no_grad() if cli_args.dream_pretrain_freeze_model else torch.enable_grad():
                 extras = {}
                 if hasattr(topas_model, 'encoder'):
+                    # Ensure batch dimension
+                    if test_grid.dim() == 2:
+                        test_grid = test_grid.unsqueeze(0)
                     enc_in = test_grid.float() / 9.0  # Normalize
                     feat, glob = topas_model.encoder(enc_in)
                     if hasattr(topas_model, 'slots'):
                         slot_vecs = topas_model.slots(feat)
                         if isinstance(slot_vecs, tuple):
                             slot_vecs = slot_vecs[0]
-                        extras['latent'] = slot_vecs
+                        # Ensure slot_vecs has correct shape [B, num_slots, slot_dim]
+                        if slot_vecs.dim() == 2:
+                            slot_vecs = slot_vecs.unsqueeze(1)  # Add slot dimension
+                        
+                        # Concatenate global features with slot vectors to match state_dim
+                        # DreamEngine expects state_dim = width + slot_dim
+                        B, K, D = slot_vecs.shape
+                        glob_expanded = glob.unsqueeze(1).expand(B, K, -1)  # [B, K, width]
+                        combined_state = torch.cat([glob_expanded, slot_vecs], dim=-1)  # [B, K, width+slot_dim]
+                        extras['latent'] = combined_state
             
             # Train Dream/ETS
             if hasattr(dream, 'train_step'):
-                loss = dream.train_step(extras.get('latent'), target=target_grid)
+                latent = extras.get('latent')
+                if latent is not None:
+                    print(f"[Dream-Debug] latent shape: {latent.shape}, target shape: {target_grid.shape if target_grid is not None else None}")
+                loss = dream.train_step(latent, target=target_grid)
             else:
                 # Minimal fallback: reconstruction loss
                 if 'latent' in extras and extras['latent'] is not None:

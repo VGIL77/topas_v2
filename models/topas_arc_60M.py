@@ -19,6 +19,15 @@ import logging
 # Module-level flag for one-time EBR theme prior warning
 _WARNED_EBR_THEME_PRIOR_MISSING = False
 
+def _ensure_extras(extras: Optional[Dict] = None) -> Dict:
+    """
+    Ensure extras is a dict. Use this at function entry to avoid UnboundLocalError when
+    functions both read and write 'extras' in different code paths.
+    """
+    if isinstance(extras, dict):
+        return extras
+    return {}
+
 # Add paths for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -742,8 +751,11 @@ class TopasARC60M(nn.Module):
         if training_mode is None:
             training_mode = self.training
             
-        # Initialize extras early to prevent scope errors
-        extras = {}
+        # Initialize extras early to prevent scope errors - use canonical helper
+        extras = _ensure_extras(None)
+        
+        # Ensure torch is available in this scope
+        import torch
         
         # Input validation
         if not demos:
@@ -1955,13 +1967,16 @@ class TopasARC60M(nn.Module):
         except Exception:
             return False
     
-    def _apply_ebr(self, logits: torch.Tensor, priors: dict, extras: dict = None) -> torch.Tensor:
+    def _apply_ebr(self, logits: torch.Tensor, priors: dict, extras: Optional[Dict] = None) -> torch.Tensor:
         """
         Apply EnergyRefiner with grad safety:
         - Pass continuous logits into refinement
         - Use STE only at the output interface
         - Mark success/failure explicitly in extras
         """
+        # Ensure extras is canonical at function entry
+        extras = _ensure_extras(extras)
+        
         try:
             if self.config.verbose:
                 print("[EBR] Refining output (grad-safe)")
@@ -1971,9 +1986,6 @@ class TopasARC60M(nn.Module):
             
             B, C, H, W = logits.shape
             cons = ARCGridConstraints(expect_symmetry=None, color_hist=None, sparsity=None)
-            
-            # canonical extras guard
-            extras = extras if isinstance(extras, dict) else {}
             
             # safe theme embed + priors
             try:
@@ -2018,16 +2030,25 @@ class TopasARC60M(nn.Module):
                 extras["ebr_error"] = str(e)
             return logits.softmax(dim=1).argmax(dim=1)  # honest fallback
     
-    def _get_theme_embed_from_dream(self, extras):
-        """Get theme embedding from DreamEngine for op-bias contribution"""
+    def _get_theme_embed_from_dream(self, extras: Optional[Dict] = None):
+        """Get theme embedding from DreamEngine for op-bias contribution. Be defensive if extras is None."""
+        # Ensure extras is a dict using canonical helper
+        extras = _ensure_extras(extras)
+        
         if self.dream and hasattr(self.dream, 'theme'):
             theme_obj = self.dream.theme
             if hasattr(theme_obj, 'get_embedding'):
-                latents = extras.get('latent', None)
-                if latents is not None:
-                    return theme_obj.get_embedding(latents)
+                try:
+                    latents = extras.get('latent', None)
+                    if latents is not None:
+                        return theme_obj.get_embedding(latents)
+                except Exception:
+                    pass  # Fall through to defaults
             elif hasattr(theme_obj, 'themes') and len(theme_obj.themes) > 0:
-                return theme_obj.themes[0].embedding
+                try:
+                    return theme_obj.themes[0].embedding
+                except Exception:
+                    pass  # Fall through to defaults
         return torch.zeros(self.config.slot_dim, device=next(self.parameters()).device)
     
     def _generate_theme_priors(self, theme_embed, extras):
