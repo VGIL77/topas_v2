@@ -2101,7 +2101,7 @@ class TopasARC60M(nn.Module):
             'brain': brain          # Control vector [B, ctrl_dim]
         }
     
-    def forward_pretraining(self, test_grid: torch.Tensor, hrm_latents=None, target_shape=None) -> Dict[str, torch.Tensor]:
+    def forward_pretraining(self, test_grid: torch.Tensor, hrm_latents=None, target_shape=None, demos=None, global_step=0) -> Dict[str, torch.Tensor]:
         """
         Forward pass optimized for pretraining (no DSL search, just neural features)
         
@@ -2265,28 +2265,64 @@ class TopasARC60M(nn.Module):
         # Convert logits to predicted grid for DSL training
         pred_grid = logits.argmax(dim=-1).view(B, H, W)  # [B, H, W]
         
-        # DSL execution loss (if enabled)
+        # DSL execution loss (if enabled and after warm-up)
         losses = {}
         if self.config.use_dsl_loss:
+            # Anneal lambda_dsl: start very small, ramp up after epoch 10
+            step_ratio = global_step / 60000.0  # 150 epochs * 400 steps
+            if step_ratio < 0.1:  # First 10% of training
+                lambda_dsl_annealed = 0.001  # Very small
+            else:
+                lambda_dsl_annealed = 0.001 + (self.config.lambda_dsl - 0.001) * (step_ratio - 0.1) / 0.9
+            
             try:
-                # Real DSL program execution
-                from .dsl_search import DSLProgram, apply_program
-                import random
+                from .dsl_search import DSLProgram, apply_program, beam_search
                 
-                # Generate simple random program
-                available_ops = ["identity", "rotate90", "rotate180", "rotate270", "flip_horizontal", "flip_vertical"]
-                num_ops = random.randint(1, 3)  # 1-3 operations
-                ops = random.choices(available_ops, k=num_ops)
-                params = [{}] * num_ops  # Most ops don't need params
+                # Use real demos if available, otherwise fallback
+                demo_grids = demos if demos and len(demos) > 0 else []
                 
-                dsl_program = DSLProgram(ops=ops, params=params)
+                # Get priors from relational processing for op_bias
+                priors_dict = {}
+                if hasattr(self, 'reln') and hasattr(self.reln, 'get_operation_bias'):
+                    priors_dict = self.reln.get_operation_bias(slot_vecs)
                 
-                # Apply program to predicted grid
-                dsl_output_grid = apply_program(pred_grid.squeeze(0), dsl_program)  # Remove batch dim
-                dsl_output_grid = dsl_output_grid.unsqueeze(0)  # Add batch dim back
+                # Use beam search with real inputs
+                dsl_result = beam_search(
+                    demo_grids, 
+                    pred_grid.squeeze(0).cpu().numpy(),  # Convert to numpy for beam_search
+                    priors_dict, 
+                    depth=2, 
+                    beam=3, 
+                    verbose=False
+                )
                 
-                # Create target logits from DSL output
-                dsl_target_flat = dsl_output_grid.view(B, -1).long()
+                if isinstance(dsl_result, tuple):
+                    dsl_grid, rule_info = dsl_result
+                else:
+                    dsl_grid = dsl_result
+                
+                # Fallback if beam search fails
+                if dsl_grid is None:
+                    # Simple identity transform
+                    dsl_grid = pred_grid.squeeze(0).clone()
+                
+                # Ensure tensor format
+                if not isinstance(dsl_grid, torch.Tensor):
+                    dsl_grid = torch.tensor(dsl_grid, device=pred_grid.device)
+                
+                # Proper shape alignment
+                if dsl_grid.dim() == 2:
+                    dsl_grid = dsl_grid.unsqueeze(0)  # Add batch dim
+                
+                if dsl_grid.shape[-2:] != (H, W):
+                    dsl_grid = torch.nn.functional.interpolate(
+                        dsl_grid.float().unsqueeze(1), 
+                        size=(H, W), 
+                        mode="nearest"
+                    ).long().squeeze(1)
+                
+                # Create target logits using reshape
+                dsl_target_flat = dsl_grid.reshape(B, -1).long()
                 dsl_logits = torch.zeros_like(logits)
                 dsl_logits.scatter_(-1, dsl_target_flat.unsqueeze(-1), 1.0)
                 
@@ -2296,7 +2332,7 @@ class TopasARC60M(nn.Module):
                     dsl_logits,
                     reduction='batchmean'
                 )
-                losses["dsl_loss"] = dsl_loss * 0.01  # Scale appropriately
+                losses["dsl_loss"] = dsl_loss * lambda_dsl_annealed
             except Exception as e:
                 import logging
                 logging.warning(f"DSL loss skipped: {e}")
@@ -2336,31 +2372,29 @@ class TopasARC60M(nn.Module):
         # 3. Run EnergyRefiner if enabled
         if self.config.use_ebr:
             try:
-                # Create simple constraint object for ARC grids
-                class ARCConstraint:
-                    def __init__(self, target_grid):
-                        self.target = target_grid
-                    
-                    def fit_loss(self, logits_4d):
-                        # Cross-entropy loss against target
-                        B, C, H, W = logits_4d.shape
-                        target_flat = self.target.view(B, -1).long()
-                        logits_flat = logits_4d.permute(0, 2, 3, 1).reshape(B, H*W, C)
-                        return F.cross_entropy(logits_flat.view(-1, C), target_flat.view(-1))
-                    
-                    def violation_loss(self, logits_4d):
-                        # Simple smoothness constraint
-                        return torch.zeros(1, device=logits_4d.device)
+                # Import real ARC constraints
+                from trainers.arc_constraints import ARCGridConstraints
                 
-                # Convert logits to 4D format for EBR
+                # Define C properly
+                C = logits.shape[-1]  # Number of colors
+                
+                # Convert logits to [B, C, H, W] format
                 logits_4d = logits.view(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
                 
-                # Create constraint and prior tensors
-                constraint_obj = ARCConstraint(target_grid)
-                prior_tensors = {'phi': 0.0, 'kappa': 0.0, 'cge': 0.0, 'hodge': 0.0}
+                # Use real ARC constraints
+                constraint_obj = ARCGridConstraints()
+                
+                # Collect priors from features if available
+                priors = {'phi': 0.0, 'kappa': 0.0, 'cge': 0.0, 'hodge': 0.0}
+                try:
+                    features_dict = outputs.get('features', {})
+                    if isinstance(features_dict, dict):
+                        priors.update({k: v for k, v in features_dict.items() if k in priors})
+                except:
+                    pass
                 
                 # Run EBR refinement
-                refined_logits_4d = self.ebr(logits_4d, constraint_obj, prior_tensors)
+                refined_logits_4d = self.ebr(logits_4d, constraint_obj, priors)
                 refined_grid = refined_logits_4d.argmax(dim=1)  # [B, H, W]
                 
                 outputs["refined_grid"] = refined_grid
@@ -2369,8 +2403,7 @@ class TopasARC60M(nn.Module):
                 exact_match = (refined_grid == target_grid).all(dim=(1,2)).float().mean().item()
                 outputs["exact_match_refined"] = exact_match
             except Exception as e:
-                import logging
-                logging.warning(f"EBR refinement skipped: {e}")
+                print(f"EBR refinement skipped: {e}")  # Simple print instead of logging
                 outputs["refined_grid"] = torch.tensor(base_grid, device=test_grid.device)
                 outputs["exact_match_refined"] = 0.0
         else:

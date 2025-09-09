@@ -134,13 +134,16 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             hrm_latents = None
 
         with torch.amp.autocast(device_type, enabled=(device.type=='cuda')):
-            # Pass target shape to fix mismatches + optional HRM latents
+            # Pass target shape, demos, and global_step for complete DSL+EBR integration
             target_shape = target_grid.shape[-2:]  # (H, W)
             try:
-                if hrm_latents is not None:
-                    outputs = topas_model.forward_pretraining(input_grid, hrm_latents=hrm_latents, target_shape=target_shape)
-                else:
-                    outputs = topas_model.forward_pretraining(input_grid, target_shape=target_shape)
+                outputs = topas_model.forward_pretraining(
+                    input_grid, 
+                    hrm_latents=hrm_latents, 
+                    target_shape=target_shape,
+                    demos=demos,
+                    global_step=global_step
+                )
             except TypeError:
                 # Fallback for older signature
                 outputs = topas_model.forward_pretraining(input_grid)
@@ -175,19 +178,14 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                     label_smoothing=label_smoothing
                 )
                 
-                # Add DSL losses with curriculum (ramp up weight over time)
+                # Add DSL losses (weight already annealed in model)
                 total_loss = ce_loss
                 if 'losses' in outputs and outputs['losses']:
-                    # DSL loss curriculum: start low, ramp up
-                    max_steps = 60000  # 150 epochs * 400 steps
-                    step_ratio = min(global_step / max_steps, 1.0)
-                    lambda_dsl = 0.01 + 0.09 * step_ratio  # 0.01 → 0.1
-                    
                     for loss_name, loss_value in outputs['losses'].items():
                         if loss_name == 'dsl_loss':
-                            total_loss = total_loss + lambda_dsl * loss_value
+                            total_loss = total_loss + loss_value  # Weight already applied in model
                             if global_step % 100 == 0:  # Log occasionally
-                                logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}, lambda_dsl={lambda_dsl:.3f}")
+                                logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
                 
                 loss = total_loss
             else:
