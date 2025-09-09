@@ -21,6 +21,38 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     return logging
 
+def compute_metrics(predictions, targets):
+    """Compute evaluation metrics: exact match, per-cell accuracy, and IoU."""
+    # predictions: [B, H*W, C] logits
+    # targets: [B, H, W] grids
+    
+    B = predictions.size(0)
+    preds = predictions.argmax(dim=-1)  # [B, H*W]
+    targets_flat = targets.view(B, -1)  # [B, H*W]
+    
+    # Exact match (entire grid correct)
+    exact_match = (preds == targets_flat).all(dim=1).float().mean().item()
+    
+    # Per-cell accuracy
+    accuracy = (preds == targets_flat).float().mean().item()
+    
+    # IoU per color (mean over colors)
+    ious = []
+    for c in range(10):  # NUM_COLORS
+        pred_c = (preds == c)
+        target_c = (targets_flat == c)
+        intersection = (pred_c & target_c).sum().float()
+        union = (pred_c | target_c).sum().float()
+        if union > 0:
+            ious.append((intersection / union).item())
+    mean_iou = sum(ious) / len(ious) if ious else 0.0
+    
+    return {
+        'exact_match': exact_match,
+        'accuracy': accuracy,
+        'mean_iou': mean_iou
+    }
+
 def create_models(device):
     print("🔧 Creating HRM-TOPAS integrated models...")
     topas_config = ModelConfig()
@@ -60,7 +92,7 @@ def create_models(device):
 
     return topas_model, hrm_model
 
-def train_step(topas_model, hrm_model, batch, optimizer, scaler, device):
+def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
     optimizer.zero_grad()
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
@@ -106,14 +138,28 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device):
 
             # Expect outputs to be dict-like and contain 'logits'
             if isinstance(outputs, dict) and 'logits' in outputs:
-                logits = outputs['logits']
-                target_flat = target_grid.view(target_grid.size(0), -1).long()
-
-                if logits.dim() == 4:  # [B, C, H, W]
-                    logits = logits.view(logits.size(0), logits.size(1), -1)
-                    logits = logits.transpose(1, 2)  # [B, H*W, C]
-
-                loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), target_flat.view(-1))
+                logits = outputs['logits']  # Should already be [B, H*W, C]
+                
+                # Ensure target is properly shaped
+                B = logits.size(0)
+                H, W = target_grid.shape[-2:]
+                target_flat = target_grid.view(B, -1).long()
+                
+                # Verify shapes match
+                if logits.size(1) != target_flat.size(1):
+                    logging.error(f"Shape mismatch: logits {logits.shape} vs target {target_flat.shape}")
+                    return None
+                
+                # Sanity check targets
+                assert (target_flat >= 0).all() and (target_flat < 10).all(), f"Invalid target values: {target_flat.unique()}"
+                
+                # Cross-entropy with label smoothing
+                label_smoothing = 0.05
+                loss = nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), 
+                    target_flat.reshape(-1),
+                    label_smoothing=label_smoothing
+                )
             else:
                 logging.error("train_step: outputs missing 'logits'; keys=%s", (list(outputs.keys()) if isinstance(outputs, dict) else type(outputs)))
                 return None
@@ -123,10 +169,19 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device):
             return None
 
         scaler.scale(loss).backward()
+        
+        # Gradient clipping for stability
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=1.0)
+        
         scaler.step(optimizer)
         scaler.update()
 
-        return loss.item() if isinstance(loss, torch.Tensor) else None
+        if return_metrics:
+            metrics = compute_metrics(logits, target_grid)
+            return loss.item(), metrics
+        else:
+            return loss.item() if isinstance(loss, torch.Tensor) else None
 
     except Exception:
         logging.exception("Exception in train_step")
@@ -148,38 +203,100 @@ def main():
     optimizer = optim.AdamW(topas_model.parameters(), lr=1e-4, weight_decay=1e-5)
     scaler = torch.amp.GradScaler()
 
-    num_epochs = 2
+    num_epochs = 120  # Full training run
     total_steps = len(dataset) * num_epochs
     print(f"Training: {num_epochs} epochs, {total_steps} total steps")
+    
+    # Time estimation
+    estimated_time_hours = total_steps / (10 * 3600)  # Assuming ~10 it/s from smoke test
+    print(f"⏱️  Estimated training time: {estimated_time_hours:.1f} hours ({estimated_time_hours*60:.0f} minutes)")
 
     print("\n🎯 Starting training loop...")
     print(">>> TRAIN STARTED")
     global_step = 0
+    best_em = 0.0
+    best_acc = 0.0
 
     for epoch in range(num_epochs):
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
         epoch_losses = []
+        epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': []}
         from tqdm import tqdm
         progress = tqdm(dataloader, desc=f"Epoch {epoch+1}")
 
         for batch_idx, batch in enumerate(progress):
-            loss = train_step(topas_model, hrm_model, batch, optimizer, scaler, device)
-            if loss is not None:
-                epoch_losses.append(loss)
+            # Compute metrics every 10 steps
+            compute_metrics_now = (global_step % 10 == 0)
+            
+            result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now)
+            
+            if result is not None:
+                if compute_metrics_now and isinstance(result, tuple):
+                    loss, metrics = result
+                    epoch_losses.append(loss)
+                    for k, v in metrics.items():
+                        epoch_metrics[k].append(v)
+                else:
+                    loss = result
+                    if loss is not None:
+                        epoch_losses.append(loss)
+            
             global_step += 1
 
+            # Update progress bar
             if len(epoch_losses) > 0:
-                avg_loss = sum(epoch_losses) / len(epoch_losses)
-                progress.set_postfix({"loss": f"{avg_loss:.4f}", "step": global_step})
+                postfix = {"loss": f"{sum(epoch_losses[-10:]) / min(10, len(epoch_losses)):.4f}", "step": global_step}
+                if len(epoch_metrics['exact_match']) > 0:
+                    postfix['EM'] = f"{sum(epoch_metrics['exact_match'][-5:]) / min(5, len(epoch_metrics['exact_match'])):.2%}"
+                    postfix['acc'] = f"{sum(epoch_metrics['accuracy'][-5:]) / min(5, len(epoch_metrics['accuracy'])):.2%}"
+                progress.set_postfix(postfix)
 
-            if global_step >= 50:
-                print("Reached smoke test limit (50 steps). Exiting early.")
-                break
+            # Save checkpoint every 5 epochs
+            if global_step % (len(dataset) * 5) == 0 and global_step > 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': topas_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': sum(epoch_losses[-100:]) / min(100, len(epoch_losses)) if epoch_losses else 0,
+                    'best_em': best_em,
+                    'best_acc': best_acc
+                }
+                torch.save(checkpoint, f'checkpoint_step_{global_step}.pt')
+                print(f"💾 Saved checkpoint at step {global_step}")
 
         if len(epoch_losses) > 0:
             avg_loss = sum(epoch_losses) / len(epoch_losses)
-            print(f"Epoch {epoch+1} complete: avg_loss={avg_loss:.4f}")
+            summary = f"Epoch {epoch+1} complete: avg_loss={avg_loss:.4f}"
+            
+            if len(epoch_metrics['exact_match']) > 0:
+                avg_em = sum(epoch_metrics['exact_match']) / len(epoch_metrics['exact_match'])
+                avg_acc = sum(epoch_metrics['accuracy']) / len(epoch_metrics['accuracy'])
+                avg_iou = sum(epoch_metrics['mean_iou']) / len(epoch_metrics['mean_iou'])
+                summary += f", EM={avg_em:.2%}, acc={avg_acc:.2%}, IoU={avg_iou:.3f}"
+                
+                # Track best metrics
+                if avg_em > best_em:
+                    best_em = avg_em
+                    print(f"🎯 New best EM: {best_em:.2%}")
+                if avg_acc > best_acc:
+                    best_acc = avg_acc
+                    print(f"🎯 New best accuracy: {best_acc:.2%}")
+            
+            print(summary)
 
+    # Save final checkpoint
+    final_checkpoint = {
+        'epoch': num_epochs,
+        'global_step': global_step,
+        'model_state_dict': topas_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_em': best_em,
+        'best_acc': best_acc
+    }
+    torch.save(final_checkpoint, 'checkpoint_final.pt')
+    print(f"💾 Saved final checkpoint: best_em={best_em:.2%}, best_acc={best_acc:.2%}")
+    
     print("\n🎉 Training completed successfully!")
     return True
 

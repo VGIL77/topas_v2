@@ -446,6 +446,9 @@ class TopasARC60M(nn.Module):
             nn.Linear(self.config.slot_dim, self.num_colors),
         )
         
+        # Pixel fallback head for when attention is unavailable
+        self.pixel_fallback = nn.Conv2d(self.config.width, self.num_colors, kernel_size=1)
+        
         # DSL and refinement
         self.ebr = EnergyRefiner(
             min_steps=3,
@@ -2155,21 +2158,42 @@ class TopasARC60M(nn.Module):
             elif attn.dim() == 3:  # Already [B, K, H*W]
                 attn_flat = attn
             else:
-                # Fallback: uniform attention
-                attn_flat = torch.ones(B, K, H*W, device=slot_vecs.device) / K
+                # Unexpected attention shape, use pixel fallback
+                attn = None
             
-            # Normalize attention over slots
-            attn_flat = torch.softmax(attn_flat, dim=1)  # [B, K, H*W]
+            if attn is not None:
+                # Check if attention is already normalized (avoid double-softmax)
+                attn_sum = attn_flat.sum(dim=1, keepdim=True)  # [B, 1, H*W]
+                is_normalized = torch.allclose(attn_sum.mean(), torch.ones(1, device=attn_sum.device), atol=0.1)
+                
+                if not is_normalized:
+                    # Normalize attention over slots only if not already normalized
+                    attn_flat = torch.softmax(attn_flat, dim=1)  # [B, K, H*W]
+                
+                # Mix slot logits with attention: [B, K, C] x [B, K, P] -> [B, C, P]
+                pixel_logits = torch.einsum("bkc,bkp->bcp", slot_logits, attn_flat)
+                logits = pixel_logits.permute(0, 2, 1).contiguous()  # [B, P, C]
+                logits = logits.view(B, H*W, C)  # [B, H*W, C]
+            else:
+                attn = None  # Force pixel fallback
+        
+        if attn is None:
+            # Use pixel fallback head instead of uniform attention
+            pixel_logits = self.pixel_fallback(feat)  # [B, C, H', W']
             
-            # Mix slot logits with attention: [B, K, C] x [B, K, P] -> [B, C, P]
-            pixel_logits = torch.einsum("bkc,bkp->bcp", slot_logits, attn_flat)
-            logits = pixel_logits.permute(0, 2, 1).contiguous()  # [B, P, C]
-            logits = logits.view(B, H*W, C)  # [B, H*W, C]
-        else:
-            # Fallback: broadcast slot logits uniformly
-            # Average over slots and repeat for each pixel
-            avg_logits = slot_logits.mean(dim=1)  # [B, C]
-            logits = avg_logits.unsqueeze(1).expand(B, H*W, C)  # [B, H*W, C]
+            # Ensure spatial dimensions match
+            if pixel_logits.shape[-2:] != (H, W):
+                pixel_logits = torch.nn.functional.interpolate(
+                    pixel_logits, size=(H, W), mode='bilinear', align_corners=False
+                )
+            
+            # Reshape to [B, H*W, C]
+            logits = pixel_logits.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+            logits = logits.view(B, H*W, C)
+        
+        # Sanity checks for training hygiene
+        assert torch.isfinite(logits).all(), "Non-finite logits detected"
+        assert logits.shape == (B, H*W, C), f"Logits shape mismatch: expected {(B, H*W, C)}, got {logits.shape}"
         
         # Get painter prediction (for comparison)
         grid_pred, _, _ = self.painter(feat)
