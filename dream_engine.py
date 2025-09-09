@@ -909,3 +909,8 @@ class DreamEngine:
             "ripple_active_steps": ripple_metrics.get('ripple_active_steps', 0),
             "ripple_phase_coherence": ripple_metrics.get('ripple_phase_coherence', 0.0)
         }
+    def train_step(self, slot_vecs, target=None):
+        """Minimal training step for Dream/ETS pretraining"""
+        # Simple reconstruction loss placeholder
+        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        return loss

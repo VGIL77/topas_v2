@@ -11,11 +11,123 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 import sys, os, logging
+import argparse
+import threading
+import time
+import json
+import traceback
+from typing import Optional, Dict, Any
 from pathlib import Path
 from trainers.arc_dataset_loader import ARCDataset
 from models.topas_arc_60M import TopasARC60M, ModelConfig
 from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train TOPAS+HRM (with DreamEngine controls)")
+    # Dream engine controls
+    parser.add_argument("--enable-dream", action="store_true", default=False,
+                        help="Enable DreamEngine (micro ticks during forward) and offline cycles.")
+    parser.add_argument("--dream-micro-ticks", type=int, default=1,
+                        help="Number of micro dream ticks to run during each forward_pretraining call.")
+    parser.add_argument("--dream-full-every", type=int, default=10,
+                        help="Run a full offline dream consolidation every N epochs. 0 disables.")
+    parser.add_argument("--dream-full-timeout", type=int, default=600,
+                        help="Log timeout threshold (seconds) for full dream cycle; used for warnings only.")
+    parser.add_argument("--dream-background", action="store_true", default=False,
+                        help="If set, run full dream cycles in a background daemon thread (risky if dream touches model GPU state).")
+    parser.add_argument("--dream-force-cpu", action="store_true", default=False,
+                        help="Hint: prefer CPU for offline dream cycle if supported (not enforced here).")
+
+    # Dream pretrain args
+    parser.add_argument("--dream-pretrain-epochs", type=int, default=0,
+                        help="Number of epochs for Dream/ETS pretraining (default 0 = disabled)")
+    parser.add_argument("--dream-pretrain-lr", type=float, default=1e-4,
+                        help="Learning rate for Dream pretraining")
+    parser.add_argument("--dream-pretrain-batches", type=int, default=200,
+                        help="Number of batches per Dream pretrain epoch")
+    parser.add_argument("--dream-pretrain-freeze-model", action="store_true", default=False,
+                        help="Freeze main model during Dream pretraining")
+    
+    # Self-play args
+    parser.add_argument("--selfplay-enable", action="store_true", default=False,
+                        help="Enable self-play with template-guided puzzles")
+    parser.add_argument("--selfplay-interval", type=int, default=200,
+                        help="Generate self-play puzzles every N steps")
+    parser.add_argument("--selfplay-weight", type=float, default=0.1,
+                        help="Weight for self-play loss")
+    parser.add_argument("--selfplay-topk", type=int, default=3,
+                        help="Number of puzzles to generate per self-play round")
+    parser.add_argument("--selfplay-buffer-size", type=int, default=200,
+                        help="Maximum size of self-play buffer")
+    
+    # Eval args
+    parser.add_argument("--eval-interval", type=int, default=5,
+                        help="Run evaluation every N epochs")
+    
+    args, _unknown = parser.parse_known_args()
+    return args
+
+def run_dream_cycle_safe(model,
+                         timeout_sec: int = 600,
+                         background: bool = False,
+                         force_cpu: bool = False,
+                         logger=None) -> Optional[Dict[str, Any]]:
+    """
+    Run model.run_dream_cycle() robustly.
+
+    - Checks model has run_dream_cycle
+    - Skips if no cached tokens and model.run_dream_cycle requires tokens
+    - Logs start/end, duration, returned stats (if any)
+    - Optionally runs in a background daemon thread (default False).
+
+    Returns the dict returned by run_dream_cycle() if called and returned; otherwise None.
+    """
+    logger = logger or logging.getLogger(__name__)
+
+    if not hasattr(model, "run_dream_cycle"):
+        logger.warning("[Dream] model has no run_dream_cycle() method; skipping.")
+        return None
+
+    # Best-effort: prefer to pass cached tokens if available
+    tokens = getattr(model, "_dream_tokens", None)
+
+    def _call_cycle():
+        try:
+            t0 = time.time()
+            logger.info("[Dream] Full cycle started (force_cpu=%s) ...", force_cpu)
+            # Call with tokens if available; wrap in try/except
+            try:
+                if tokens is not None:
+                    stats = model.run_dream_cycle(tokens=tokens)
+                else:
+                    # Some implementations accept no args
+                    stats = model.run_dream_cycle()
+            except TypeError:
+                # Older signature - call without tokens
+                stats = model.run_dream_cycle()
+            duration = time.time() - t0
+            logger.info("[Dream] Full cycle finished in %.1f s. stats=%s", duration, repr(stats))
+            return stats
+        except Exception as e:
+            logger.warning("[Dream] Full cycle failed: %s\n%s", repr(e), traceback.format_exc())
+            return None
+
+    if background:
+        # Run asynchronously in a daemon thread and return immediately.
+        logger.warning("[Dream] Running full dream cycle in background thread (thread-safety warning).")
+        th = threading.Thread(target=_call_cycle, daemon=True, name="dream_cycle_thread")
+        th.start()
+        return None
+    else:
+        # Run synchronously (blocking) and return stats. Use a simple watchdog for long runs (warning only).
+        t_start = time.time()
+        stats = _call_cycle()
+        t_total = time.time() - t_start
+        if t_total > timeout_sec:
+            logger.warning("[Dream] Full cycle exceeded timeout threshold %ds (took %.1fs)", timeout_sec, t_total)
+        return stats
 
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -99,6 +211,100 @@ def create_models(device):
 
     return topas_model, hrm_model
 
+def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
+    """
+    Tiny Dream-Pretrain phase: train Dream/ETS only for a few epochs
+    """
+    if not cli_args or cli_args.dream_pretrain_epochs <= 0:
+        return
+        
+    logger.info(f"[Dream-Pretrain] Starting {cli_args.dream_pretrain_epochs} epochs")
+    
+    # Check if model has dream engine
+    if not hasattr(topas_model, 'dream') or topas_model.dream is None:
+        logger.warning("[Dream-Pretrain] No DreamEngine found, skipping pretrain")
+        return
+    
+    dream = topas_model.dream
+    
+    # Create optimizer for Dream/ETS params only
+    dream_params = []
+    if hasattr(dream, 'parameters'):
+        dream_params.extend(dream.parameters())
+    if hasattr(dream, 'theme') and hasattr(dream.theme, 'parameters'):
+        dream_params.extend(dream.theme.parameters())
+    
+    if not dream_params:
+        logger.warning("[Dream-Pretrain] No trainable Dream/ETS parameters found")
+        return
+    
+    dream_optimizer = torch.optim.Adam(dream_params, lr=cli_args.dream_pretrain_lr)
+    
+    # Freeze main model if requested
+    if cli_args.dream_pretrain_freeze_model:
+        topas_model.eval()
+        for param in topas_model.parameters():
+            param.requires_grad = False
+    
+    dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
+    
+    for epoch in range(cli_args.dream_pretrain_epochs):
+        total_loss = 0.0
+        motifs_added = 0
+        buffer_len = 0
+        
+        for batch_idx, (demos, test_grid, target_grid) in enumerate(dataloader):
+            if batch_idx >= cli_args.dream_pretrain_batches:
+                break
+                
+            # Get slot features from model (no grad if frozen)
+            with torch.no_grad() if cli_args.dream_pretrain_freeze_model else torch.enable_grad():
+                extras = {}
+                if hasattr(topas_model, 'encoder'):
+                    enc_in = test_grid.float() / 9.0  # Normalize
+                    feat, glob = topas_model.encoder(enc_in)
+                    if hasattr(topas_model, 'slots'):
+                        slot_vecs = topas_model.slots(feat)
+                        if isinstance(slot_vecs, tuple):
+                            slot_vecs = slot_vecs[0]
+                        extras['latent'] = slot_vecs
+            
+            # Train Dream/ETS
+            if hasattr(dream, 'train_step'):
+                loss = dream.train_step(extras.get('latent'), target=target_grid)
+            else:
+                # Minimal fallback: reconstruction loss
+                if 'latent' in extras and extras['latent'] is not None:
+                    # Simple projection loss
+                    proj = torch.nn.functional.linear(extras['latent'].mean(dim=1), 
+                                                     torch.randn(10, extras['latent'].size(-1), device=device))
+                    loss = torch.nn.functional.cross_entropy(proj.view(-1, 10), 
+                                                            target_grid.view(-1).long())
+                else:
+                    loss = torch.tensor(0.0, device=device)
+            
+            if loss.requires_grad:
+                dream_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(dream_params, max_norm=1.0)
+                dream_optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # Track metrics
+            if hasattr(dream, 'nmda') and hasattr(dream.nmda, 'buffer'):
+                buffer_len = len(dream.nmda.buffer)
+            if hasattr(dream, 'theme') and hasattr(dream.theme, 'synthesis_count'):
+                motifs_added = dream.theme.synthesis_count
+        
+        avg_loss = total_loss / min(batch_idx + 1, cli_args.dream_pretrain_batches)
+        logger.info(f"[Dream-Pretrain] Epoch {epoch+1}/{cli_args.dream_pretrain_epochs}: "
+                   f"loss={avg_loss:.4f}, buffer_len={buffer_len}, motifs_added={motifs_added}")
+    
+    # Save pretrained Dream/ETS
+    torch.save(dream.state_dict() if hasattr(dream, 'state_dict') else {}, 'dream_pretrain.pth')
+    logger.info("[Dream-Pretrain] Saved pretrained Dream/ETS to dream_pretrain.pth")
+
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
     optimizer.zero_grad()
@@ -178,6 +384,16 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                     label_smoothing=label_smoothing
                 )
                 
+                # Batch debug probe for CE spikes
+                if global_step % 100 == 0 and ce_loss > 2.0:  # Log when CE loss is high
+                    batch_shapes = [tuple(input_grid.shape), tuple(target_grid.shape)]
+                    logging.info(f"[BATCH DEBUG] CE_spike={ce_loss.item():.3f} batch_shapes={batch_shapes}")
+                
+                # Dream health check - log cached tokens if available
+                if global_step % 100 == 0 and getattr(topas_model, "_dream_tokens", None) is not None:
+                    tokens_shape = getattr(topas_model, "_dream_tokens").shape
+                    logging.info(f"[Dream] _dream_tokens shape: {tokens_shape}")
+                
                 # Add DSL losses (weight already annealed in model)
                 total_loss = ce_loss
                 if 'losses' in outputs and outputs['losses']:
@@ -223,11 +439,51 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    
+    # Apply CLI dream settings
+    try:
+        cli_args = parse_args()
+    except Exception:
+        cli_args = None
 
     topas_model, hrm_model = create_models(device)
 
+    if cli_args:
+        # Enable dream micro ticks if asked
+        if getattr(cli_args, "enable_dream", False):
+            try:
+                topas_model.config.enable_dream = True
+                print(f"✅ DreamEngine enabled (micro_ticks={getattr(cli_args, 'dream_micro_ticks', 1)})")
+            except Exception:
+                pass
+        if hasattr(cli_args, "dream_micro_ticks"):
+            try:
+                topas_model.config.dream_micro_ticks = int(cli_args.dream_micro_ticks)
+            except Exception:
+                pass
+
+    # store cli_args in trainer scope for later reference
+    trainer_cli_args = cli_args
+
     dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
+    
+    # Run Dream pretrain if requested
+    if cli_args and cli_args.dream_pretrain_epochs > 0:
+        dream_pretrain_loop(topas_model, dataset, cli_args, device, logger)
+        # Try to load pretrained Dream/ETS
+        if os.path.exists('dream_pretrain.pth') and hasattr(topas_model, 'dream'):
+            try:
+                topas_model.dream.load_state_dict(torch.load('dream_pretrain.pth'))
+                logger.info("[Main] Loaded pretrained Dream/ETS")
+            except:
+                pass
+    
+    # Initialize self-play if enabled
+    self_play_buffer = None
+    if cli_args and cli_args.selfplay_enable:
+        from trainers.self_play import SelfPlayBuffer
+        self_play_buffer = SelfPlayBuffer(maxlen=cli_args.selfplay_buffer_size)
 
     # Conservative hyperparameters for stable training
     optimizer = optim.AdamW(topas_model.parameters(), lr=5e-5, weight_decay=1e-5)  # Lower LR
@@ -321,6 +577,39 @@ def main():
                     print(f"🎯 New best accuracy: {best_acc:.2%}")
             
             print(summary)
+
+        # === DREAM: full offline consolidation on schedule ===
+        try:
+            if trainer_cli_args:
+                full_every = getattr(trainer_cli_args, "dream_full_every", 0)
+                if full_every and ((epoch + 1) % int(full_every) == 0):
+                    # Check we enabled dream in config
+                    try:
+                        enabled = bool(getattr(topas_model.config, "enable_dream", False))
+                    except Exception:
+                        enabled = False
+
+                    if enabled:
+                        timeout = int(getattr(trainer_cli_args, "dream_full_timeout", 600))
+                        bg = bool(getattr(trainer_cli_args, "dream_background", False))
+                        force_cpu = bool(getattr(trainer_cli_args, "dream_force_cpu", False))
+                        logging.info("[Dream-Trainer] Triggering full dream cycle (epoch %d)", epoch+1)
+                        stats = run_dream_cycle_safe(topas_model,
+                                                     timeout_sec=timeout,
+                                                     background=bg,
+                                                     force_cpu=force_cpu,
+                                                     logger=logging.getLogger(__name__))
+                        # If stats contains EM or other metrics, push into epoch_metrics for visibility
+                        if isinstance(stats, dict):
+                            em_ebr = stats.get("exact_match_refined") or stats.get("em_ebr") or stats.get("EM_ebr")
+                            if em_ebr is not None:
+                                epoch_metrics.setdefault('exact_match_refined', []).append(float(em_ebr))
+                            # log other stats
+                            logging.info("[Dream-Trainer] Full dream stats keys: %s", list(stats.keys()))
+                    else:
+                        logging.info("[Dream-Trainer] Dream disabled in model config; skipping full cycle.")
+        except Exception:
+            logging.warning("[Dream-Trainer] Dream scheduling failed: %s", traceback.format_exc())
 
     # Save final checkpoint
     final_checkpoint = {

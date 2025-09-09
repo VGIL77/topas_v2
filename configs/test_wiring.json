@@ -1,0 +1,65 @@
+{
+  "device": "cpu",
+  "log_dir": "logs/test_wiring",
+  "checkpoint_dir": "checkpoints/test_wiring",
+  "strict": true,
+  "phase0_mode": false,
+
+  "phase1_policy_distill": {
+    "steps": 1,
+    "learning_rate": 1e-4,
+    "log_interval": 1
+  },
+
+  "phase2_meta_learning": {
+    "num_epochs": 1,
+    "inner_steps": 1,
+    "tasks_per_meta_batch": 1
+  },
+
+  "phase3_self_critique": {
+    "epochs": 1,
+    "batch_size": 1,
+    "max_counterexamples": 1
+  },
+
+  "phase4_mcts_alpha": {
+    "steps": 1,
+    "mcts_depth": 3
+  },
+
+  "phase5_dream_scaled": {
+    "epochs": 1,
+    "steps_per_epoch": 1,
+    "dream_interval": 1
+  },
+
+  "phase6_neuro_priors": {
+    "epochs": 1,
+    "steps_per_epoch": 1
+  },
+
+  "phase7_relmem": {
+    "epochs": 1,
+    "steps_per_epoch": 1
+  },
+
+  "phase8_sgi_optimizer": {
+    "epochs": 1,
+    "steps_per_epoch": 1
+  },
+
+  "phase9_ensemble_solver": {
+    "steps": 1
+  },
+
+  "phase10_production": {
+    "epochs": 1,
+    "steps_per_epoch": 1
+  },
+
+  "train_challenges": "ARC/arc-agi_training_challenges.json",
+  "train_solutions": "ARC/arc-agi_training_solutions.json",
+  "eval_challenges": "ARC/arc-agi_evaluation_challenges.json",
+  "eval_solutions": "ARC/arc-agi_evaluation_solutions.json"
+}

@@ -39,6 +39,10 @@ class TrainLogger:
             scheduler_info: dict -> {"task_id":..., "bucket":..., "difficulty":..., "ucb":...}
             dream_info: dict -> {"ripple":..., "valence":..., "arousal":..., "motifs":...}
             relmem_info: dict -> {"inverse_loss":..., "hebbian_applied":..., "wta_applied":...}
+            
+            Enhanced dream_info keys:
+            nmda_loss, buffer_len, motifs_added, motifs_rejected,
+            curiosity_pred_error, curiosity_novelty, ripple_phase, num_themes
         """
         record = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -59,7 +63,16 @@ class TrainLogger:
             if "painter" in losses: 
                 msg += f" | Painter={losses['painter']:.3f}"
             if "dsl" in losses: 
-                msg += f" DSL={losses['dsl']:.3f}"
+                msg += f" | DSL={losses['dsl']:.3f}"
+            
+            # Add dream logging
+            if dream_info:
+                if "buffer_len" in dream_info:
+                    msg += f" | BufLen={dream_info['buffer_len']}"
+                if "nmda_loss" in dream_info:
+                    msg += f" | NMDA={dream_info['nmda_loss']:.3f}"
+                if "num_themes" in dream_info:
+                    msg += f" | Themes={dream_info['num_themes']}"
             if "ebr" in losses: 
                 msg += f" EBR={losses['ebr']:.3f}"
             if "aux" in losses: 

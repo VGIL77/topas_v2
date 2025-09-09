@@ -148,4 +148,12 @@ class EmergentThemeSynthesis:
     def get_insights(self) -> str:
         if not self.themes: return "No insights yet."
         avg_embed = torch.stack([t.embedding for t in self.themes]).mean(0)
-        return "Complexity navigation and pattern discovery through evolutionary challenges."
+        return "Complexity navigation and pattern discovery through evolutionary challenges."    
+    def get_embedding(self, latents):
+        """Get theme embedding for given latents"""
+        if self.themes:
+            # Return embedding of most relevant theme (simplified: first theme)
+            return self.themes[0].embedding
+        else:
+            # Return zero embedding if no themes
+            return torch.zeros(self.embedding_dim, device=latents.device if torch.is_tensor(latents) else "cpu")

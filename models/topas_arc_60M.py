@@ -372,6 +372,7 @@ class ModelConfig:
     enable_dream: bool = True
     dream_micro_ticks: int = 1
     dream_offline_iters: int = 50
+    theme_bias_alpha: float = 0.2  # ETS theme contribution to DSL op-bias
     dream_valence_default: float = 0.7
     dream_arousal_default: float = 0.5
     
@@ -458,6 +459,13 @@ class TopasARC60M(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.slot_dim, self.num_colors),
         )
+        
+        # Theme head for ETS -> DSL op-bias mapping
+        theme_dim = self.config.slot_dim  # Use slot_dim as default theme dimension
+        self.theme_to_op_bias = nn.Sequential(
+            nn.Linear(theme_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, self.config.dsl_vocab_size))
         
         # Pixel fallback head for when attention is unavailable
         self.pixel_fallback = nn.Conv2d(self.config.width, self.num_colors, kernel_size=1)
@@ -1980,6 +1988,18 @@ class TopasARC60M(nn.Module):
                 extras["ebr_ok"] = False
                 extras["ebr_error"] = str(e)
             return logits.softmax(dim=1).argmax(dim=1)  # honest fallback
+    
+    def _get_theme_embed_from_dream(self, extras):
+        """Get theme embedding from DreamEngine for op-bias contribution"""
+        if self.dream and hasattr(self.dream, 'theme'):
+            theme_obj = self.dream.theme
+            if hasattr(theme_obj, 'get_embedding'):
+                latents = extras.get('latent', None)
+                if latents is not None:
+                    return theme_obj.get_embedding(latents)
+            elif hasattr(theme_obj, 'themes') and len(theme_obj.themes) > 0:
+                return theme_obj.themes[0].embedding
+        return torch.zeros(self.config.slot_dim, device=next(self.parameters()).device)
     
     @torch.no_grad()
     def run_dream_cycle(self, demos_programs=None, tokens: Optional[torch.Tensor] = None):
