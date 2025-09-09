@@ -395,6 +395,8 @@ class ModelConfig:
     relmem_op_bias_w: float = 0.2        # weight for DSL op bias injection
     relmem_max_concepts: int = 2048
     relmem_rank: int = 16
+    relmem_op_bias_scale: float = 0.5    # scaling factor for op bias generation
+    relmem_inverse_loss_lambda: float = 1e-4  # lambda for inverse loss in training
     
     def validate(self):
         """Validate configuration parameters"""
@@ -1163,14 +1165,36 @@ class TopasARC60M(nn.Module):
                 try:
                     print(f"[RAIL-DSL] Falling back to beam search...")
                     
-                    # Merge RelMem bias into op_bias
+                    # Merge RelMem bias into op_bias (robust approach)
                     if self.relmem is not None and self.config.relmem_op_bias_w > 0:
                         try:
-                            relmem_bias = self.relmem.get_op_bias()
+                            from models.dsl_registry import DSL_OPS
+                            if hasattr(self.relmem, "get_op_bias"):
+                                relmem_bias = self.relmem.get_op_bias(dsl_ops=DSL_OPS, scale=getattr(self.config, "relmem_op_bias_scale", 0.5))
+                            else:
+                                # fallback to the older _scores approach
+                                relmem_bias = {}
+                                for rel in ["translate","resize","flip_h","flip_v","color_map"]:
+                                    if hasattr(self.relmem, "_scores") and rel in getattr(self.relmem, "relations", []):
+                                        try:
+                                            import torch
+                                            with torch.no_grad():
+                                                score = float(torch.sigmoid(self.relmem._scores(rel).mean()).item())
+                                            # map relation->op name (simple 1:1 mapping)
+                                            relmem_bias[rel] = max(0.0, score)
+                                        except Exception:
+                                            pass
+
+                            # Merge: take max to avoid reducing any existing detection bias
                             for k, v in relmem_bias.items():
-                                op_bias[k] = op_bias.get(k, 0.0) + v * self.config.relmem_op_bias_w
+                                op_bias[k] = max(op_bias.get(k, 0.0), float(v) * self.config.relmem_op_bias_w)
+
+                            import logging
+                            logging.getLogger().info(f"[RelMem] merged op_bias from RelMem: {list(relmem_bias.items())[:8]}")
                             print(f"[RelMem] Merged op_bias with {len(relmem_bias)} operations")
                         except Exception as e:
+                            import logging
+                            logging.getLogger().warning(f"[RelMem] error merging op_bias: {e}")
                             print(f"[RelMem] op_bias integration failed: {e}")
                     
                     # Enhanced beam_search call with operation bias
@@ -2129,6 +2153,8 @@ class TopasARC60M(nn.Module):
         Returns:
             Dictionary with neural predictions for pretraining heads
         """
+        import torch
+        
         if not self._pretraining_mode:
             raise RuntimeError("Model must be in pretraining mode to use forward_pretraining")
         
@@ -2307,17 +2333,46 @@ class TopasARC60M(nn.Module):
                 # Get op_bias from RelationManager
                 op_bias = self.relman.op_bias()  # existing relation manager bias
                 
-                # Merge RelMem bias into op_bias
+                # Defensive TOPAS merging with enhanced debug logging
+                relman_bias_count = len(op_bias)
                 if self.relmem is not None and self.config.relmem_op_bias_w > 0:
                     try:
-                        relmem_bias = self.relmem.get_op_bias()
+                        # Use robust op_bias method (never empty)
+                        if hasattr(self.relmem, "op_bias"):
+                            relmem_bias = self.relmem.op_bias()
+                        elif hasattr(self.relmem, "get_op_bias"):
+                            from models.dsl_registry import DSL_OPS
+                            relmem_bias = self.relmem.get_op_bias(dsl_ops=DSL_OPS, scale=getattr(self.config, "relmem_op_bias_scale", 0.5))
+                        else:
+                            relmem_bias = {}
+                            import logging
+                            logging.getLogger().warning("[RelMem] No op_bias or get_op_bias method found")
+                        
+                        # Merge conservatively
                         for k, v in relmem_bias.items():
-                            op_bias[k] = op_bias.get(k, 0.0) + v * self.config.relmem_op_bias_w
+                            op_bias[k] = max(op_bias.get(k, 0.0), float(v) * self.config.relmem_op_bias_w)
+                        
                         import logging
-                        logging.info(f"[RelMem] DSL op_bias merged with {len(relmem_bias)} operations")
+                        logging.getLogger().info(f"[RelMem] merged op_bias from RelMem: {list(relmem_bias.items())[:8]}")
                     except Exception as e:
                         import logging
-                        logging.warning(f"[RelMem] op_bias integration failed: {e}")
+                        logging.getLogger().warning(f"[RelMem] error merging op_bias: {e}")
+                        relmem_bias = {}
+                
+                # Enhanced debug logging
+                import logging
+                if not op_bias:
+                    logging.getLogger().info(f"[RelMem] op_bias empty after merge; relman.edges={len(getattr(self.relman, 'edges', []))}, relmem.relations={getattr(self.relmem, 'relations', [])}")
+                else:
+                    logging.getLogger().info(f"[RelMem DEBUG] relman_count={relman_bias_count}, final_count={len(op_bias)}")
+                
+                # RelMem sanity check probe
+                import logging
+                logging.getLogger().info(f"[RelMem PROBE] op_bias_count={len(op_bias)} sample={list(op_bias.items())[:10]}")
+                # Also log top-5 by weight
+                if op_bias:
+                    top5 = sorted(op_bias.items(), key=lambda x: -x[1])[:5]
+                    logging.getLogger().info(f"[RelMem PROBE] top5={top5}")
                 
                 # Use beam search with real inputs
                 dsl_result = beam_search(
@@ -2380,10 +2435,18 @@ class TopasARC60M(nn.Module):
         # RelMem inverse-loss regularization
         if self.relmem is not None and self.config.relmem_inverse_loss_w > 0:
             try:
-                inv_loss = self.relmem.inverse_loss()
+                if hasattr(self.relmem, "compute_inverse_loss"):
+                    inv_loss = self.relmem.compute_inverse_loss()
+                else:
+                    # fallback to old method
+                    inv_loss = self.relmem.inverse_loss()
                 losses["relmem_inverse_loss"] = inv_loss * self.config.relmem_inverse_loss_w
+                
                 import logging
-                logging.info(f"[RelMem] Applied inverse-loss: {inv_loss.item():.4f} (weighted: {(inv_loss * self.config.relmem_inverse_loss_w).item():.4f})")
+                # Enhanced logging probe for inverse loss
+                weighted_loss = inv_loss * self.config.relmem_inverse_loss_w
+                logging.getLogger().info(f"[RelMem PROBE] inverse_loss_raw={inv_loss.item():.6f}, weighted={weighted_loss.item():.6f}")
+                logging.info(f"[RelMem] Applied inverse-loss: {inv_loss.item():.4f} (weighted: {weighted_loss.item():.4f})")
             except Exception as e:
                 import logging
                 logging.warning(f"RelMem inverse-loss skipped: {e}")

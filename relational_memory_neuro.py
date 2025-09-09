@@ -370,76 +370,205 @@ class RelationalMemoryNeuro(nn.Module):
         self.apply_hebbian()
         self.apply_wta()
     
-    def get_op_bias(self) -> Dict[str, float]:
+    def get_op_bias(self, dsl_ops: List[str] = None, scale: float = 1.0) -> Dict[str, float]:
         """
-        Produce a prior over DSL operations using learned relational signals.
-        Returns: dict {op_name: bias_float} with op names VALID in DSL_OPS.
+        Return a mapping {dsl_op_name: bias} with values in [0, 1].
+        - dsl_ops: optional list of DSL ops to restrict to (defaults to all known ops).
+        - scale: multiplicative scaling factor from ModelConfig.relmem_op_bias_scale
+        """
+        from typing import Dict, List
+        import torch
+        import logging
+        
+        op_bias: Dict[str, float] = {}
+
+        # If no learned weights present, return empty (but log)
+        if not hasattr(self, "weights") or not self.weights:
+            logging.getLogger().debug("[RelMem] get_op_bias: no weights available")
+            return {}
+
+        # Example mapping: map internal relation names to candidate DSL ops (use actual DSL_OPS names)
+        relation_to_ops = {
+            'color': ['color_map', 'flood_fill', 'extract_color'],
+            'shape': ['rotate90', 'flip_h', 'flip_v', 'transpose'],
+            'structure': ['crop_bbox', 'tile_pattern', 'resize_nn'],
+            'translate': ['translate'],
+            'size': ['resize_nn', 'scale'],
+            'flip': ['flip_h', 'flip_v'],
+            'rotate': ['rotate90', 'rotate180', 'rotate270'],
+            'crop': ['crop_bbox', 'crop_nonzero'],
+            'tile': ['tile', 'tile_pattern'],
+            'flood': ['flood_fill', 'flood_select'],
+            'outline': ['outline', 'boundary_extract'],
+            'symmetry': ['symmetry'],
+            'paste': ['paste'],
+            'count': ['count_objects', 'count_colors'],
+            'pattern': ['find_pattern', 'extract_pattern', 'match_template'],
+            'logic': ['grid_union', 'grid_intersection', 'grid_xor', 'grid_difference'],
+            'object': ['for_each_object', 'for_each_object_translate', 'for_each_object_recolor',
+                      'for_each_object_rotate', 'for_each_object_scale', 'for_each_object_flip'],
+            'conditional': ['conditional_map', 'apply_rule'],
+            'select': ['select_by_property', 'flood_select'],
+            'identity': ['identity'],
+            'arithmetic': ['arithmetic_op']
+        }
+
+        # compute a score per relation (robust: use sigmoid of mean to make [0,1])
+        for rel_name, ops in relation_to_ops.items():
+            if hasattr(self, "relations") and rel_name in getattr(self, "relations", []):
+                try:
+                    scores = self._scores(rel_name)  # tensor
+                    if isinstance(scores, torch.Tensor):
+                        mean_score = float(torch.sigmoid(scores.mean()).item())
+                    else:
+                        mean_score = float(scores)  # fallback
+                except Exception:
+                    mean_score = 0.0
+
+                # push into ops
+                for op in ops:
+                    op_bias[op] = max(op_bias.get(op, 0.0), min(1.0, mean_score * scale))
+
+        # if user passed explicit dsl_ops, filter/ensure baseline
+        if dsl_ops is not None:
+            for op in dsl_ops:
+                if op not in op_bias:
+                    op_bias[op] = 0.0
+
+        # Always clamp
+        op_bias = {k: float(max(0.0, min(1.0, v))) for k, v in op_bias.items()}
+
+        logging.getLogger().info(f"[RelMem] get_op_bias produced {len(op_bias)} ops: {list(op_bias.keys())[:6]}")
+        return op_bias
+    
+    def compute_inverse_loss(self) -> torch.Tensor:
+        """
+        Compute inverse loss regularizer for RelMem training.
+        Returns a small positive scalar when relation activations are present.
+        """
+        import torch
+        
+        # defensive: if no weights return zero-tensor on correct device
+        if not hasattr(self, "weights") or not self.weights:
+            return torch.tensor(0.0, device=next(self.parameters()).device if hasattr(self, "parameters") else "cpu")
+        
+        # simple proxy: L2 of off-diagonal relation weights
+        total = 0.0
+        count = 0
+        for k, W in getattr(self, "weights", {}).items():
+            if isinstance(W, torch.Tensor):
+                total = total + (W**2).mean()
+                count += 1
+        
+        return (total / max(1, count))
+    
+    def op_bias(self) -> Dict[str, float]:
+        """
+        Return operation bias dict for DSL search - NEVER EMPTY.
+        - Looks at self.relations (list of relation names) and
+          self._scores(rel) (must return a tensor or numeric score).
+        - Fallbacks: if no scores present, use lightweight learned 'weights' if present,
+          else return baseline small biases.
         """
         from typing import Dict
+        import torch
+        import logging
         
-        # Lazy import to avoid circulars
+        # list of operations we know about (keep in sync with DSL registry)
+        known_ops = [
+            "identity","rotate90","rotate180","rotate270",
+            "flip_h","flip_v","translate","scale","resize_nn",
+            "color_map","flood_fill","extract_color","crop_bbox","crop_nonzero",
+            "tile_pattern","tile","paste","center_pad_to","outline","symmetry",
+            "grid_union","grid_intersection","grid_xor","grid_difference",
+            "count_objects","count_colors","find_pattern","extract_pattern","match_template",
+            "for_each_object","for_each_object_translate","for_each_object_recolor",
+            "for_each_object_rotate","for_each_object_scale","for_each_object_flip",
+            "conditional_map","apply_rule","select_by_property","flood_select",
+            "boundary_extract","arithmetic_op"
+        ]
+
+        op_bias: Dict[str, float] = {op: 0.0 for op in known_ops}
+
+        # If we have explicit relation names -> operation mapping, prefer that.
+        relation_to_ops = {
+            "color": ["color_map","flood_fill","extract_color"],
+            "shape": ["rotate90","flip_h","flip_v"],
+            "structure": ["crop_bbox","tile_pattern","resize_nn","translate","scale"],
+            "logic": ["grid_union","grid_intersection","grid_xor","grid_difference"],
+            "identity": ["identity"],
+            "flip": ["flip_h","flip_v"],
+            "rotate": ["rotate90","rotate180","rotate270"],
+            "crop": ["crop_bbox","crop_nonzero"],
+            "tile": ["tile","tile_pattern"],
+            "flood": ["flood_fill","flood_select"],
+            "outline": ["outline","boundary_extract"],
+            "symmetry": ["symmetry"],
+            "paste": ["paste"],
+            "count": ["count_objects","count_colors"],
+            "pattern": ["find_pattern","extract_pattern","match_template"],
+            "object": ["for_each_object","for_each_object_translate","for_each_object_recolor",
+                      "for_each_object_rotate","for_each_object_scale","for_each_object_flip"],
+            "conditional": ["conditional_map","apply_rule"],
+            "select": ["select_by_property","flood_select"],
+            "arithmetic": ["arithmetic_op"]
+        }
+
+        # 1) Use _scores(rel) if present
         try:
-            from models.dsl_registry import DSL_OPS  # canonical op set
-            DSL_OPS_SET = set(DSL_OPS)
+            if hasattr(self, "_scores") and callable(getattr(self, "_scores")):
+                for rel, ops in relation_to_ops.items():
+                    if rel in getattr(self, "relations", []):
+                        try:
+                            score_t = self._scores(rel)
+                            score = float(score_t.mean().item()) if hasattr(score_t, "mean") else float(score_t)
+                            score = max(0.0, min(1.0, score))  # clamp
+                        except Exception:
+                            score = 0.0
+                        # distribute the score to ops (simple equal split)
+                        for op in ops:
+                            op_bias[op] = max(op_bias.get(op, 0.0), score)
         except Exception:
-            DSL_OPS_SET = set()
-        
-        def rel_score(name: str) -> float:
-            """
-            Preferred way to read a scalar relation strength from RelMem.
-            Falls back to 0.0 if unavailable.
-            """
+            # defensive - don't fail training due to relmem
+            pass
+
+        # 2) If still all zeros, fall back to 'weights' or small priors
+        if all(v == 0.0 for v in op_bias.values()):
             try:
-                if hasattr(self, "_scores"):
-                    s = self._scores(name)  # tensor-like
-                    return float(s.mean()) if hasattr(s, "mean") else float(s)
+                # if self.weights exists and is a dict mapping relation->tensor
+                if hasattr(self, "weights") and isinstance(self.weights, dict):
+                    for rel, W in self.weights.items():
+                        # map the rel to ops if possible
+                        ops = relation_to_ops.get(rel, [])
+                        strength = float(torch.norm(W).item()) / (W.numel() + 1e-9) if hasattr(W, "numel") else 0.0
+                        strength = max(0.0, min(1.0, strength))
+                        for op in ops:
+                            op_bias[op] = max(op_bias.get(op, 0.0), strength * 0.3)
             except Exception:
                 pass
-            return 0.0
-        
-        # Map high-level relations to your ACTUAL DSL ops (must match registry)
-        rel_to_ops = {
-            "translate":      ["translate"],
-            "resize":         ["resize_nn"],
-            "scale":          ["scale"],
-            "flip":           ["flip_h", "flip_v"],
-            "rotate":         ["rotate90", "rotate180", "rotate270"],
-            "color_map":      ["color_map"],
-            "mask_color":     ["extract_color"],  # closest match
-            "extract_color":  ["extract_color"],
-            "crop":           ["crop_bbox", "crop_nonzero"],
-            "center_pad":     ["center_pad_to"],
-            "tile":           ["tile", "tile_pattern"],
-            "flood":          ["flood_fill", "flood_select"],
-            "outline":        ["outline", "boundary_extract"],
-            "symmetry":       ["symmetry"],
-            "paste":          ["paste"],
-            "count":          ["count_objects", "count_colors"],
-            "pattern":        ["find_pattern", "extract_pattern", "match_template"],
-            "logic":          ["grid_union", "grid_intersection", "grid_xor", "grid_difference"],
-            "object":         ["for_each_object", "for_each_object_translate", "for_each_object_recolor",
-                              "for_each_object_rotate", "for_each_object_scale", "for_each_object_flip"],
-            "conditional":    ["conditional_map", "apply_rule"],
-            "select":         ["select_by_property", "flood_select"],
-            "identity":       ["identity"],
-            "arithmetic":     ["arithmetic_op"],
-        }
-        
-        bias: Dict[str, float] = {}
-        # Aggregate relation strengths into op priors
-        for rel, ops in rel_to_ops.items():
-            s = rel_score(rel)
-            if s <= 0.0:
-                continue
-            for op in ops:
-                if not DSL_OPS_SET or op in DSL_OPS_SET:  # filter to valid ops
-                    bias[op] = bias.get(op, 0.0) + float(s)
-        
-        # Normalize to 0..1 for stability (keeps top-op ordering)
-        if bias:
-            m = max(bias.values())
-            if m > 0:
-                for k in list(bias.keys()):
-                    bias[k] = bias[k] / m
-        
-        return bias
+
+        # 3) final baseline small bias so bias dict is never empty
+        for k in list(op_bias.keys()):
+            if op_bias[k] == 0.0:
+                op_bias[k] = 0.01
+
+        # 4) optionally normalize (keep flexible)
+        total = sum(op_bias.values()) + 1e-12
+        # keep raw scale for downstream; but normalize to [0,1] relative
+        for k in op_bias:
+            op_bias[k] = float(op_bias[k]) / total
+
+        return op_bias
+    
+    def _scores(self, rel_name):
+        """Return a FloatTensor score for relation rel_name (shape [] or [N])"""
+        try:
+            if hasattr(self, "weights") and rel_name in self.weights:
+                W = self.weights[rel_name]
+                return torch.tensor(float(torch.norm(W).item()) / (W.numel() + 1e-9))
+            # fallback to stored activations if available
+            if hasattr(self, "rel_activations") and rel_name in self.rel_activations:
+                return torch.tensor(self.rel_activations[rel_name]).float()
+        except Exception:
+            pass
+        return torch.tensor(0.0)
