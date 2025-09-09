@@ -911,64 +911,54 @@ class DreamEngine:
         }
     def train_step(self, slot_vecs, target=None):
         """Lightweight training step for Dream/ETS pretraining"""
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        if slot_vecs is None:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        if slot_vecs is not None:
-            # Projection loss: predict logits over 10 colors
-            if not hasattr(self, '_color_proj'):
-                # Create small MLP for color prediction
-                self._color_proj = torch.nn.Sequential(
-                    torch.nn.Linear(slot_vecs.size(-1), 64),
+        # Pool slot_vecs to [B,D]
+        if slot_vecs.dim() == 3:  # [B,K,D] -> [B,D]
+            pooled_slots = slot_vecs.mean(dim=1)
+        else:  # Already [B,D]
+            pooled_slots = slot_vecs
+        
+        # Color prediction MLP: D->64->10
+        if not hasattr(self, '_color_proj'):
+            D = pooled_slots.size(-1)
+            self._color_proj = torch.nn.Sequential(
+                torch.nn.Linear(D, 64),
+                torch.nn.GELU(), 
+                torch.nn.Linear(64, 10)
+            ).to(self.device)
+        
+        color_logits = self._color_proj(pooled_slots)  # [B,10]
+        
+        if target is not None:
+            # Cross-entropy loss if target provided
+            target_flat = target.view(-1).long().clamp(0, 9)
+            color_loss = torch.nn.functional.cross_entropy(color_logits.view(-1, 10), target_flat)
+        else:
+            # Self-supervised contrastive loss using color_logits (has gradients)
+            dummy_target = torch.zeros(pooled_slots.size(0), dtype=torch.long, device=self.device)
+            color_loss = torch.nn.functional.cross_entropy(color_logits, dummy_target)
+        
+        total_loss = color_loss
+        
+        # Op-bias prediction if theme available
+        if hasattr(self, 'theme') and hasattr(self.theme, 'themes') and len(self.theme.themes) > 0:
+            if not hasattr(self, '_op_bias_proj'):
+                D = pooled_slots.size(-1)
+                self._op_bias_proj = torch.nn.Sequential(
+                    torch.nn.Linear(D, 64),
                     torch.nn.GELU(),
-                    torch.nn.Linear(64, 10)
+                    torch.nn.Linear(64, 41)
                 ).to(self.device)
-                
-            # Pool slots and predict colors
-            pooled_slots = slot_vecs.mean(dim=1) if slot_vecs.dim() > 2 else slot_vecs
-            color_logits = self._color_proj(pooled_slots)
             
-            if target is not None:
-                # Use target if provided
-                target_flat = target.view(-1).long().clamp(0, 9)
-                proj_loss = torch.nn.functional.cross_entropy(
-                    color_logits.view(-1, 10)[:target_flat.size(0)], 
-                    target_flat
-                )
-            else:
-                # Self-supervised loss: predict slot statistics
-                slot_stats = torch.softmax(pooled_slots.mean(dim=0), dim=0)
-                uniform_target = torch.ones(10, device=self.device) / 10
-                proj_loss = torch.nn.functional.kl_div(
-                    torch.log_softmax(color_logits.mean(dim=0), dim=0),
-                    uniform_target,
-                    reduction='batchmean'
-                )
-            
-            total_loss = total_loss + proj_loss
-            
-            # Theme op-bias prediction loss (if theme available)
-            if hasattr(self, 'theme') and hasattr(self.theme, 'themes') and len(self.theme.themes) > 0:
-                if not hasattr(self, '_op_bias_proj'):
-                    # Create MLP for op-bias prediction
-                    self._op_bias_proj = torch.nn.Sequential(
-                        torch.nn.Linear(slot_vecs.size(-1), 64),
-                        torch.nn.GELU(),
-                        torch.nn.Linear(64, 41)  # 41 DSL operations
-                    ).to(self.device)
-                
-                # Predict op-bias distribution
-                pred_op_bias = self._op_bias_proj(pooled_slots)
-                pred_op_dist = torch.softmax(pred_op_bias.mean(dim=0), dim=0)
-                
-                # Target: uniform distribution over ops (encourage exploration)
-                uniform_op_target = torch.ones(41, device=self.device) / 41
-                
-                op_loss = torch.nn.functional.kl_div(
-                    torch.log_softmax(pred_op_bias.mean(dim=0), dim=0),
-                    uniform_op_target,
-                    reduction='batchmean'
-                ) * 0.1  # Small weight
-                
-                total_loss = total_loss + op_loss
+            op_logits = self._op_bias_proj(pooled_slots)  # [B,41]
+            uniform_target = torch.ones(41, device=self.device) / 41
+            op_loss = torch.nn.functional.kl_div(
+                torch.log_softmax(op_logits.mean(dim=0), dim=0),
+                uniform_target,
+                reduction='batchmean'
+            )
+            total_loss = total_loss + op_loss * 0.1
         
         return total_loss

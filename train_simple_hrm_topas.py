@@ -53,7 +53,7 @@ def parse_args():
     # Self-play args
     parser.add_argument("--selfplay-enable", action="store_true", default=False,
                         help="Enable self-play with template-guided puzzles")
-    parser.add_argument("--selfplay-interval", type=int, default=200,
+    parser.add_argument("--selfplay-interval", type=int, default=250,
                         help="Generate self-play puzzles every N steps")
     parser.add_argument("--selfplay-weight", type=float, default=0.1,
                         help="Weight for self-play loss")
@@ -172,16 +172,22 @@ def compute_metrics(model, input_grid, target_grid, hrm_latents=None):
             'exact_match_refined': exact_match_refined
         }
 
-def create_models(device):
+def create_models(device, cli_args=None):
     print("🔧 Creating HRM-TOPAS integrated models...")
     topas_config = ModelConfig()
+    
+    # Apply CLI dream settings to config before model creation
+    if cli_args and getattr(cli_args, "enable_dream", False):
+        topas_config.enable_dream = True
+        if hasattr(cli_args, "dream_micro_ticks"):
+            topas_config.dream_micro_ticks = cli_args.dream_micro_ticks
     topas_config.width = 512
     topas_config.depth = 8
     topas_config.slots = 32
     topas_config.slot_dim = 256
     topas_config.max_dsl_depth = 4
     topas_config.use_ebr = True
-    topas_config.enable_dream = False
+    # Don't override enable_dream - respect CLI setting
     topas_config.verbose = True
     topas_config.pretraining_mode = True
 
@@ -446,21 +452,12 @@ def main():
     except Exception:
         cli_args = None
 
-    topas_model, hrm_model = create_models(device)
+    topas_model, hrm_model = create_models(device, cli_args)
 
-    if cli_args:
-        # Enable dream micro ticks if asked
-        if getattr(cli_args, "enable_dream", False):
-            try:
-                topas_model.config.enable_dream = True
-                print(f"✅ DreamEngine enabled (micro_ticks={getattr(cli_args, 'dream_micro_ticks', 1)})")
-            except Exception:
-                pass
-        if hasattr(cli_args, "dream_micro_ticks"):
-            try:
-                topas_model.config.dream_micro_ticks = int(cli_args.dream_micro_ticks)
-            except Exception:
-                pass
+    # CLI args are already applied in create_models, just log the status
+    if cli_args and getattr(cli_args, "enable_dream", False):
+        dream_status = "enabled" if (hasattr(topas_model, 'dream') and topas_model.dream is not None) else "failed"
+        print(f"✅ DreamEngine {dream_status} (micro_ticks={getattr(cli_args, 'dream_micro_ticks', 1)})")
 
     # store cli_args in trainer scope for later reference
     trainer_cli_args = cli_args
@@ -517,44 +514,44 @@ def main():
             result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now, global_step=global_step)
             
             # Self-play training integration
+            sp_loss_contribution = 0.0
             if self_play_buffer and global_step % cli_args.selfplay_interval == 0:
-                sp_samples = self_play_buffer.sample_batch(4)  # Small batch size
-                if sp_samples:
-                    sp_loss_total = 0.0
-                    for sp_input, sp_target in sp_samples:
-                        try:
-                            # Forward pass on self-play sample
-                            with torch.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
-                                sp_output = topas_model.forward_pretraining(
-                                    sp_input.unsqueeze(0), 
-                                    target_shape=sp_target.shape[-2:]
-                                )
-                                if 'logits' in sp_output and sp_output['logits'] is not None:
-                                    sp_logits = sp_output['logits']
-                                    sp_target_flat = sp_target.view(-1).long().clamp(0, 9)
-                                    sp_loss = F.cross_entropy(
-                                        sp_logits.view(-1, 10)[:sp_target_flat.size(0)], 
-                                        sp_target_flat
-                                    )
-                                    sp_loss_total += sp_loss * cli_args.selfplay_weight
-                        except Exception:
-                            continue  # Skip failed samples
-                    
-                    # Backward pass for self-play loss
-                    if sp_loss_total > 0:
-                        optimizer.zero_grad()
-                        sp_loss_total.backward()
-                        torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=1.0)
-                        optimizer.step()
+                # Generate new puzzles from current batch
+                demos, test_inputs, test_outputs, task_id = batch
+                current_demos = [(test_inputs, test_outputs)] if test_inputs is not None and test_outputs is not None else []
+                
+                if current_demos:
+                    new_puzzles = self_play_buffer.generate_batch(
+                        current_demos, 
+                        getattr(topas_model, 'wormhole', None), 
+                        top_k=cli_args.selfplay_topk
+                    )
+                
+                # Sample and compute self-play loss
+                sp_samples = self_play_buffer.sample_batch(4)
+                for sp_input, sp_target in sp_samples:
+                    try:
+                        sp_output = topas_model.forward_pretraining(sp_input.unsqueeze(0), target_shape=sp_target.shape[-2:])
+                        if 'logits' in sp_output:
+                            sp_loss = F.cross_entropy(sp_output['logits'].view(-1, 10), sp_target.view(-1).long().clamp(0, 9))
+                            sp_loss_contribution += sp_loss * cli_args.selfplay_weight
+                    except Exception:
+                        continue
             
             if result is not None:
                 if compute_metrics_now and isinstance(result, tuple):
                     loss, metrics = result
+                    # Add self-play contribution to loss
+                    if sp_loss_contribution > 0:
+                        loss = loss + sp_loss_contribution
                     epoch_losses.append(loss)
                     for k, v in metrics.items():
                         epoch_metrics[k].append(v)
                 else:
                     loss = result
+                    # Add self-play contribution to loss
+                    if sp_loss_contribution > 0:
+                        loss = loss + sp_loss_contribution
                     if loss is not None:
                         epoch_losses.append(loss)
             

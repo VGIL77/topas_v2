@@ -76,6 +76,18 @@ class SelfPlayBuffer:
         
         return generated
     
+    def generate_batch(self, demos: List[Tuple[torch.Tensor, torch.Tensor]], 
+                      wormhole, top_k: int = 3) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Kaggle-safe helper to generate puzzles from demos using wormhole mining.
+        Only applies transformations to existing ARC training data.
+        """
+        if not demos:
+            return []
+        
+        # Use existing generate_from_wormhole logic
+        return self.generate_from_wormhole(demos, wormhole, themes=None, top_k=top_k)
+    
     def sample_batch(self, n: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Sample n items from the buffer"""
         if len(self.buffer) == 0:

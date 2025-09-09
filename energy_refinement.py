@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from typing import Optional, Dict
 from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, clamp_neuromorphic_terms
 
 class EnergyRefiner(nn.Module):
@@ -32,13 +33,19 @@ class EnergyRefiner(nn.Module):
         else:
             self.temp_schedule = temp_schedule
 
-    def forward(self, logits: torch.Tensor, constraint_obj, prior_tensors: dict):
+    def forward(self, logits: torch.Tensor, constraint_obj, prior_tensors: dict, 
+                prior_scales: Optional[Dict[str, float]] = None, 
+                extras: Optional[Dict] = None):
         # logits: Float tensor, e.g., [B, C, H, W]; must be differentiable
         # constraint_obj must expose: fit_loss(logits), violation_loss(logits)
         # prior_tensors: dict of optional scalar tensors/floats: {'phi','kappa','cge','hodge'}
         # make a leaf tensor that can get grads, regardless of upstream context
         x = logits.detach().clone().requires_grad_(True)
 
+        # Apply prior scaling with safe defaults
+        if prior_scales is None:
+            prior_scales = {"phi": 1.0, "kappa": 1.0, "cge": 1.0}
+            
         # ensure autograd is ON inside refinement (eval often uses no_grad)
         with torch.enable_grad():
             for step in range(self.max_steps):
@@ -76,8 +83,13 @@ class EnergyRefiner(nn.Module):
                 hodge = prior_tensors.get("hodge", 0.0)
                 hodge_term = hodge.mean() if torch.is_tensor(hodge) else float(hodge)
                 
+                # Scale internal priors by prior_scales
+                w_phi_scaled = self.w_phi * prior_scales.get("phi", 1.0)
+                w_kappa_scaled = self.w_kappa * prior_scales.get("kappa", 1.0)
+                w_cge_scaled = self.w_cge * prior_scales.get("cge", 1.0)
+                
                 # Form weighted prior term: pri = wφ*φ + wκ*κ + wCGE*CGE + hodge
-                pri = self.w_phi * phi + self.w_kappa * kappa + self.w_cge * cge + hodge_term
+                pri = w_phi_scaled * phi + w_kappa_scaled * kappa + w_cge_scaled * cge + hodge_term
                 
                 # Add size constraint loss
                 size_constraints = prior_tensors.get("size_constraints", None)

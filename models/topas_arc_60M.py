@@ -14,6 +14,10 @@ import sys
 import os
 import math
 import hashlib
+import logging
+
+# Module-level flag for one-time EBR theme prior warning
+_WARNED_EBR_THEME_PRIOR_MISSING = False
 
 # Add paths for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -737,6 +741,9 @@ class TopasARC60M(nn.Module):
         # Auto-detect training mode if not specified
         if training_mode is None:
             training_mode = self.training
+            
+        # Initialize extras early to prevent scope errors
+        extras = {}
         
         # Input validation
         if not demos:
@@ -1965,18 +1972,29 @@ class TopasARC60M(nn.Module):
             B, C, H, W = logits.shape
             cons = ARCGridConstraints(expect_symmetry=None, color_hist=None, sparsity=None)
             
-            # Get theme priors for EBR gating
-            theme_embed = self._get_theme_embed_from_dream(extras)
-            theme_priors = self._generate_theme_priors(theme_embed, extras)
+            # canonical extras guard
+            extras = extras if isinstance(extras, dict) else {}
             
-            # Apply theme prior scaling
-            scaled_priors = priors.copy()
-            for key in ['phi', 'kappa', 'cge']:
-                if key in scaled_priors:
-                    scale = theme_priors.get('symmetry' if key == 'phi' else 'connectivity', 1.0)
-                    scaled_priors[key] = scaled_priors[key] * scale
+            # safe theme embed + priors
+            try:
+                theme_embed = self._get_theme_embed_from_dream(extras)
+            except Exception:
+                theme_embed = None
+
+            try:
+                theme_priors = getattr(self, "relmem", None).get_theme_priors(theme_embed) if getattr(self, "relmem", None) is not None else None
+            except Exception:
+                theme_priors = None
+                
+            # One-time fallback logger
+            global _WARNED_EBR_THEME_PRIOR_MISSING
+            if theme_priors is None and not _WARNED_EBR_THEME_PRIOR_MISSING:
+                logging.warning("[EBR] theme_priors missing -> using neutral priors (will warn once).")
+                _WARNED_EBR_THEME_PRIOR_MISSING = True
+            if theme_priors is not None:
+                logging.debug(f"[EBR] using prior_scales={theme_priors}")
             
-            refined_logits = self.ebr(logits, cons, scaled_priors)  # differentiable
+            refined_logits = self.ebr(logits, cons, priors, prior_scales=theme_priors, extras=extras)
             
             class ArgmaxSTE(torch.autograd.Function):
                 @staticmethod
@@ -2014,22 +2032,33 @@ class TopasARC60M(nn.Module):
     
     def _generate_theme_priors(self, theme_embed, extras):
         """Generate simple priors from theme embedding for EBR gating"""
-        theme_priors = {'symmetry': 1.0, 'connectivity': 1.0}
+        theme_priors = {'phi': 1.0, 'kappa': 1.0, 'cge': 1.0}
         
         if theme_embed is not None and theme_embed.numel() > 0:
-            # Extract simple priors from theme embedding
+            # Extract EBR priors from theme embedding
             embed_norm = torch.norm(theme_embed).item()
             embed_mean = theme_embed.mean().item()
+            embed_std = torch.std(theme_embed).item()
             
-            # Symmetry prior: based on embedding regularity
-            symmetry_score = 1.0 + 0.3 * abs(embed_mean)  # Boost if theme has clear bias
-            theme_priors['symmetry'] = min(2.0, max(0.5, symmetry_score))
+            # Phi (synergy): based on embedding regularity  
+            phi_scale = 1.0 + 0.3 * min(embed_std, 1.0)
+            theme_priors['phi'] = min(1.5, max(0.5, phi_scale))
             
-            # Connectivity prior: based on embedding magnitude
-            connectivity_score = 1.0 + 0.2 * min(embed_norm, 2.0)  # Boost for stronger themes
-            theme_priors['connectivity'] = min(1.5, max(0.7, connectivity_score))
+            # Kappa/CGE: based on embedding magnitude
+            mag_scale = 1.0 + 0.2 * min(embed_norm, 1.5) 
+            theme_priors['kappa'] = min(1.5, max(0.5, mag_scale))
+            theme_priors['cge'] = min(1.5, max(0.5, mag_scale * 0.8))
         
         return theme_priors
+    
+    def get_theme_priors(self, theme_embed):
+        """Safe theme priors computation for EBR integration"""
+        if not hasattr(self, '_generate_theme_priors'):
+            return None
+        try:
+            return self._generate_theme_priors(theme_embed, {})
+        except Exception:
+            return None
     
     @torch.no_grad()
     def run_dream_cycle(self, demos_programs=None, tokens: Optional[torch.Tensor] = None):
@@ -2485,11 +2514,13 @@ class TopasARC60M(nn.Module):
         # RelMem inverse-loss regularization
         if self.relmem is not None and self.config.relmem_inverse_loss_w > 0:
             try:
-                if hasattr(self.relmem, "compute_inverse_loss"):
+                if hasattr(self.relmem, "inverse_loss"):
+                    # Use the A/B-based inverse_loss (more active)
+                    inv_loss = self.relmem.inverse_loss()
+                elif hasattr(self.relmem, "compute_inverse_loss"):
                     inv_loss = self.relmem.compute_inverse_loss()
                 else:
-                    # fallback to old method
-                    inv_loss = self.relmem.inverse_loss()
+                    inv_loss = torch.tensor(0.0)
                 losses["relmem_inverse_loss"] = inv_loss * self.config.relmem_inverse_loss_w
                 
                 import logging
@@ -2551,18 +2582,29 @@ class TopasARC60M(nn.Module):
                 except:
                     pass
                 
-                # Run EBR refinement with theme priors
-                theme_embed = self._get_theme_embed_from_dream(extras)
-                theme_priors = self._generate_theme_priors(theme_embed, extras)
+                # canonical extras guard
+                extras = extras if isinstance(extras, dict) else {}
                 
-                # Apply theme prior scaling
-                scaled_priors = priors.copy()
-                for key in ['phi', 'kappa', 'cge']:
-                    if key in scaled_priors:
-                        scale = theme_priors.get('symmetry' if key == 'phi' else 'connectivity', 1.0)
-                        scaled_priors[key] = scaled_priors[key] * scale
+                # safe theme embed + priors
+                try:
+                    theme_embed = self._get_theme_embed_from_dream(extras)
+                except Exception:
+                    theme_embed = None
+
+                try:
+                    theme_priors = getattr(self, "relmem", None).get_theme_priors(theme_embed) if getattr(self, "relmem", None) is not None else None
+                except Exception:
+                    theme_priors = None
+                    
+                # One-time fallback logger
+                global _WARNED_EBR_THEME_PRIOR_MISSING
+                if theme_priors is None and not _WARNED_EBR_THEME_PRIOR_MISSING:
+                    logging.warning("[EBR] theme_priors missing -> using neutral priors (will warn once).")
+                    _WARNED_EBR_THEME_PRIOR_MISSING = True
+                if theme_priors is not None:
+                    logging.debug(f"[EBR] using prior_scales={theme_priors}")
                 
-                refined_logits_4d = self.ebr(logits_4d, constraint_obj, scaled_priors)
+                refined_logits_4d = self.ebr(logits_4d, constraint_obj, priors, prior_scales=theme_priors, extras=extras)
                 refined_grid = refined_logits_4d.argmax(dim=1)  # [B, H, W]
                 
                 outputs["refined_grid"] = refined_grid
