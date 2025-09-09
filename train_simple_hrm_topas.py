@@ -137,17 +137,22 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 outputs = topas_model.forward_pretraining(input_grid)
 
             # Expect outputs to be dict-like and contain 'logits'
-            if isinstance(outputs, dict) and 'logits' in outputs:
+            if isinstance(outputs, dict) and 'logits' in outputs and outputs['logits'] is not None:
                 logits = outputs['logits']  # Should already be [B, H*W, C]
+                
+                # Check for None return (model detected issues)
+                if logits is None:
+                    logging.warning("Model returned None logits, skipping batch")
+                    return None
                 
                 # Ensure target is properly shaped
                 B = logits.size(0)
                 H, W = target_grid.shape[-2:]
                 target_flat = target_grid.view(B, -1).long()
                 
-                # Verify shapes match
+                # Auto-align shapes if needed (model should handle this now)
                 if logits.size(1) != target_flat.size(1):
-                    logging.error(f"Shape mismatch: logits {logits.shape} vs target {target_flat.shape}")
+                    logging.warning(f"Shape mismatch: logits {logits.shape} vs target {target_flat.shape}, skipping")
                     return None
                 
                 # Sanity check targets
@@ -165,7 +170,7 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 return None
 
         if loss is None or (isinstance(loss, torch.Tensor) and not torch.isfinite(loss).all()):
-            logging.error("Invalid loss encountered; skipping step.")
+            logging.error("Invalid loss (NaN/Inf) at global step %d, skipping", global_step if 'global_step' in locals() else -1)
             return None
 
         scaler.scale(loss).backward()
