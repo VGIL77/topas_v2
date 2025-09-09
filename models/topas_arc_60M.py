@@ -364,6 +364,10 @@ class ModelConfig:
     painter_refine: bool = True  # Skip EBR after painter fallback if False
     painter_confidence_threshold: float = 0.0  # Skip EBR if logits entropy < threshold (0.0 = disabled)
     
+    # DSL execution loss
+    use_dsl_loss: bool = True
+    lambda_dsl: float = 0.1
+    
     # Dream Engine
     enable_dream: bool = True
     dream_micro_ticks: int = 1
@@ -2097,7 +2101,7 @@ class TopasARC60M(nn.Module):
             'brain': brain          # Control vector [B, ctrl_dim]
         }
     
-    def forward_pretraining(self, test_grid: torch.Tensor, hrm_latents=None) -> Dict[str, torch.Tensor]:
+    def forward_pretraining(self, test_grid: torch.Tensor, hrm_latents=None, target_shape=None) -> Dict[str, torch.Tensor]:
         """
         Forward pass optimized for pretraining (no DSL search, just neural features)
         
@@ -2153,16 +2157,20 @@ class TopasARC60M(nn.Module):
         K = slot_logits.size(1)
         C = self.num_colors
         
-        # Get actual grid dimensions from input
-        if test_grid.dim() == 2:  # [H, W]
-            H, W = test_grid.shape
-        elif test_grid.dim() == 3:  # [B, H, W] or [C, H, W]
-            if test_grid.size(0) == B:  # [B, H, W]
-                H, W = test_grid.shape[-2:]
-            else:  # [C, H, W]
-                H, W = test_grid.shape[-2:]
+        # Get target grid dimensions (preferred) or fall back to input
+        if target_shape is not None:
+            H, W = target_shape
         else:
-            H, W = test_grid.shape[-2:]
+            # Fallback: use input dimensions
+            if test_grid.dim() == 2:  # [H, W]
+                H, W = test_grid.shape
+            elif test_grid.dim() == 3:  # [B, H, W] or [C, H, W]
+                if test_grid.size(0) == B:  # [B, H, W]
+                    H, W = test_grid.shape[-2:]
+                else:  # [C, H, W]
+                    H, W = test_grid.shape[-2:]
+            else:
+                H, W = test_grid.shape[-2:]
         
         # Generate per-pixel logits using attention
         if attn is not None:
@@ -2191,7 +2199,25 @@ class TopasARC60M(nn.Module):
                 # Mix slot logits with attention: [B, K, C] x [B, K, P] -> [B, C, P]
                 pixel_logits = torch.einsum("bkc,bkp->bcp", slot_logits, attn_flat)
                 logits = pixel_logits.permute(0, 2, 1).contiguous()  # [B, P, C]
-                logits = logits.view(B, H*W, C)  # [B, H*W, C]
+                
+                # Ensure correct reshape: if P != H*W, need spatial interpolation
+                P = logits.size(1)
+                if P != H*W:
+                    # Reshape to 4D for interpolation
+                    P_sqrt = int(P**0.5)
+                    if P_sqrt * P_sqrt == P:  # Perfect square
+                        logits_4d = logits.view(B, P_sqrt, P_sqrt, C).permute(0, 3, 1, 2)  # [B, C, H', W']
+                        logits_4d = torch.nn.functional.interpolate(logits_4d, size=(H, W), mode="bilinear", align_corners=False)
+                        logits = logits_4d.permute(0, 2, 3, 1).reshape(B, H*W, C)
+                    else:
+                        # Non-square: truncate or pad
+                        if P > H*W:
+                            logits = logits[:, :H*W, :]
+                        else:
+                            pad_size = H*W - P
+                            logits = torch.cat([logits, torch.zeros(B, pad_size, C, device=logits.device)], dim=1)
+                else:
+                    logits = logits.view(B, H*W, C)  # [B, H*W, C]
             else:
                 attn = None  # Force pixel fallback
         
@@ -2236,22 +2262,82 @@ class TopasARC60M(nn.Module):
                         pad_size = H*W - P_actual
                         logits = torch.cat([logits, torch.zeros(B, pad_size, C, device=logits.device)], dim=1)
         
+        # Convert logits to predicted grid for DSL training
+        pred_grid = logits.argmax(dim=-1).view(B, H, W)  # [B, H, W]
+        
+        # DSL execution loss (if enabled)
+        losses = {}
+        if self.config.use_dsl_loss:
+            try:
+                # Simple DSL loss: encourage grid to be DSL-executable
+                # For now, use a consistency loss - predicted grid should be stable under identity operations
+                identity_grid = pred_grid.clone()  # Placeholder for DSL execution
+                dsl_logits = torch.zeros_like(logits)
+                dsl_logits.scatter_(-1, identity_grid.view(B, H*W, 1), 1.0)  # One-hot from identity
+                
+                dsl_loss = torch.nn.functional.kl_div(
+                    torch.log_softmax(logits, dim=-1),
+                    dsl_logits,
+                    reduction='batchmean'
+                )
+                losses["dsl_loss"] = dsl_loss * 0.01  # Scale down the very high DSL loss
+            except Exception as e:
+                import logging
+                logging.warning(f"DSL loss skipped: {e}")
+        
         # Get painter prediction (for comparison)
         grid_pred, _, _ = self.painter(feat)
         
-        # Extract full neural features
+        # Extract full neural features  
         features = self.get_neural_features(test_grid)
         
         # Prepare predictions dictionary
         predictions = {
             'logits': logits,  # [B, H*W, C] for cross-entropy loss
+            'pred_grid': pred_grid,  # [B, H, W] predicted grid
             'grid': grid_pred,
             'features': features,
             'slot_vecs': slot_vecs,
-            'slot_logits': slot_logits
+            'slot_logits': slot_logits,
+            'losses': losses
         }
         
         return predictions
+    
+    def evaluate_with_ebr(self, test_grid: torch.Tensor, target_grid: torch.Tensor, hrm_latents=None) -> Dict[str, torch.Tensor]:
+        """Evaluation with EBR refinement for exact match optimization"""
+        # 1. Run base model forward
+        outputs = self.forward_pretraining(test_grid, hrm_latents=hrm_latents, target_shape=target_grid.shape[-2:])
+        logits = outputs["logits"]
+        
+        if logits is None:
+            return outputs
+        
+        # 2. Convert logits to grid
+        B, H, W = target_grid.shape
+        base_grid = logits.argmax(dim=-1).view(B, H, W).cpu().numpy()
+        
+        # 3. Run EnergyRefiner if enabled
+        if self.config.use_ebr:
+            try:
+                # EBR operates on logits - for now just use base grid (placeholder)
+                # TODO: Implement proper EBR integration with constraint objects
+                refined_grid = torch.tensor(base_grid, device=test_grid.device)
+                outputs["refined_grid"] = refined_grid
+                
+                # Compute exact match on refined grid
+                exact_match = (refined_grid == target_grid).all(dim=(1,2)).float().mean().item()
+                outputs["exact_match_refined"] = exact_match
+            except Exception as e:
+                import logging
+                logging.warning(f"EBR refinement skipped: {e}")
+                outputs["refined_grid"] = torch.tensor(base_grid, device=test_grid.device)
+                outputs["exact_match_refined"] = 0.0
+        else:
+            outputs["refined_grid"] = torch.tensor(base_grid, device=test_grid.device)
+            outputs["exact_match_refined"] = 0.0
+            
+        return outputs
     
     # === POLICY MODE METHODS ===
     

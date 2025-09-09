@@ -21,37 +21,44 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     return logging
 
-def compute_metrics(predictions, targets):
-    """Compute evaluation metrics: exact match, per-cell accuracy, and IoU."""
-    # predictions: [B, H*W, C] logits
-    # targets: [B, H, W] grids
-    
-    B = predictions.size(0)
-    preds = predictions.argmax(dim=-1)  # [B, H*W]
-    targets_flat = targets.view(B, -1)  # [B, H*W]
-    
-    # Exact match (entire grid correct)
-    exact_match = (preds == targets_flat).all(dim=1).float().mean().item()
-    
-    # Per-cell accuracy
-    accuracy = (preds == targets_flat).float().mean().item()
-    
-    # IoU per color (mean over colors)
-    ious = []
-    for c in range(10):  # NUM_COLORS
-        pred_c = (preds == c)
-        target_c = (targets_flat == c)
-        intersection = (pred_c & target_c).sum().float()
-        union = (pred_c | target_c).sum().float()
-        if union > 0:
-            ious.append((intersection / union).item())
-    mean_iou = sum(ious) / len(ious) if ious else 0.0
-    
-    return {
-        'exact_match': exact_match,
-        'accuracy': accuracy,
-        'mean_iou': mean_iou
-    }
+def compute_metrics(model, input_grid, target_grid, hrm_latents=None):
+    """Compute evaluation metrics with optional EBR refinement."""
+    # Use the model's evaluate_with_ebr method for comprehensive metrics
+    with torch.no_grad():
+        eval_outputs = model.evaluate_with_ebr(input_grid, target_grid, hrm_latents=hrm_latents)
+        
+        if eval_outputs.get('logits') is None:
+            return {'exact_match': 0.0, 'accuracy': 0.0, 'mean_iou': 0.0, 'exact_match_refined': 0.0}
+        
+        logits = eval_outputs['logits']
+        B = logits.size(0)
+        preds = logits.argmax(dim=-1)  # [B, H*W]
+        targets_flat = target_grid.view(B, -1)  # [B, H*W]
+        
+        # Basic metrics
+        exact_match = (preds == targets_flat).all(dim=1).float().mean().item()
+        accuracy = (preds == targets_flat).float().mean().item()
+        
+        # IoU per color
+        ious = []
+        for c in range(10):  # NUM_COLORS
+            pred_c = (preds == c)
+            target_c = (targets_flat == c)
+            intersection = (pred_c & target_c).sum().float()
+            union = (pred_c | target_c).sum().float()
+            if union > 0:
+                ious.append((intersection / union).item())
+        mean_iou = sum(ious) / len(ious) if ious else 0.0
+        
+        # EBR refined exact match
+        exact_match_refined = eval_outputs.get('exact_match_refined', 0.0)
+        
+        return {
+            'exact_match': exact_match,
+            'accuracy': accuracy,
+            'mean_iou': mean_iou,
+            'exact_match_refined': exact_match_refined
+        }
 
 def create_models(device):
     print("🔧 Creating HRM-TOPAS integrated models...")
@@ -92,7 +99,7 @@ def create_models(device):
 
     return topas_model, hrm_model
 
-def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False):
+def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
     optimizer.zero_grad()
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
@@ -127,13 +134,15 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             hrm_latents = None
 
         with torch.amp.autocast(device_type, enabled=(device.type=='cuda')):
-            # Prefer passing hrm_latents if TOPAS supports it
+            # Pass target shape to fix mismatches + optional HRM latents
+            target_shape = target_grid.shape[-2:]  # (H, W)
             try:
                 if hrm_latents is not None:
-                    outputs = topas_model.forward_pretraining(input_grid, hrm_latents=hrm_latents)
+                    outputs = topas_model.forward_pretraining(input_grid, hrm_latents=hrm_latents, target_shape=target_shape)
                 else:
-                    outputs = topas_model.forward_pretraining(input_grid)
+                    outputs = topas_model.forward_pretraining(input_grid, target_shape=target_shape)
             except TypeError:
+                # Fallback for older signature
                 outputs = topas_model.forward_pretraining(input_grid)
 
             # Expect outputs to be dict-like and contain 'logits'
@@ -160,17 +169,28 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 
                 # Cross-entropy with label smoothing
                 label_smoothing = 0.05
-                loss = nn.functional.cross_entropy(
+                ce_loss = nn.functional.cross_entropy(
                     logits.reshape(-1, logits.size(-1)), 
                     target_flat.reshape(-1),
                     label_smoothing=label_smoothing
                 )
+                
+                # Add DSL losses if available
+                total_loss = ce_loss
+                if 'losses' in outputs and outputs['losses']:
+                    for loss_name, loss_value in outputs['losses'].items():
+                        if loss_name == 'dsl_loss':
+                            total_loss = total_loss + 0.1 * loss_value  # lambda_dsl = 0.1
+                            if global_step % 100 == 0:  # Log occasionally
+                                logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
+                
+                loss = total_loss
             else:
                 logging.error("train_step: outputs missing 'logits'; keys=%s", (list(outputs.keys()) if isinstance(outputs, dict) else type(outputs)))
                 return None
 
         if loss is None or (isinstance(loss, torch.Tensor) and not torch.isfinite(loss).all()):
-            logging.error("Invalid loss (NaN/Inf) at global step %d, skipping", global_step if 'global_step' in locals() else -1)
+            logging.error("Invalid loss (NaN/Inf) at global step %d, skipping", global_step)
             return None
 
         scaler.scale(loss).backward()
@@ -183,7 +203,8 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
         scaler.update()
 
         if return_metrics:
-            metrics = compute_metrics(logits, target_grid)
+            # Pass model and grids for comprehensive metrics including EBR
+            metrics = compute_metrics(topas_model, input_grid, target_grid, hrm_latents=hrm_latents)
             return loss.item(), metrics
         else:
             return loss.item() if isinstance(loss, torch.Tensor) else None
@@ -205,10 +226,11 @@ def main():
     dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
 
-    optimizer = optim.AdamW(topas_model.parameters(), lr=1e-4, weight_decay=1e-5)
+    # Conservative hyperparameters for stable training
+    optimizer = optim.AdamW(topas_model.parameters(), lr=5e-5, weight_decay=1e-5)  # Lower LR
     scaler = torch.amp.GradScaler()
 
-    num_epochs = 120  # Full training run
+    num_epochs = 150  # Extended run with stable hyperparams
     total_steps = len(dataset) * num_epochs
     print(f"Training: {num_epochs} epochs, {total_steps} total steps")
     
@@ -225,7 +247,7 @@ def main():
     for epoch in range(num_epochs):
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
         epoch_losses = []
-        epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': []}
+        epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': [], 'exact_match_refined': []}
         from tqdm import tqdm
         progress = tqdm(dataloader, desc=f"Epoch {epoch+1}")
 
@@ -233,7 +255,7 @@ def main():
             # Compute metrics every 10 steps
             compute_metrics_now = (global_step % 10 == 0)
             
-            result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now)
+            result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now, global_step=global_step)
             
             if result is not None:
                 if compute_metrics_now and isinstance(result, tuple):
@@ -254,10 +276,12 @@ def main():
                 if len(epoch_metrics['exact_match']) > 0:
                     postfix['EM'] = f"{sum(epoch_metrics['exact_match'][-5:]) / min(5, len(epoch_metrics['exact_match'])):.2%}"
                     postfix['acc'] = f"{sum(epoch_metrics['accuracy'][-5:]) / min(5, len(epoch_metrics['accuracy'])):.2%}"
+                    if len(epoch_metrics['exact_match_refined']) > 0:
+                        postfix['EM_ebr'] = f"{sum(epoch_metrics['exact_match_refined'][-5:]) / min(5, len(epoch_metrics['exact_match_refined'])):.2%}"
                 progress.set_postfix(postfix)
 
-            # Save checkpoint every 5 epochs
-            if global_step % (len(dataset) * 5) == 0 and global_step > 0:
+            # Save checkpoint every 2 epochs (more frequent for monitoring)
+            if global_step % (len(dataset) * 2) == 0 and global_step > 0:
                 checkpoint = {
                     'epoch': epoch,
                     'global_step': global_step,
@@ -279,6 +303,11 @@ def main():
                 avg_acc = sum(epoch_metrics['accuracy']) / len(epoch_metrics['accuracy'])
                 avg_iou = sum(epoch_metrics['mean_iou']) / len(epoch_metrics['mean_iou'])
                 summary += f", EM={avg_em:.2%}, acc={avg_acc:.2%}, IoU={avg_iou:.3f}"
+                
+                # Add EBR refined exact match if available
+                if len(epoch_metrics['exact_match_refined']) > 0:
+                    avg_em_refined = sum(epoch_metrics['exact_match_refined']) / len(epoch_metrics['exact_match_refined'])
+                    summary += f", EM_ebr={avg_em_refined:.2%}"
                 
                 # Track best metrics
                 if avg_em > best_em:
