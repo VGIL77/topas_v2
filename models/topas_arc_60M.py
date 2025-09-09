@@ -389,6 +389,13 @@ class ModelConfig:
     pretraining_mode: bool = False  # Enable multi-head pretraining
     use_multi_head_loss: bool = False  # Use multi-head loss during training
     
+    # RelMem integration
+    enable_relmem: bool = True
+    relmem_inverse_loss_w: float = 0.1   # weight for inverse loss regularization
+    relmem_op_bias_w: float = 0.2        # weight for DSL op bias injection
+    relmem_max_concepts: int = 2048
+    relmem_rank: int = 16
+    
     def validate(self):
         """Validate configuration parameters"""
         assert self.width > 0, "width must be positive"
@@ -1155,6 +1162,17 @@ class TopasARC60M(nn.Module):
             if dsl_pred is None:
                 try:
                     print(f"[RAIL-DSL] Falling back to beam search...")
+                    
+                    # Merge RelMem bias into op_bias
+                    if self.relmem is not None and self.config.relmem_op_bias_w > 0:
+                        try:
+                            relmem_bias = self.relmem.get_op_bias()
+                            for k, v in relmem_bias.items():
+                                op_bias[k] = op_bias.get(k, 0.0) + v * self.config.relmem_op_bias_w
+                            print(f"[RelMem] Merged op_bias with {len(relmem_bias)} operations")
+                        except Exception as e:
+                            print(f"[RelMem] op_bias integration failed: {e}")
+                    
                     # Enhanced beam_search call with operation bias
                     dsl_result = beam_search(demos, test_grid[0] if test_grid.dim() == 4 else test_grid, 
                                             priors, depth=depth, beam=beam_w, verbose=self.config.verbose,
@@ -2286,6 +2304,21 @@ class TopasARC60M(nn.Module):
                 if hasattr(self, 'reln') and hasattr(self.reln, 'get_operation_bias'):
                     priors_dict = self.reln.get_operation_bias(slot_vecs)
                 
+                # Get op_bias from RelationManager
+                op_bias = self.relman.op_bias()  # existing relation manager bias
+                
+                # Merge RelMem bias into op_bias
+                if self.relmem is not None and self.config.relmem_op_bias_w > 0:
+                    try:
+                        relmem_bias = self.relmem.get_op_bias()
+                        for k, v in relmem_bias.items():
+                            op_bias[k] = op_bias.get(k, 0.0) + v * self.config.relmem_op_bias_w
+                        import logging
+                        logging.info(f"[RelMem] DSL op_bias merged with {len(relmem_bias)} operations")
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"[RelMem] op_bias integration failed: {e}")
+                
                 # Use beam search with real inputs
                 dsl_result = beam_search(
                     demo_grids, 
@@ -2293,7 +2326,8 @@ class TopasARC60M(nn.Module):
                     priors_dict, 
                     depth=2, 
                     beam=3, 
-                    verbose=False
+                    verbose=False,
+                    op_bias=op_bias  # Pass merged op_bias
                 )
                 
                 if isinstance(dsl_result, tuple):
@@ -2342,6 +2376,17 @@ class TopasARC60M(nn.Module):
         
         # Extract full neural features  
         features = self.get_neural_features(test_grid)
+        
+        # RelMem inverse-loss regularization
+        if self.relmem is not None and self.config.relmem_inverse_loss_w > 0:
+            try:
+                inv_loss = self.relmem.inverse_loss()
+                losses["relmem_inverse_loss"] = inv_loss * self.config.relmem_inverse_loss_w
+                import logging
+                logging.info(f"[RelMem] Applied inverse-loss: {inv_loss.item():.4f} (weighted: {(inv_loss * self.config.relmem_inverse_loss_w).item():.4f})")
+            except Exception as e:
+                import logging
+                logging.warning(f"RelMem inverse-loss skipped: {e}")
         
         # Prepare predictions dictionary
         predictions = {

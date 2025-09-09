@@ -369,3 +369,77 @@ class RelationalMemoryNeuro(nn.Module):
         
         self.apply_hebbian()
         self.apply_wta()
+    
+    def get_op_bias(self) -> Dict[str, float]:
+        """
+        Produce a prior over DSL operations using learned relational signals.
+        Returns: dict {op_name: bias_float} with op names VALID in DSL_OPS.
+        """
+        from typing import Dict
+        
+        # Lazy import to avoid circulars
+        try:
+            from models.dsl_registry import DSL_OPS  # canonical op set
+            DSL_OPS_SET = set(DSL_OPS)
+        except Exception:
+            DSL_OPS_SET = set()
+        
+        def rel_score(name: str) -> float:
+            """
+            Preferred way to read a scalar relation strength from RelMem.
+            Falls back to 0.0 if unavailable.
+            """
+            try:
+                if hasattr(self, "_scores"):
+                    s = self._scores(name)  # tensor-like
+                    return float(s.mean()) if hasattr(s, "mean") else float(s)
+            except Exception:
+                pass
+            return 0.0
+        
+        # Map high-level relations to your ACTUAL DSL ops (must match registry)
+        rel_to_ops = {
+            "translate":      ["translate"],
+            "resize":         ["resize_nn"],
+            "scale":          ["scale"],
+            "flip":           ["flip_h", "flip_v"],
+            "rotate":         ["rotate90", "rotate180", "rotate270"],
+            "color_map":      ["color_map"],
+            "mask_color":     ["extract_color"],  # closest match
+            "extract_color":  ["extract_color"],
+            "crop":           ["crop_bbox", "crop_nonzero"],
+            "center_pad":     ["center_pad_to"],
+            "tile":           ["tile", "tile_pattern"],
+            "flood":          ["flood_fill", "flood_select"],
+            "outline":        ["outline", "boundary_extract"],
+            "symmetry":       ["symmetry"],
+            "paste":          ["paste"],
+            "count":          ["count_objects", "count_colors"],
+            "pattern":        ["find_pattern", "extract_pattern", "match_template"],
+            "logic":          ["grid_union", "grid_intersection", "grid_xor", "grid_difference"],
+            "object":         ["for_each_object", "for_each_object_translate", "for_each_object_recolor",
+                              "for_each_object_rotate", "for_each_object_scale", "for_each_object_flip"],
+            "conditional":    ["conditional_map", "apply_rule"],
+            "select":         ["select_by_property", "flood_select"],
+            "identity":       ["identity"],
+            "arithmetic":     ["arithmetic_op"],
+        }
+        
+        bias: Dict[str, float] = {}
+        # Aggregate relation strengths into op priors
+        for rel, ops in rel_to_ops.items():
+            s = rel_score(rel)
+            if s <= 0.0:
+                continue
+            for op in ops:
+                if not DSL_OPS_SET or op in DSL_OPS_SET:  # filter to valid ops
+                    bias[op] = bias.get(op, 0.0) + float(s)
+        
+        # Normalize to 0..1 for stability (keeps top-op ordering)
+        if bias:
+            m = max(bias.values())
+            if m > 0:
+                for k in list(bias.keys()):
+                    bias[k] = bias[k] / m
+        
+        return bias
