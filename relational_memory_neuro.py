@@ -720,3 +720,30 @@ class RelationalMemoryNeuro(nn.Module):
                 self.rel_gain[k].data.copy_(state["rel_gain"][k].to(self.device))
         self.concept_used.copy_(state["concept_used"].to(self.device))
         self.exceptions = { (int(sid), rel): set(map(int, oids)) for (sid,rel), oids in state.get("exceptions", {}).items() }
+
+    # --- Shape-safe wrapper to keep training going & preserve grads ---
+    _REL_INV_WARN = 0
+    _REL_INV_WARN_MAX = 5
+
+    def inverse_loss_safe(self) -> torch.Tensor:
+        """
+        Shape/robust inverse-loss:
+        - returns a real scalar with grad
+        - logs once on failure
+        """
+        try:
+            loss = self.inverse_loss()
+            if torch.is_tensor(loss) and torch.isfinite(loss):
+                return loss
+        except Exception:
+            pass
+        # Log a limited number of warnings (avoid spam)
+        try:
+            if RelationalMemoryNeuro._REL_INV_WARN < RelationalMemoryNeuro._REL_INV_WARN_MAX:
+                import logging
+                logging.getLogger(__name__).warning("RelMem inverse-loss skipped (shape or value issue). Using zero-like fallback.")
+                RelationalMemoryNeuro._REL_INV_WARN += 1
+        except Exception:
+            pass
+        # Zero-like with grad on the correct device
+        return (self.concept_proto * 0).sum()  # preserves graph/device

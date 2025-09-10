@@ -987,6 +987,8 @@ class TopasARC60M(nn.Module):
                 "ebr_deltas": {"iou_delta": 0.0, "acc_delta": 0.0},
                 "retry_count": 0
             }
+            # Expose slot context for RelMem contextual bias
+            extras["slot_vecs"] = slots_rel if training_mode else slots_rel.detach()
         except Exception as e:
             print(f"[ERROR] Neural encoding failed: {e}")
             # Fallback to simple grid passthrough
@@ -1149,7 +1151,7 @@ class TopasARC60M(nn.Module):
             # Try to get theme embedding from Dream/ETS
             if self.dream is not None and hasattr(self.dream, "theme") and hasattr(self.dream.theme, "get_embedding"):
                 try:
-                    theme_embed = self.dream.theme.get_embedding(extras.get("latents", None))
+                    theme_embed = self.dream.theme.get_embedding(extras.get("latent", None))
                 except Exception as e:
                     if self.config.verbose:
                         print(f"[RelMem] Could not get theme embedding: {e}")
@@ -1520,7 +1522,7 @@ class TopasARC60M(nn.Module):
                         theme_embed = None
                         if self.dream is not None and hasattr(self.dream, "theme") and hasattr(self.dream.theme, "get_embedding"):
                             try:
-                                theme_embed = self.dream.theme.get_embedding(extras.get("latents", None))
+                                theme_embed = self.dream.theme.get_embedding(extras.get("latent", None))
                             except Exception:
                                 pass
                     

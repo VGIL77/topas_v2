@@ -483,7 +483,10 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         if hasattr(topas_model.relmem, 'inverse_loss_safe'):
                             relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss_safe()
                         elif hasattr(topas_model.relmem, "inverse_loss"):
-                            try:\n                                relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss()\n                            except Exception:\n                                pass  # Skip inverse loss if it fails"
+                            try:
+                                relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss()
+                            except Exception:
+                                pass  # Skip inverse loss if it fails
                         if torch.is_tensor(relmem_aux):
                             total_loss = total_loss + 0.01 * relmem_aux
                     except Exception as e:
