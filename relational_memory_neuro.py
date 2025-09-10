@@ -59,6 +59,11 @@ class RelationalMemoryNeuro(nn.Module):
         # --- UKS-lite additions ---
         self.exceptions = {}  # dict[(sid:int, rel:str)] = set([oid:int])
         self.persist_path = None  # optional save/load path for UKS-like state
+        
+        # Concept management
+        self.concepts = {}      # dict cid -> record
+        self._next_cid = 0
+        self._index_dirty = True
     
     def forward(self, x: torch.Tensor, state=None, top_k: int = 128):
         """
@@ -200,6 +205,33 @@ class RelationalMemoryNeuro(nn.Module):
         """Queue WTA update for post-optimizer application"""
         if self.wta_enabled:
             self.wta_queue.append(rel)
+
+    def add_concept(self, vec: torch.Tensor, meta: Optional[dict] = None, alpha: float = 1.0) -> int:
+        """Create and store a new concept from vec (tensor). Return cid."""
+        import logging
+        if vec is None:
+            raise ValueError("add_concept requires a vector")
+        vec_cpu = vec.detach().cpu().clone()
+        cid = self._next_cid
+        self._next_cid += 1
+        self.concepts[cid] = {"vec": vec_cpu, "meta": meta or {}, "count": 1, "alpha": float(alpha)}
+        self._index_dirty = True
+        logging.getLogger(__name__).info("[RelMem] add_concept cid=%d vec_norm=%.4f", cid, float(vec_cpu.norm().item()))
+        return cid
+
+    def bind_concept_by_vector(self, vec: torch.Tensor, op_name: str, meta: Optional[dict] = None, alpha: float = 0.5):
+        import logging
+        cid = self.add_concept(vec, meta=meta, alpha=alpha)
+        try:
+            # existing bind API expects (cid, vec, alpha)
+            self.bind_concept(cid, vec, alpha=alpha)
+        except Exception as e:
+            logging.getLogger(__name__).warning("[RelMem] bind_concept failed for cid=%s op=%s: %s", cid, op_name, e)
+        try:
+            self.queue_hebbian_update(op_name, cid, cid)
+        except Exception:
+            logging.getLogger(__name__).debug("[RelMem] queue_hebbian_update failed for cid=%s op=%s", cid, op_name)
+        return cid
 
     @torch.no_grad()
     def apply_hebbian(self):
@@ -725,25 +757,24 @@ class RelationalMemoryNeuro(nn.Module):
     _REL_INV_WARN = 0
     _REL_INV_WARN_MAX = 5
 
-    def inverse_loss_safe(self) -> torch.Tensor:
-        """
-        Shape/robust inverse-loss:
-        - returns a real scalar with grad
-        - logs once on failure
-        """
+    def inverse_loss_safe(self, *args, **kwargs):
+        """Wrapper around inverse loss to avoid shape/index errors and to log shapes."""
+        import logging
+        import torch
         try:
-            loss = self.inverse_loss()
-            if torch.is_tensor(loss) and torch.isfinite(loss):
-                return loss
-        except Exception:
-            pass
-        # Log a limited number of warnings (avoid spam)
-        try:
-            if RelationalMemoryNeuro._REL_INV_WARN < RelationalMemoryNeuro._REL_INV_WARN_MAX:
-                import logging
-                logging.getLogger(__name__).warning("RelMem inverse-loss skipped (shape or value issue). Using zero-like fallback.")
-                RelationalMemoryNeuro._REL_INV_WARN += 1
-        except Exception:
-            pass
-        # Zero-like with grad on the correct device
-        return (self.concept_proto * 0).sum()  # preserves graph/device
+            if not getattr(self, "concepts", None):
+                logging.getLogger(__name__).debug("[RelMem] inverse_loss_safe: no concepts present -> 0")
+                return torch.tensor(0.0, device=getattr(self,'device','cpu'))
+            # call underlying implementation if exists
+            if hasattr(self, "_inverse_loss_impl"):
+                return self._inverse_loss_impl(*args, **kwargs)
+            # otherwise, try original inverse_loss if present
+            if hasattr(self, "inverse_loss"):
+                return self.inverse_loss(*args, **kwargs)
+            return torch.tensor(0.0, device=getattr(self,'device','cpu'))
+        except IndexError as e:
+            logging.getLogger(__name__).exception("[RelMem] inverse_loss IndexError shapes=%s: %s", getattr(args[0],'shape',None), e)
+            return torch.tensor(0.0, device=getattr(self,'device','cpu'))
+        except Exception as e:
+            logging.getLogger(__name__).exception("[RelMem] inverse_loss unexpected error: %s", e)
+            return torch.tensor(0.0, device=getattr(self,'device','cpu'))

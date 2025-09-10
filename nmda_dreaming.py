@@ -174,3 +174,29 @@ class NMDAGatedDreaming(nn.Module):
                     logger.debug(f"Phase-locked replay: batch reordered (N={len(batch)})")
             
         return batch
+    
+    def to(self, device):
+        """Move the module and buffer contents to the specified device."""
+        # Call parent class to() to move nn.Module parameters
+        super().to(device)
+        self.device = torch.device(device)
+        
+        # Move buffer experiences to the new device
+        new_buffer = deque(maxlen=self.buffer.maxlen)
+        for exp in self.buffer:
+            # Create new Experience with tensors on the new device
+            new_exp = Experience(
+                state=exp.state.to(device) if torch.is_tensor(exp.state) else exp.state,
+                action=exp.action,
+                reward=exp.reward,
+                next_state=exp.next_state.to(device) if torch.is_tensor(exp.next_state) else exp.next_state,
+                done=exp.done,
+                valence=exp.valence,
+                arousal=exp.arousal,
+                timestamp=exp.timestamp,
+                phase=exp.phase
+            )
+            new_buffer.append(new_exp)
+        self.buffer = new_buffer
+        
+        return self

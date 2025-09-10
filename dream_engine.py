@@ -189,6 +189,7 @@ class DreamEngine:
                 torch.cuda.manual_seed_all(cfg.cio_seed)
         
         # Create seeded generator for reproducible random numbers
+        # Always ensure generator is on the same device as DreamEngine
         self._rng = torch.Generator(device=self.device)
         self._rng.manual_seed(cfg.cio_seed)
         
@@ -201,6 +202,40 @@ class DreamEngine:
         # Optional attached relational memory (set by model)
         self._relmem = None
 
+    def to(self, device: str):
+        """Move DreamEngine and RNG to a new device (e.g., cuda)"""
+        self.device = torch.device(device)
+        self.cfg.device = str(self.device)
+        # Recreate RNG on the new device
+        self._rng = torch.Generator(device=self.device)
+        self._rng.manual_seed(self.cfg.cio_seed)
+        # Move any nn.Module subcomponents
+        if hasattr(self, "_dream_color_head"):
+            self._dream_color_head.to(self.device)
+        if hasattr(self, "_dream_opbias_head"):
+            self._dream_opbias_head.to(self.device)
+        if hasattr(self, "nmda"):
+            self.nmda.to(self.device)
+        if hasattr(self, "curiosity"):
+            self.curiosity.to(self.device)
+            # Normalize curiosity buffers to device
+            for buf_name in ["reservoir", "running_error", "error_momentum"]:
+                if hasattr(self.curiosity, buf_name):
+                    setattr(self.curiosity, buf_name,
+                            getattr(self.curiosity, buf_name).to(self.device))
+        if hasattr(self, "theme"):
+            # Move theme synthesis module if it has device-dependent components
+            if hasattr(self.theme, "to"):
+                self.theme.to(self.device)
+        if hasattr(self, "wormhole"):
+            # Move wormhole miner if it has device-dependent components
+            if hasattr(self.wormhole, "to"):
+                self.wormhole.to(self.device)
+        # Move oscillator state if it exists
+        if hasattr(self, "z"):
+            self.z = self.z.to(self.device)
+        return self
+
     def attach_relmem(self, relmem):
         """Attach a relational memory module for dream-gated plasticity."""
         self._relmem = relmem
@@ -208,7 +243,7 @@ class DreamEngine:
         self.nmda = NMDAGatedDreaming(
             state_dim=self.cfg.state_dim, action_dim=self.cfg.action_dim, device=self.device
         )
-        self.curiosity = GCCRFCuriosity(state_dim=self.cfg.state_dim)
+        self.curiosity = GCCRFCuriosity(state_dim=self.cfg.state_dim).to(self.device)
         self.theme = EmergentThemeSynthesis()
         self.wormhole = WormholeTemplateMiner()
         # FSHO oscillator state (complex z = x + i y)
@@ -760,12 +795,12 @@ class DreamEngine:
         """Fallback perturbation method using seeded generator when Ridge regression is not applicable."""
         if gain > prior_retention:
             # Small random improvements to all knobs using seeded generator
-            perturb_K = torch.rand(1, generator=self._rng).item() * 0.04 - 0.02  # [-0.02, 0.02]
-            perturb_eta = torch.rand(1, generator=self._rng).item() * 0.02 - 0.01  # [-0.01, 0.01]
-            perturb_alpha = torch.rand(1, generator=self._rng).item() * 0.1 - 0.05  # [-0.05, 0.05]
-            perturb_H = torch.rand(1, generator=self._rng).item() * 0.04 - 0.02  # [-0.02, 0.02]
-            perturb_ripple_rate = torch.rand(1, generator=self._rng).item() * 0.2 - 0.1  # [-0.1, 0.1]
-            perturb_stdp = torch.rand(1, generator=self._rng).item() * 0.4 - 0.2  # [-0.2, 0.2]
+            perturb_K = torch.rand(1, device=self.device, generator=self._rng).item() * 0.04 - 0.02  # [-0.02, 0.02]
+            perturb_eta = torch.rand(1, device=self.device, generator=self._rng).item() * 0.02 - 0.01  # [-0.01, 0.01]
+            perturb_alpha = torch.rand(1, device=self.device, generator=self._rng).item() * 0.1 - 0.05  # [-0.05, 0.05]
+            perturb_H = torch.rand(1, device=self.device, generator=self._rng).item() * 0.04 - 0.02  # [-0.02, 0.02]
+            perturb_ripple_rate = torch.rand(1, device=self.device, generator=self._rng).item() * 0.2 - 0.1  # [-0.1, 0.1]
+            perturb_stdp = torch.rand(1, device=self.device, generator=self._rng).item() * 0.4 - 0.2  # [-0.2, 0.2]
             
             self.cfg.fsho_K = np.clip(
                 self.cfg.fsho_K + perturb_K, 0.05, 0.8
@@ -834,8 +869,19 @@ class DreamEngine:
         """
         import time
         
-        # Begin ripple cycle with energy scalar based on tokens
+        # Always enforce tokens on DreamEngine device for consistency
+        tokens = tokens.to(self.device)
         B, T, D = tokens.shape
+        
+        # Tokens should now always have the correct state_dim since we're using brain tokens
+        # If dimension mismatch, it's a bug that should be fixed at the source
+        if D != self.cfg.state_dim:
+            raise ValueError(f"DreamEngine received tokens with dimension {D}, expected {self.cfg.state_dim}. "
+                           f"Ensure brain tokens are being passed with ctrl_dim={self.cfg.state_dim}")
+        
+        # Cache last tokens for entropy/motif computations
+        self._last_tokens = tokens.detach()
+        
         energy_scalar = 1.0 + float(tokens.var().item()) * 0.01
         
         # Initialize ripple cycle with proper number of steps
@@ -879,6 +925,8 @@ class DreamEngine:
         mined = []
         if demos_programs:
             mined = self.wormhole.mine_from_programs(demos_programs, top_k=5)
+            # normalize mined templates to DreamEngine device
+            mined = [tpl.to(self.device) if hasattr(tpl, "to") else tpl for tpl in mined]
 
         # 5) Several NMDA consolidation passes with ripple context
         losses = []

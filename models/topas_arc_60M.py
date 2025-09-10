@@ -453,20 +453,20 @@ class TopasARC60M(nn.Module):
                                 slot_dim=self.config.slot_dim)
         
         # Always define encoder projection at init for stability
-        if self.config.width != self.config.slot_dim:
-            self.encoder_proj = nn.Linear(self.config.width, self.config.slot_dim)
-            self.glob_dim = self.config.slot_dim
-        else:
-            self.encoder_proj = nn.Identity()
-            self.glob_dim = self.config.width
+        # Set glob_dim to width for consistent brain dimension
+        self.glob_dim = self.config.width
+        self.encoder_proj = nn.Identity()  # glob already has width dimension
         
         self.reln = RelGraph(d=self.config.slot_dim, 
                            layers=self.config.rt_layers, 
                            heads=self.config.rt_heads)
         
-        # Define ctrl_dim correctly after projection
+        # Add projection from slot_dim to slots.out_dim for pooled slots
+        self.pooled_proj = nn.Linear(self.config.slot_dim, self.slots.out_dim)
+        
+        # Define base control dimension for heads (glob + slots)
+        # Will be adjusted later if HRM planner adds puzzle embedding
         self.ctrl_dim = self.glob_dim + self.slots.out_dim
-        print(f"[TOPAS] Prior heads expect ctrl_dim={self.ctrl_dim} (glob={self.glob_dim} + slot_out={self.slots.out_dim})")
         
         # Prior heads
         self.prior_transform = nn.Linear(self.ctrl_dim, 8)
@@ -531,37 +531,16 @@ class TopasARC60M(nn.Module):
         # Legacy DSLHead fallback removed. All DSL calls route through dsl_search.
         self.simple_dsl = None
         
-        # Dream Engine (optional)
+        # Dream Engine (optional) - will be initialized after ctrl_dim is finalized
         self.dream = None
-        if self.config.enable_dream:
-            # Use full control vector (encoder width + slot_dim) as DreamEngine state_dim
-            # This matches the ctrl_dim used for prior heads (width + slots.out_dim)
-            state_dim = self.config.width + self.slots.out_dim
-            dcfg = DreamConfig(
-                state_dim=state_dim,
-                device=self._get_device(),
-                micro_ticks=self.config.dream_micro_ticks,
-                offline_iters=self.config.dream_offline_iters,
-                valence_default=self.config.dream_valence_default,
-                arousal_default=self.config.dream_arousal_default,
-                verbose=self.config.verbose
-            )
-            self.dream = DreamEngine(dcfg)
-            
-            # Attach RelMem to DreamEngine for dream-gated plasticity
-            if hasattr(self, "relmem") and self.relmem is not None:
-                if hasattr(self.dream, "attach_relmem"):
-                    self.dream.attach_relmem(self.relmem)
-            
-            # Log ripple configuration if enabled
-            if hasattr(self.dream, 'ripple') and self.dream.ripple is not None:
-                print(f"[Dream] Ripple substrate: rate={self.dream.ripple.config.event_rate_hz}Hz, "
-                      f"stdp_gain={self.dream.ripple.config.stdp_gain}, "
-                      f"center={self.dream.ripple.config.center_freq_hz}Hz")
         
         # Dream token cache (one sample, downsampled)
         self._dream_tokens = None  # type: Optional[torch.Tensor]
         self._dream_tokens_info = {"H": None, "W": None}  # keep spatial metadata if helpful
+        
+        # persistent dream token buffer to avoid epoch-boundary races
+        self._dream_tokens_buffer = []            # list of small CPU tensors
+        self._dream_tokens_buffer_max = getattr(config, "dream_tokens_buffer_max", 128)
         
         # Enhanced Task Scheduler for intelligent compute allocation
         self.scheduler = None
@@ -645,6 +624,52 @@ class TopasARC60M(nn.Module):
         else:
             self.hrm_bridge = None
             self._has_hrm_bridge = False
+        
+        # If HRM planner is present, expand ctrl_dim to include puzzle_emb (128d)
+        if self._has_planner:
+            self.ctrl_dim += 128
+            # Update prior heads to use the adjusted ctrl_dim
+            self.prior_transform = nn.Linear(self.ctrl_dim, 8)
+            self.prior_size = nn.Linear(self.ctrl_dim, 2)
+            self.prior_palette = nn.Linear(self.ctrl_dim, NUM_COLORS)
+        
+        # Fidelity check: log ctrl_dim definition
+        import logging
+        logging.getLogger(__name__).info(
+            f"[TOPAS] ctrl_dim set to {self.ctrl_dim} "
+            f"(width={self.glob_dim}, slots_out={self.slots.out_dim}, "
+            f"puzzle_emb={'128' if self._has_planner else '0'})"
+        )
+        
+        # Dream Engine initialization - AFTER ctrl_dim is finalized
+        if self.config.enable_dream:
+            # Now ctrl_dim includes puzzle_emb if planner is present
+            # So DreamEngine will get the correct dimension (896 with planner, 768 without)
+            state_dim = self.ctrl_dim
+            dcfg = DreamConfig(
+                state_dim=state_dim,
+                device=self._get_device(),
+                micro_ticks=self.config.dream_micro_ticks,
+                offline_iters=self.config.dream_offline_iters,
+                valence_default=self.config.dream_valence_default,
+                arousal_default=self.config.dream_arousal_default,
+                verbose=self.config.verbose
+            )
+            self.dream = DreamEngine(dcfg)
+            
+            # Attach RelMem to DreamEngine for dream-gated plasticity
+            if hasattr(self, "relmem") and self.relmem is not None:
+                if hasattr(self.dream, "attach_relmem"):
+                    self.dream.attach_relmem(self.relmem)
+            
+            # Log ripple configuration if enabled
+            if hasattr(self.dream, 'ripple') and self.dream.ripple is not None:
+                print(f"[Dream] Ripple substrate: rate={self.dream.ripple.config.event_rate_hz}Hz, "
+                      f"stdp_gain={self.dream.ripple.config.stdp_gain}, "
+                      f"center={self.dream.ripple.config.center_freq_hz}Hz")
+            
+            if self.config.verbose:
+                print(f"[Dream] DreamEngine initialized with state_dim={state_dim}")
         
         # Replace encoder with HRM-aware version if HRM is available
         if self._has_planner:
@@ -945,17 +970,27 @@ class TopasARC60M(nn.Module):
                 slot_vecs = slot_vecs.unsqueeze(1)
             assert slot_vecs.dim() == 3, f"Expected slot_vecs [B,K,D], got {tuple(slot_vecs.shape)}"
             slots_rel = self.reln(slot_vecs)
-            pooled = slots_rel.mean(dim=1)
+            pooled = slots_rel.mean(dim=1)  # [B, slot_dim]
             
-            # Project encoder output to match slot dimensions (using initialized projection)
-            glob_proj = self.encoder_proj(glob)  # [B, width] → [B, slot_dim]
-            brain = torch.cat([glob_proj, pooled], dim=-1)
+            # Project pooled to slots.out_dim for consistent brain dimension
+            if not hasattr(self, "pooled_proj"):
+                self.pooled_proj = nn.Linear(self.config.slot_dim, self.slots.out_dim).to(pooled.device)
+            pooled_proj = self.pooled_proj(pooled)  # [B, slots.out_dim]
+            
+            # Project encoder output to glob_dim (not slot_dim!)
+            glob_proj = self.encoder_proj(glob)  # [B, width] → [B, glob_dim]
+            brain = torch.cat([glob_proj, pooled_proj], dim=-1)
+            
+            # Fidelity check: brain dimension must equal ctrl_dim
+            assert brain.shape[-1] == self.ctrl_dim, \
+                f"Brain dimension mismatch in forward_pretraining: got {brain.shape[-1]}, expected ctrl_dim={self.ctrl_dim}"
             
             # Dream micro-ticks and token caching
             if hasattr(self, 'dream_engine') and self.dream_engine is not None:
                 try:
-                    # Cache tokens for dream processing
-                    dream_tokens = slot_vecs.detach().clone()
+                    # Cache tokens for dream processing - use brain (ctrl_dim) not slot_vecs
+                    # Brain has the proper ctrl_dim that DreamEngine expects
+                    dream_tokens = brain.unsqueeze(1).detach().clone()  # [B, 1, ctrl_dim]
                     extras["dream_tokens_cached"] = dream_tokens
                     
                     # Run micro-ticks if enabled
@@ -1018,7 +1053,17 @@ class TopasARC60M(nn.Module):
             )
             return test_grid, fallback_logits, fallback_size, fallback_extras
         
+        # Cache brain tokens for offline dream cycle
+        # Brain has the proper ctrl_dim that DreamEngine expects
+        try:
+            # Brain is [B, ctrl_dim], expand to [B, 1, ctrl_dim] for consistency
+            brain_tokens = brain.unsqueeze(1).detach().clone()
+            self._cache_dream_tokens(brain_tokens, 1, 1)  # H=1, W=1 since brain is a single vector
+        except Exception as e:
+            print(f"[WARN] Failed to cache dream tokens: {e}")
+        
         # Compute tokens for priors: use feature map if available; fallback to slots_rel
+        # Note: These are for prior computation, not dream tokens
         try:
             Bf, Cf, Hf, Wf = feat.shape
             tokens = feat.permute(0, 2, 3, 1).reshape(Bf, Hf*Wf, Cf).contiguous()
@@ -1029,17 +1074,14 @@ class TopasARC60M(nn.Module):
             Htok = int(math.sqrt(tokens.size(1)))
             Wtok = Htok
         
-        # Cache tokens for offline dream cycle (downsample to keep memory bounded)
-        try:
-            self._cache_dream_tokens(tokens, Htok, Wtok)
-        except Exception as e:
-            print(f"[WARN] Failed to cache dream tokens: {e}")
-        
         # Compute metrics/priors using DreamEngine or fallback
         priors = dict()
         if self.dream is not None:
-            # Compute real priors via DreamEngine
-            priors.update(self.dream.compute_priors(tokens, Htok, Wtok))
+            # Use brain tokens for priors computation - they have the correct ctrl_dim
+            # Brain is [B, ctrl_dim], expand to [B, 1, ctrl_dim] for compute_priors
+            brain_for_priors = brain.unsqueeze(1)
+            # Compute real priors via DreamEngine using brain tokens
+            priors.update(self.dream.compute_priors(brain_for_priors, 1, 1))
         else:
             # Fallback: try direct computation
             try:
@@ -1807,21 +1849,23 @@ class TopasARC60M(nn.Module):
         grid, logits, size, extras = enforce_sacred_signature(grid, logits, size, extras, "FINAL-OUTPUT", training_mode)
         return grid, logits, size, extras
     
-    def _cache_dream_tokens(self, tokens: torch.Tensor, H: int, W: int, max_tokens: int = 256) -> None:
-        """
-        Store a small, detached slice of tokens for offline dream cycles.
-        tokens: [B, T, D]
-        Keeps 1x(min(T, max_tokens))xD on the model's device, detached.
-        """
-        assert tokens.dim() == 3, f"tokens expected [B,T,D], got {tokens.shape}"
-        B, T, D = tokens.shape
-        # Take first sample only to bound memory
-        t = min(T, max_tokens)
-        stride = max(1, T // t)
-        cached = tokens[0:1, ::stride, :].detach().contiguous()
-        self._dream_tokens = cached
-        self._dream_tokens_info["H"] = H
-        self._dream_tokens_info["W"] = W
+    def _cache_dream_tokens(self, tokens, Hf=None, Wf=None):
+        # Append to persistent buffer (detach & move to cpu to avoid GPU memory growth)
+        try:
+            t_cpu = tokens.detach().cpu().clone()
+            self._dream_tokens_buffer.append(t_cpu)
+            if len(self._dream_tokens_buffer) > self._dream_tokens_buffer_max:
+                # pop oldest
+                self._dream_tokens_buffer.pop(0)
+            # build merged _dream_tokens on device for fast access
+            try:
+                merged = torch.cat(self._dream_tokens_buffer, dim=1)
+                self._dream_tokens = merged.to(self.device)
+            except Exception:
+                # fallback: keep last batch on device
+                self._dream_tokens = t_cpu.to(self.device)
+        except Exception as e:
+            logging.getLogger(__name__).warning("[Dream] _cache_dream_tokens failed: %s", e)
     
     def _grid_fingerprint(self, g: torch.Tensor) -> str:
         g2 = g.detach().to("cpu").contiguous()
@@ -2282,32 +2326,40 @@ class TopasARC60M(nn.Module):
             return None
     
     @torch.no_grad()
-    def run_dream_cycle(self, demos_programs=None, tokens: Optional[torch.Tensor] = None):
+    def run_dream_cycle(self, tokens=None, demos_programs=None, force_cpu=False):
         """
-        Run offline dream consolidation.
-        Priority for tokens:
-          1) tokens=... passed explicitly
-          2) cached self._dream_tokens from last forward
-        Fails fast if neither is available.
+        Run a full dream consolidation cycle.
+        tokens: optional explicit tensor [B, T, D]. If None, try:
+          1) self._dream_tokens (merged device tensor)
+          2) build from self._dream_tokens_buffer (if available)
+        If none available, raise with diagnostics.
         """
         if self.dream is None:
             print("[Dream] Disabled")
             return {}
 
         if tokens is None:
-            tokens = self._dream_tokens
-
-        if tokens is None:
-            raise RuntimeError(
-                "run_dream_cycle requires tokens but none were provided or cached. "
-                "Call model.forward(...) once (to cache tokens) or pass tokens=<B,T,D> explicitly."
-            )
+            tokens = getattr(self, "_dream_tokens", None)
+            if tokens is None or (hasattr(tokens, "numel") and tokens.numel() == 0):
+                # try to build from buffer
+                buf = getattr(self, "_dream_tokens_buffer", None)
+                if buf and len(buf) > 0:
+                    try:
+                        merged = torch.cat(buf, dim=1)
+                        tokens = merged.to(self.device)
+                        self._dream_tokens = tokens
+                    except Exception as e:
+                        raise RuntimeError("run_dream_cycle: failed to assemble tokens from buffer: %s" % e)
+                else:
+                    raise RuntimeError("run_dream_cycle requires tokens but none were provided or cached. Call model.forward(...) once (to cache tokens) or pass tokens=<B,T,D> explicitly.")
         
-        # Ensure tokens are on the correct device
-        model_device = self._get_device()
-        if tokens.device.type != model_device or str(tokens.device) != model_device:
-            tokens = tokens.to(model_device)
-
+        # Ensure tokens are on the DreamEngine's device
+        dream_device = torch.device(self.dream.device)
+        if tokens.device != dream_device:
+            tokens = tokens.to(dream_device)
+        
+        # Tokens should now always have the correct ctrl_dim since we're using brain tokens
+        # No defensive projection needed anymore
         return self.dream.cycle_offline(tokens, demos_programs=demos_programs)
         
     def update_scheduler_metrics(self, task_id: str, metrics: Dict[str, float], 
@@ -2428,11 +2480,18 @@ class TopasARC60M(nn.Module):
         # Create projection layer dynamically if needed
         if self.encoder_proj is None:
             actual_glob_dim = glob.shape[-1]
-            self.encoder_proj = nn.Linear(actual_glob_dim, self.config.slot_dim).to(glob.device)
+            # Project to glob_dim (width) not slot_dim for consistent brain dimension
+            self.encoder_proj = nn.Linear(actual_glob_dim, self.glob_dim).to(glob.device)
         
         # Control vector (brain) with projection
         glob_proj = self.encoder_proj(glob)
-        brain = torch.cat([glob_proj, pooled], dim=-1)
+        
+        # Project pooled to slots.out_dim for consistent brain dimension
+        if not hasattr(self, "pooled_proj"):
+            self.pooled_proj = nn.Linear(self.config.slot_dim, self.slots.out_dim).to(pooled.device)
+        pooled_proj = self.pooled_proj(pooled)
+        
+        brain = torch.cat([glob_proj, pooled_proj], dim=-1)
         
         return {
             'feat': feat,           # Feature maps [B, C, H, W]
@@ -2586,25 +2645,71 @@ class TopasARC60M(nn.Module):
             gamma, beta = self.hrm_to_film(hrm_mean).chunk(2, dim=-1)
             slot_vecs = slot_vecs * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
         
-        # Dream micro-ticks and token caching
-        if hasattr(self, 'dream_engine') and self.dream_engine is not None:
+        # Dream micro-ticks and token caching  
+        if hasattr(self, 'dream') and self.dream is not None:
             try:
-                # Cache tokens for dream processing
-                dream_tokens = slot_vecs.detach().clone()
-                extras["dream_tokens_cached"] = dream_tokens
+                # NOTE: We must wait until brain is constructed below to cache dream tokens
+                # Brain will be constructed after pooling and concatenation
+                pass  # Dream tokens will be cached after brain construction
                 
                 # Run micro-ticks if enabled
                 dream_micro_ticks = getattr(self.config, 'dream_micro_ticks', 1)
                 for _ in range(dream_micro_ticks):
-                    self.dream_engine.step_micro(valence=0.5, arousal=0.3)
+                    if hasattr(self.dream, 'step_micro'):
+                        self.dream.step_micro(valence=0.5, arousal=0.3)
+                    elif hasattr(self.dream, 'tick'):
+                        self.dream.tick()
                     
             except Exception as e:
                 import logging
                 logging.warning(f"Dream micro-tick failed: {e}")
         
-        # Extract relational slots and brain latent
-        slots_rel = slot_vecs  # For now, use slot_vecs as relational slots
-        brain = self._extract_brain_latent(slots_rel, glob)
+        # Extract relational slots
+        slots_rel = slot_vecs  # [B, K, slot_dim]
+
+        # Pool relational slots - keep at slot_dim for now
+        pooled = slots_rel.mean(dim=1)  # [B, slot_dim]
+        
+        # Project pooled to slots.out_dim for consistent brain dimension
+        if not hasattr(self, "pooled_proj"):
+            self.pooled_proj = nn.Linear(self.config.slot_dim, self.slots.out_dim).to(pooled.device)
+        pooled_proj = self.pooled_proj(pooled)  # [B, slots.out_dim]
+
+        # Always project global features to glob_dim (not slot_dim!)
+        if not hasattr(self, "encoder_proj") or self.encoder_proj is None:
+            # Project to glob_dim which equals width when using correct initialization
+            self.encoder_proj = nn.Linear(glob.shape[-1], self.glob_dim).to(glob.device)
+        glob_proj = self.encoder_proj(glob)  # [B, glob_dim]
+
+        # Optional HRM puzzle embedding (128d if planner attached)
+        puzzle_emb = None
+        if self._has_planner and hasattr(self.planner, "inner") and hasattr(self.planner.inner, "puzzle_emb"):
+            try:
+                puzzle_ids = torch.zeros(glob.size(0), dtype=torch.long, device=glob.device)
+                puzzle_emb = self.planner.inner.puzzle_emb(puzzle_ids)  # [B, 128]
+            except Exception:
+                puzzle_emb = None
+
+        # Build brain consistently with ctrl_dim = glob_dim + slots.out_dim (+ puzzle_emb)
+        brain_parts = [glob_proj, pooled_proj]
+        if puzzle_emb is not None:
+            brain_parts.append(puzzle_emb)
+        brain = torch.cat(brain_parts, dim=-1)
+        
+        # Fidelity check: brain dimension must equal ctrl_dim (ctrl_dim already includes puzzle_emb if present)
+        assert brain.shape[-1] == self.ctrl_dim, \
+            f"Brain dimension mismatch in decode_objects: got {brain.shape[-1]}, expected ctrl_dim={self.ctrl_dim}"
+        
+        # Now cache dream tokens with proper ctrl_dim (from brain)
+        if hasattr(self, 'dream') and self.dream is not None:
+            try:
+                # Brain has the proper ctrl_dim that DreamEngine expects
+                dream_tokens = brain.unsqueeze(1).detach().clone()  # [B, 1, ctrl_dim]
+                self._cache_dream_tokens(dream_tokens)
+                extras["dream_tokens_cached"] = dream_tokens
+            except Exception as e:
+                import logging
+                logging.warning(f"Failed to cache dream tokens: {e}")
         
         # Generate per-slot logits [B, K, C]
         slot_logits = self.slot_to_logits(slot_vecs)
@@ -2933,7 +3038,11 @@ class TopasARC60M(nn.Module):
         # 2. Convert logits to grid
         B, H, W = target_grid.shape
         base_grid = logits.argmax(dim=-1).view(B, H, W).cpu().numpy()
-        
+
+        # Pull features from forward_pretraining outputs for downstream use
+        glob = outputs.get("glob", None)
+        puzzle_emb = outputs.get("puzzle_emb", None)
+
         # 3. Run EnergyRefiner if enabled
         if self.config.use_ebr:
             try:

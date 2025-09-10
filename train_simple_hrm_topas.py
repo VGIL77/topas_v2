@@ -337,10 +337,24 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
                             slot_vecs = slot_vecs.unsqueeze(1)  # Add slot dimension
                         
                         # Concatenate global features with slot vectors to match state_dim
-                        # DreamEngine expects state_dim = width + slot_dim
+                        # DreamEngine expects state_dim = ctrl_dim (width + slot_dim + puzzle_emb if present)
                         B, K, D = slot_vecs.shape
                         glob_expanded = glob.unsqueeze(1).expand(B, K, -1)  # [B, K, width]
-                        combined_state = torch.cat([glob_expanded, slot_vecs], dim=-1)  # [B, K, width+slot_dim]
+                        
+                        # Check if we need to add puzzle_emb to match ctrl_dim
+                        # The model's ctrl_dim includes puzzle_emb (128) when planner is present
+                        if hasattr(topas_model, '_has_planner') and topas_model._has_planner:
+                            # Add dummy puzzle_emb for dream pretraining (128D)
+                            puzzle_emb = torch.zeros(B, K, 128, device=device)
+                            combined_state = torch.cat([glob_expanded, slot_vecs, puzzle_emb], dim=-1)  # [B, K, ctrl_dim]
+                        else:
+                            combined_state = torch.cat([glob_expanded, slot_vecs], dim=-1)  # [B, K, width+slot_dim]
+                        
+                        # Verify dimension matches DreamEngine's expectation
+                        expected_dim = topas_model.ctrl_dim if hasattr(topas_model, 'ctrl_dim') else 768
+                        if combined_state.shape[-1] != expected_dim:
+                            logger.warning(f"[Dream-Pretrain] Dimension mismatch: latent has {combined_state.shape[-1]}D, expected {expected_dim}D")
+                        
                         extras['latent'] = combined_state
             
             # Train Dream/ETS
@@ -388,7 +402,7 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
     optimizer.zero_grad()
-    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    device_type = 'cuda' if str(device).startswith('cuda') else 'cpu'
 
     try:
         demos, test_inputs, test_outputs, task_id = batch
@@ -563,6 +577,29 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                                                 binding_stats['relmem_bound'] = True
                                                 binding_stats['relmem_concept_id'] = 'auto'
                                         
+                                        # --- Wormhole integration ---
+                                        try:
+                                            if hasattr(topas_model, "dream") and hasattr(topas_model.dream, "wormhole"):
+                                                rule_info = outputs.get('extras', {}).get('rule_info')
+                                                ops = outputs.get('extras', {}).get('ops_used', [])
+                                                programs = rule_info.get("programs", [ops]) if isinstance(rule_info, dict) else [ops]
+                                                mined = topas_model.dream.wormhole.mine_from_programs(programs, top_k=5)
+                                                if mined:
+                                                    logging.getLogger(__name__).info(f"[Wormhole] mined {len(mined)} templates")
+                                                    # Bind mined templates into RelMem
+                                                    for tpl in mined:
+                                                        try:
+                                                            tpl_sig = str(tpl)[:32]
+                                                            if hasattr(topas_model.relmem, "bind_concept_by_vector"):
+                                                                topas_model.relmem.bind_concept_by_vector(
+                                                                    brain_latent.squeeze(0), op_name="wormhole",
+                                                                    meta={"template": tpl_sig}, alpha=0.5
+                                                                )
+                                                        except Exception as e:
+                                                            logging.getLogger(__name__).warning(f"[Wormhole] RelMem bind failed: {e}")
+                                        except Exception as e:
+                                            logging.getLogger(__name__).warning(f"[Wormhole] integration failed: {e}")
+                                        
                                         if binding_stats.get('relmem_bound') and global_step % 100 == 0:
                                             concept_id = binding_stats.get('relmem_concept_id', 'unknown')
                                             logging.info(f"RelMem bound concept {concept_id} on success (EM={exact_match:.3f}, IoU={mean_iou:.3f})")
@@ -603,6 +640,21 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             return None
 
         scaler.scale(loss).backward()
+        
+        # Cache batch and programs for dream seeding (every 50 steps to reduce overhead)
+        if global_step % 50 == 0:
+            try:
+                # Extract programs from outputs
+                programs = outputs.get("extras", {}).get("programs", [])
+                
+                # Store in a global that main() can access
+                globals()['last_batch_for_dream'] = {
+                    'test_grid': input_grid.detach().cpu(),
+                    'task_id': task_id,
+                    'programs': programs
+                }
+            except Exception:
+                pass
         
         # Gradient clipping for stability
         scaler.unscale_(optimizer)
@@ -861,6 +913,26 @@ def main():
                         summary += f"exceptions={int(relmem_info.get('relmem_exceptions', 0))}"
             except Exception:
                 pass
+
+            # --- Wormhole consolidation ---
+            try:
+                if hasattr(topas_model, "dream") and hasattr(topas_model.dream, "wormhole"):
+                    consolidator = getattr(topas_model.dream.wormhole, "consolidator", None)
+                    if consolidator is not None:
+                        # Consolidate programs collected during the epoch
+                        # Assume extras logged some programs; you can adapt source
+                        all_programs = []
+                        if hasattr(topas_model, "task_history"):
+                            for tid, perf in topas_model.task_history.items():
+                                if "programs" in perf:
+                                    all_programs.extend(perf["programs"])
+                        if all_programs:
+                            new_templates = consolidator.consolidate(all_programs, top_k=20)
+                            logging.getLogger(__name__).info(
+                                f"[Wormhole] Consolidated {len(new_templates)} templates at epoch {epoch+1}"
+                            )
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[Wormhole] consolidation failed: {e}")
             
             if len(epoch_metrics['exact_match']) > 0:
                 avg_em = sum(epoch_metrics['exact_match']) / len(epoch_metrics['exact_match'])
@@ -916,11 +988,30 @@ def main():
                         bg = bool(getattr(trainer_cli_args, "dream_background", False))
                         force_cpu = bool(getattr(trainer_cli_args, "dream_force_cpu", False))
                         logging.info("[Dream-Trainer] Triggering full dream cycle (epoch %d)", epoch+1)
-                        stats = run_dream_cycle_safe(topas_model,
-                                                     timeout_sec=timeout,
-                                                     background=bg,
-                                                     force_cpu=force_cpu,
-                                                     logger=logging.getLogger(__name__))
+                        # epoch boundary: build canonical 1152-dim dream tokens and run dream cycle
+                        stats = None
+                        try:
+                            cached_batch = globals().get('last_batch_for_dream', None)
+                            outputs = topas_model.forward_pretraining(
+                                cached_batch['test_grid'].to(device),
+                                target_shape=cached_batch['test_grid'].shape[-2:]
+                            ) if cached_batch is not None else None
+
+                            dream_tokens = None
+                            if outputs is not None and "brain" in outputs and "slot_vecs" in outputs:
+                                brain = outputs["brain"]              # [B, 1152]
+                                slot_vecs = outputs["slot_vecs"]      # [B, T, 512]
+                                B, T, _ = slot_vecs.shape
+                                # Expand brain across slots to produce [B, T, 1152]
+                                dream_tokens = brain.unsqueeze(1).expand(B, T, -1)
+
+                            if dream_tokens is None:
+                                # fallback: use whatever tokens the model cached
+                                dream_tokens = getattr(topas_model, "_dream_tokens", None)
+
+                            stats = topas_model.run_dream_cycle(tokens=dream_tokens, demos_programs=outputs.get("extras", {}).get("programs") if outputs else None)
+                        except Exception as e:
+                            logging.exception("[Dream] Full cycle failed: %s", e)
                         # If stats contains EM or other metrics, push into epoch_metrics for visibility
                         if isinstance(stats, dict):
                             em_ebr = stats.get("exact_match_refined") or stats.get("em_ebr") or stats.get("EM_ebr")
