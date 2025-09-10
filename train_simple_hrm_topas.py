@@ -63,9 +63,23 @@ def parse_args():
     parser.add_argument("--selfplay-buffer-size", type=int, default=200,
                         help="Maximum size of self-play buffer")
     
+    # RelMem / UKS-lite
+    parser.add_argument('--relmem-loss-weight', type=float, default=0.01,
+                        help="Weight for RelMem auxiliary loss")
+    parser.add_argument('--relmem-loss-interval', type=int, default=25,
+                        help="Apply RelMem loss every N steps")
+    parser.add_argument('--uks-save-path', type=str, default='uks_state.pt',
+                        help="Path to save UKS state")
+    parser.add_argument('--uks-load-path', type=str, default='',
+                        help="Path to load UKS state from")
+    
     # Eval args
     parser.add_argument("--eval-interval", type=int, default=5,
                         help="Run evaluation every N epochs")
+    
+    # Training args
+    parser.add_argument("--max-steps", type=int, default=60000,
+                        help="Maximum training steps")
     
     args, _unknown = parser.parse_known_args()
     return args
@@ -461,6 +475,17 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                             if global_step % 100 == 0:  # Log occasionally
                                 logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
                 
+                # ---- RelMem auxiliary loss every N steps (lightweight) ----
+                if hasattr(topas_model, "relmem") and topas_model.relmem is not None and (global_step % 25 == 0):
+                    try:
+                        relmem_aux = topas_model.relmem.inheritance_pass_plus()
+                        if hasattr(topas_model.relmem, "inverse_loss"):
+                            relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss()
+                        if torch.is_tensor(relmem_aux):
+                            total_loss = total_loss + 0.01 * relmem_aux
+                    except Exception as e:
+                        pass
+                
                 loss = total_loss
             else:
                 logging.error("train_step: outputs missing 'logits'; keys=%s", (list(outputs.keys()) if isinstance(outputs, dict) else type(outputs)))
@@ -513,6 +538,15 @@ def main():
 
     # store cli_args in trainer scope for later reference
     trainer_cli_args = cli_args
+    
+    # Optional UKS load
+    if cli_args and cli_args.uks_load_path:
+        try:
+            if hasattr(topas_model, "relmem") and topas_model.relmem is not None:
+                topas_model.relmem.load_uks(cli_args.uks_load_path)
+                print(f"[UKS] Loaded RelMem state from {cli_args.uks_load_path}")
+        except Exception as e:
+            print(f"[UKS] Could not load RelMem state: {e}")
 
     dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
@@ -601,6 +635,15 @@ def main():
                             continue
                     if sp_loss_contribution > 0:
                         print(f"[SelfPlay] applied sp_loss={float(sp_loss_contribution.item()):.4f}")
+                        # Simple reinforcement to RelMem
+                        try:
+                            if hasattr(topas_model, "relmem") and topas_model.relmem is not None:
+                                if float(sp_loss_contribution.item()) < 1.0:
+                                    topas_model.relmem.queue_hebbian_update("pattern", sid=0, oid=0, eta=0.05)
+                                else:
+                                    topas_model.relmem.add_exception(0, "has_attr", 0)
+                        except Exception:
+                            pass
                 else:
                     print(f"[SelfPlay] No samples available for training")
             
@@ -647,9 +690,31 @@ def main():
                 torch.save(checkpoint, f'checkpoint_step_{global_step}.pt')
                 print(f"💾 Saved checkpoint at step {global_step}")
 
+        # ---- Epoch end: refinement + optional UKS save ----
+        try:
+            if hasattr(topas_model, "relmem") and topas_model.relmem is not None:
+                topas_model.relmem.refinement_step()
+                if trainer_cli_args and trainer_cli_args.uks_save_path:
+                    topas_model.relmem.save_uks(trainer_cli_args.uks_save_path)
+                    if epoch % 10 == 0:
+                        print(f"[UKS] Saved RelMem state to {trainer_cli_args.uks_save_path}")
+        except Exception as e:
+            pass
+        
         if len(epoch_losses) > 0:
             avg_loss = sum(epoch_losses) / len(epoch_losses)
             summary = f"Epoch {epoch+1} complete: avg_loss={avg_loss:.4f}"
+            
+            # ---- Logging: include RelMem stats ----
+            try:
+                if hasattr(topas_model, "relmem") and topas_model.relmem is not None:
+                    relmem_info = topas_model.relmem.stats()
+                    if relmem_info:
+                        summary += f" | RelMem active={int(relmem_info.get('relmem_active', 0))} "
+                        summary += f"depth={relmem_info.get('relmem_depth', 0):.2f} "
+                        summary += f"exceptions={int(relmem_info.get('relmem_exceptions', 0))}"
+            except Exception:
+                pass
             
             if len(epoch_metrics['exact_match']) > 0:
                 avg_em = sum(epoch_metrics['exact_match']) / len(epoch_metrics['exact_match'])
@@ -704,6 +769,7 @@ def main():
                         timeout = int(getattr(trainer_cli_args, "dream_full_timeout", 600))
                         bg = bool(getattr(trainer_cli_args, "dream_background", False))
                         force_cpu = bool(getattr(trainer_cli_args, "dream_force_cpu", False))
+                        import logging
                         logging.info("[Dream-Trainer] Triggering full dream cycle (epoch %d)", epoch+1)
                         stats = run_dream_cycle_safe(topas_model,
                                                      timeout_sec=timeout,
@@ -749,7 +815,8 @@ def main():
                                 print(f"⚠️  Self-play generation failed: {e}")
                     else:
                         logging.info("[Dream-Trainer] Dream disabled in model config; skipping full cycle.")
-        except Exception:
+        except Exception as e:
+            import logging, traceback
             logging.warning("[Dream-Trainer] Dream scheduling failed: %s", traceback.format_exc())
 
     # Save final checkpoint

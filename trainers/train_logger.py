@@ -87,7 +87,15 @@ class TrainLogger:
                 msg += f" motifs={dream_info.get('motifs',0)}"
 
             if relmem_info:
-                msg += f" | RelMem inv_loss={relmem_info.get('inverse_loss',0):.3f}"
+                msg += f" | RelMem"
+                if "relmem_active" in relmem_info:
+                    msg += f" active={int(relmem_info['relmem_active'])}"
+                if "relmem_depth" in relmem_info:
+                    msg += f" depth={relmem_info['relmem_depth']:.2f}"
+                if "relmem_exceptions" in relmem_info:
+                    msg += f" exceptions={int(relmem_info['relmem_exceptions'])}"
+                if "inverse_loss" in relmem_info:
+                    msg += f" inv_loss={relmem_info.get('inverse_loss',0):.3f}"
                 if relmem_info.get("hebbian_applied"): 
                     msg += " HEBB"
                 if relmem_info.get("wta_applied"): 

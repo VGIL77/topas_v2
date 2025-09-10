@@ -122,7 +122,13 @@ def run(config, state):
             
             # Log with enhanced info
             if step % config.get("log_interval", 50) == 0:
-                logger.log_batch(global_step, {"total": loss.item()}, dream_info=dream_info)
+                relmem_info = None
+                try:
+                    if hasattr(model, "relmem") and model.relmem is not None:
+                        relmem_info = model.relmem.stats()
+                except Exception:
+                    relmem_info = None
+                logger.log_batch(global_step, {"total": loss.item()}, dream_info=dream_info, relmem_info=relmem_info)
             
             # Dream micro-ticks
             if dream and config.get("dream_micro_ticks", 0) > 0:

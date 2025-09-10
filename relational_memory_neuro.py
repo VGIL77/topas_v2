@@ -56,6 +56,9 @@ class RelationalMemoryNeuro(nn.Module):
         # Queue for post-optimizer updates
         self.hebbian_queue = []
         self.wta_queue = []
+        # --- UKS-lite additions ---
+        self.exceptions = {}  # dict[(sid:int, rel:str)] = set([oid:int])
+        self.persist_path = None  # optional save/load path for UKS-like state
     
     def forward(self, x: torch.Tensor, state=None, top_k: int = 128):
         """
@@ -572,3 +575,148 @@ class RelationalMemoryNeuro(nn.Module):
         except Exception:
             pass
         return torch.tensor(0.0)
+
+    # -------- Exceptions / Inheritance+ ----------
+    def add_exception(self, sid: int, rel: str, oid: int):
+        key = (int(sid), str(rel))
+        s = self.exceptions.get(key, set())
+        s.add(int(oid))
+        self.exceptions[key] = s
+
+    def remove_exception(self, sid: int, rel: str, oid: int):
+        key = (int(sid), str(rel))
+        if key in self.exceptions and int(oid) in self.exceptions[key]:
+            self.exceptions[key].remove(int(oid))
+            if not self.exceptions[key]:
+                self.exceptions.pop(key, None)
+
+    def _is_exception(self, sid: int, rel: str, oid: int) -> bool:
+        key = (int(sid), str(rel))
+        return key in self.exceptions and int(oid) in self.exceptions[key]
+
+    @torch.no_grad()
+    def inheritance_pass_plus(self, steps: int = 3, alpha: float = 0.1, thresh: float = 0.5) -> torch.Tensor:
+        """
+        Enhanced inheritance with exceptions and confidence gating.
+        Returns a small scalar consistency loss for training signals.
+        """
+        if "is_a" not in self.relations or "has_attr" not in self.relations:
+            return (self.concept_proto * 0).sum()
+        Wisa = self._scores("is_a")
+        What = self._scores("has_attr")
+        P = What.clone() if torch.is_tensor(What) else torch.tensor(What)
+        for _ in range(max(1, steps)):
+            if torch.is_tensor(Wisa) and torch.is_tensor(P):
+                P = P + alpha * (Wisa @ P) if Wisa.dim() == 2 else P
+        # Apply exceptions
+        if self.exceptions and torch.is_tensor(P) and P.dim() >= 2:
+            for (sid, rel), oids in self.exceptions.items():
+                if rel == "has_attr" and len(oids) > 0:
+                    if P.dim() == 2 and sid < P.shape[0]:
+                        for oid in oids:
+                            if oid < P.shape[1]:
+                                P[sid, oid] = 0.0
+        # Confidence gating
+        if torch.is_tensor(P) and torch.is_tensor(What):
+            P = torch.where(P > thresh, P, What)
+            loss = F.mse_loss(P, What)
+        else:
+            loss = torch.tensor(0.0)
+        return torch.nan_to_num(loss, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    # -------- Contextual op-bias + Theme priors ----------
+    def get_op_bias_contextual(self, slot_vecs: Optional[torch.Tensor] = None,
+                               theme_embed: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        """
+        Contextual op-bias: combines graph priors (op_bias), slot evidence, and theme steer.
+        Returns normalized dict suitable for DSL search.
+        """
+        base = self.op_bias()  # normalized dict, never empty
+        if slot_vecs is not None and torch.is_tensor(slot_vecs):
+            ctx = float(slot_vecs.abs().mean().detach().cpu())
+            for k in base:
+                base[k] = float(min(1.0, max(0.0, base[k] * (0.9 + 0.2 * ctx))))
+        if theme_embed is not None and isinstance(theme_embed, torch.Tensor) and theme_embed.numel() > 0:
+            t = theme_embed.detach().float()
+            s = float(t.mean().sigmoid().item())
+            v = float(t.std().clamp(0,1).item())
+            sym_ops = ["symmetry","flip_h","flip_v","rotate90","rotate180","rotate270","transpose"]
+            conn_ops = ["flood_fill","flood_select","outline","boundary_extract","for_each_object"]
+            for k in sym_ops:
+                if k in base: base[k] = min(1.0, base[k] * (0.9 + 0.3 * s))
+            for k in conn_ops:
+                if k in base: base[k] = min(1.0, base[k] * (0.9 + 0.3 * v))
+        Z = sum(base.values()) + 1e-12
+        for k in base: base[k] = float(base[k] / Z)
+        return base
+
+    def get_theme_priors(self, theme_embed: Optional[torch.Tensor]) -> Dict[str, float]:
+        """
+        Produce {'phi','kappa','cge'} in [0.5, 1.5] for EBR gating (neutral=1.0).
+        """
+        if theme_embed is None or not isinstance(theme_embed, torch.Tensor) or theme_embed.numel() == 0:
+            return {"phi": 1.0, "kappa": 1.0, "cge": 1.0}
+        x = theme_embed.detach().float()
+        m = float(x.mean().tanh().item())   # [-1,1]
+        v = float(x.std().tanh().item())    # [-1,1]
+        scale = lambda z: 1.0 + 0.5 * z     # [-1,1] -> [0.5,1.5]
+        return {"phi": scale(m), "kappa": scale(v), "cge": scale((m+v)/2.0)}
+
+    # -------- Refinement agent & stats ----------
+    @torch.no_grad()
+    def refinement_step(self, cos_thresh: float = 0.92, min_size: int = 3, merge_alpha: float = 0.2):
+        """Cluster similar concepts and lightly merge to form cleaner parents."""
+        used = self.concept_used.nonzero().flatten()
+        if used.numel() < min_size: return
+        E = self.concept_proto[used]
+        sim = F.cosine_similarity(E.unsqueeze(1), E.unsqueeze(0), dim=-1)
+        visited = set()
+        for i in range(used.numel()):
+            if i in visited: continue
+            cluster = [i]
+            for j in range(i+1, used.numel()):
+                if j in visited: continue
+                if float(sim[i,j].item()) >= cos_thresh:
+                    cluster.append(j)
+            if len(cluster) >= min_size:
+                cids = used[torch.tensor(cluster, device=used.device)]
+                centroid = self.concept_proto[cids].mean(dim=0, keepdim=True)
+                self.concept_proto.data[cids] = (1-merge_alpha)*self.concept_proto.data[cids] + merge_alpha*centroid
+                self.depth_hist.append(len(cluster))
+                visited.update(cluster)
+
+    def stats(self) -> Dict[str, float]:
+        active = int(self.concept_used.sum().item())
+        depth = self.get_hierarchy_depth() if hasattr(self, "get_hierarchy_depth") else 0.0
+        exc = sum(len(v) for v in self.exceptions.values()) if self.exceptions else 0
+        return {"relmem_active": float(active), "relmem_depth": float(depth), "relmem_exceptions": float(exc)}
+
+    # -------- Persistence ----------
+    def save_uks(self, path: str):
+        self.persist_path = path
+        state = {
+            "concept_proto": self.concept_proto.detach().cpu(),
+            "A": {k: v.detach().cpu() for k,v in self.A.items()},
+            "B": {k: v.detach().cpu() for k,v in self.B.items()},
+            "rel_gain": {k: v.detach().cpu() for k,v in self.rel_gain.items()},
+            "concept_used": self.concept_used.detach().cpu(),
+            "exceptions": { (sid,rel): list(oids) for (sid,rel), oids in self.exceptions.items() }
+        }
+        torch.save(state, path)
+
+    def load_uks(self, path: str):
+        import os
+        if not os.path.exists(path): return
+        state = torch.load(path, map_location=self.device)
+        self.concept_proto.data.copy_(state["concept_proto"].to(self.device))
+        for k in self.A: 
+            if k in state["A"]:
+                self.A[k].data.copy_(state["A"][k].to(self.device))
+        for k in self.B: 
+            if k in state["B"]:
+                self.B[k].data.copy_(state["B"][k].to(self.device))
+        for k in self.rel_gain: 
+            if k in state["rel_gain"]:
+                self.rel_gain[k].data.copy_(state["rel_gain"][k].to(self.device))
+        self.concept_used.copy_(state["concept_used"].to(self.device))
+        self.exceptions = { (int(sid), rel): set(map(int, oids)) for (sid,rel), oids in state.get("exceptions", {}).items() }

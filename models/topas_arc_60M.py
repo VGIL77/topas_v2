@@ -436,6 +436,17 @@ class TopasARC60M(nn.Module):
         self.config = config or ModelConfig()
         self.config.validate()
         
+        # RelMem fusion configuration with production defaults
+        self.relmem_bias_beta = float(getattr(self.config, "relmem_bias_beta", 0.2))
+        self.theme_bias_alpha = float(getattr(self.config, "theme_bias_alpha", 0.2))
+        
+        # Log configuration if RelMem fusion is enabled
+        if self.relmem_bias_beta > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[TOPAS] ETS→DSL and RelMem→DSL op-bias enabled (alpha={self.theme_bias_alpha:.2f}, beta={self.relmem_bias_beta:.2f}); theme→EBR gating=on")
+            print(f"[TOPAS] ETS→DSL and RelMem→DSL op-bias enabled (alpha={self.theme_bias_alpha:.2f}, beta={self.relmem_bias_beta:.2f}); theme→EBR gating=on")
+        
         # Neural components - encoder will be enhanced with HRM after planner init
         self.encoder = GridEncoder(width=self.config.width, depth=self.config.depth)
         self.slots = ObjectSlots(in_ch=self.config.width, K=self.config.slots, 
@@ -1131,21 +1142,60 @@ class TopasARC60M(nn.Module):
             # Get detected operation bias from relation manager
             from models.dsl_registry import DSL_OPS
             op_bias = self.relman.op_bias()
-            if self.relmem is not None:
-                # Optional soft prior derived from relational scores
-                rel_bias = {}
-                # Map a few common ops; extend as your DSL supports
-                for rel in ["translate", "resize", "flip_h", "flip_v", "color_map"]:
-                    if hasattr(self.relmem, "_scores") and rel in getattr(self.relmem, "relations", []):
-                        try:
-                            with torch.no_grad():
-                                score = float(self.relmem._scores(rel).mean().item())
-                            rel_bias[rel] = max(0.0, score)
-                        except Exception:
-                            pass
-                # Combine by max (conservative): never reduce existing bias
-                for k, v in rel_bias.items():
-                    op_bias[k] = max(op_bias.get(k, 0.0), v)
+            
+            # === Enhanced RelMem Contextual Bias Fusion ===
+            theme_embed = None  # Will be used for both RelMem and EBR
+            
+            # Try to get theme embedding from Dream/ETS
+            if self.dream is not None and hasattr(self.dream, "theme") and hasattr(self.dream.theme, "get_embedding"):
+                try:
+                    theme_embed = self.dream.theme.get_embedding(extras.get("latents", None))
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"[RelMem] Could not get theme embedding: {e}")
+            
+            # Apply RelMem contextual bias if available and enabled
+            if self.relmem is not None and self.relmem_bias_beta > 0:
+                try:
+                    # Get slot vectors from extras (computed earlier in forward)
+                    slot_vecs = extras.get("slot_vecs", None)
+                    
+                    # Get contextual bias that considers slots + theme
+                    if hasattr(self.relmem, "get_op_bias_contextual"):
+                        relmem_bias = self.relmem.get_op_bias_contextual(
+                            slot_vecs=slot_vecs,
+                            theme_embed=theme_embed
+                        )
+                        # Merge with weighted addition
+                        for k, v in relmem_bias.items():
+                            if k in DSL_OPS:
+                                op_bias[k] = op_bias.get(k, 0.0) + float(v) * self.relmem_bias_beta
+                        
+                        if self.config.verbose:
+                            top_relmem = sorted([(k,v) for k,v in relmem_bias.items() if v > 0.1], 
+                                              key=lambda x: -x[1])[:3]
+                            if top_relmem:
+                                print(f"[RelMem] Contextual bias top ops: {top_relmem}")
+                    else:
+                        # Fallback to basic RelMem bias
+                        rel_bias = {}
+                        for rel in ["translate", "resize", "flip_h", "flip_v", "color_map"]:
+                            if hasattr(self.relmem, "_scores") and rel in getattr(self.relmem, "relations", []):
+                                try:
+                                    with torch.no_grad():
+                                        score = float(self.relmem._scores(rel).mean().item())
+                                    rel_bias[rel] = max(0.0, score)
+                                except Exception:
+                                    pass
+                        # Combine by max (conservative): never reduce existing bias
+                        for k, v in rel_bias.items():
+                            op_bias[k] = max(op_bias.get(k, 0.0), v * self.relmem_bias_beta)
+                            
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"[RelMem] Contextual bias fusion failed: {e}")
+                    if self.config.verbose:
+                        print(f"[RelMem] Contextual bias fusion failed: {e}")
             
             # Combine planner op_bias with existing bias (additive)
             for k, v in planner_op_bias.items():
@@ -1272,7 +1322,16 @@ class TopasARC60M(nn.Module):
                     if dsl_logits.dim() == 3:  # [H,W,C]
                         dsl_logits = dsl_logits.unsqueeze(0)  # [1,H,W,C]
                     dsl_logits = dsl_logits.permute(0, 3, 1, 2)  # [B,C,H,W]
-                    grid = self._apply_ebr(dsl_logits, priors, extras)
+                    
+                    # Get theme priors for EBR if available
+                    ebr_prior_scales = None
+                    if self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
+                        try:
+                            ebr_prior_scales = self.relmem.get_theme_priors(theme_embed)
+                        except Exception:
+                            pass
+                    
+                    grid = self._apply_ebr(dsl_logits, priors, extras, prior_scales=ebr_prior_scales)
                     
                     # Calculate EBR deltas
                     try:
@@ -1356,7 +1415,17 @@ class TopasARC60M(nn.Module):
                         if simple_logits.dim() == 3:  # [H,W,C]
                             simple_logits = simple_logits.unsqueeze(0)
                         simple_logits = simple_logits.permute(0, 3, 1, 2)  # [B,C,H,W]
-                        grid = self._apply_ebr(simple_logits, priors, extras)
+                        
+                        # Get theme priors for EBR if available (reuse from earlier if exists)
+                        if 'ebr_prior_scales' not in locals():
+                            ebr_prior_scales = None
+                            if self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
+                                try:
+                                    ebr_prior_scales = self.relmem.get_theme_priors(theme_embed)
+                                except Exception:
+                                    pass
+                        
+                        grid = self._apply_ebr(simple_logits, priors, extras, prior_scales=ebr_prior_scales)
                         
                         # Calculate EBR deltas
                         try:
@@ -1441,7 +1510,27 @@ class TopasARC60M(nn.Module):
             B = 1 if grid.dim() == 2 else grid.shape[0]
             H, W = grid.shape[-2:]
             logits_for_ebr = painter_logits.reshape(B, H, W, -1).permute(0, 3, 1, 2)  # [B,C,H,W]
-            grid = self._apply_ebr(logits_for_ebr, priors, extras)
+            
+            # Get theme priors for EBR if available (reuse from earlier if exists)
+            if 'ebr_prior_scales' not in locals():
+                ebr_prior_scales = None
+                if self.relmem is not None:
+                    # Try to get theme_embed if not already available
+                    if 'theme_embed' not in locals():
+                        theme_embed = None
+                        if self.dream is not None and hasattr(self.dream, "theme") and hasattr(self.dream.theme, "get_embedding"):
+                            try:
+                                theme_embed = self.dream.theme.get_embedding(extras.get("latents", None))
+                            except Exception:
+                                pass
+                    
+                    if theme_embed is not None:
+                        try:
+                            ebr_prior_scales = self.relmem.get_theme_priors(theme_embed)
+                        except Exception:
+                            pass
+            
+            grid = self._apply_ebr(logits_for_ebr, priors, extras, prior_scales=ebr_prior_scales)
             
             # Calculate EBR deltas
             try:
@@ -1967,12 +2056,14 @@ class TopasARC60M(nn.Module):
         except Exception:
             return False
     
-    def _apply_ebr(self, logits: torch.Tensor, priors: dict, extras: Optional[Dict] = None) -> torch.Tensor:
+    def _apply_ebr(self, logits: torch.Tensor, priors: dict, extras: Optional[Dict] = None, 
+                   prior_scales: Optional[Dict[str, float]] = None) -> torch.Tensor:
         """
         Apply EnergyRefiner with grad safety:
         - Pass continuous logits into refinement
         - Use STE only at the output interface
         - Mark success/failure explicitly in extras
+        - Apply prior_scales to modulate EBR priors (theme-aware gating)
         """
         # Ensure extras is canonical at function entry
         extras = _ensure_extras(extras)
@@ -1987,24 +2078,41 @@ class TopasARC60M(nn.Module):
             B, C, H, W = logits.shape
             cons = ARCGridConstraints(expect_symmetry=None, color_hist=None, sparsity=None)
             
-            # safe theme embed + priors
-            try:
-                theme_embed = self._get_theme_embed_from_dream(extras)
-            except Exception:
-                theme_embed = None
+            # Use passed-in prior_scales if available, otherwise compute from RelMem
+            if prior_scales is not None:
+                # Caller provided theme-aware prior scales
+                theme_priors = prior_scales
+                if self.config.verbose:
+                    logging.debug(f"[EBR] Using provided prior_scales={theme_priors}")
+            else:
+                # Compute theme priors from RelMem if available
+                try:
+                    theme_embed = self._get_theme_embed_from_dream(extras)
+                except Exception:
+                    theme_embed = None
 
-            try:
-                theme_priors = getattr(self, "relmem", None).get_theme_priors(theme_embed) if getattr(self, "relmem", None) is not None else None
-            except Exception:
-                theme_priors = None
+                try:
+                    theme_priors = getattr(self, "relmem", None).get_theme_priors(theme_embed) if getattr(self, "relmem", None) is not None else None
+                except Exception:
+                    theme_priors = None
                 
             # One-time fallback logger
             global _WARNED_EBR_THEME_PRIOR_MISSING
             if theme_priors is None and not _WARNED_EBR_THEME_PRIOR_MISSING:
                 logging.warning("[EBR] theme_priors missing -> using neutral priors (will warn once).")
                 _WARNED_EBR_THEME_PRIOR_MISSING = True
-            if theme_priors is not None:
+            if theme_priors is not None and self.config.verbose:
                 logging.debug(f"[EBR] using prior_scales={theme_priors}")
+            
+            # Apply prior scaling to the base priors
+            if theme_priors is not None and priors is not None:
+                scaled_priors = {}
+                for k, v in priors.items():
+                    if k in theme_priors:
+                        scaled_priors[k] = v * theme_priors[k]
+                    else:
+                        scaled_priors[k] = v
+                priors = scaled_priors
             
             refined_logits = self.ebr(logits, cons, priors, prior_scales=theme_priors, extras=extras)
             
@@ -2566,8 +2674,12 @@ class TopasARC60M(nn.Module):
         
         return predictions
     
-    def evaluate_with_ebr(self, test_grid: torch.Tensor, target_grid: torch.Tensor, hrm_latents=None) -> Dict[str, torch.Tensor]:
+    def evaluate_with_ebr(self, test_grid: torch.Tensor, target_grid: torch.Tensor, hrm_latents=None, extras: dict = None) -> Dict[str, torch.Tensor]:
         """Evaluation with EBR refinement for exact match optimization"""
+        # Canonicalize extras immediately to avoid UnboundLocalError in nested flows
+        if not isinstance(extras, dict):
+            extras = {}
+        
         # 1. Run base model forward
         outputs = self.forward_pretraining(test_grid, hrm_latents=hrm_latents, target_shape=target_grid.shape[-2:])
         logits = outputs["logits"]
@@ -2603,8 +2715,7 @@ class TopasARC60M(nn.Module):
                 except:
                     pass
                 
-                # canonical extras guard
-                extras = extras if isinstance(extras, dict) else {}
+                # extras already canonicalized at function entry
                 
                 # safe theme embed + priors
                 try:

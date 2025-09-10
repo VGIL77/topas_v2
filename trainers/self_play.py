@@ -99,3 +99,8 @@ class SelfPlayBuffer:
         self.sample_count += n
         
         return samples
+    
+    def generate_batch(self, demos, wormhole, themes=None, top_k: int = 3) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Wrapper that calls generate_from_wormhole and returns up to top_k items."""
+        gen = self.generate_from_wormhole(demos=demos, wormhole=wormhole, themes=themes, top_k=top_k)
+        return gen[:top_k] if gen else []
