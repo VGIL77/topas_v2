@@ -41,6 +41,16 @@ def parse_args():
     parser.add_argument("--dream-force-cpu", action="store_true", default=False,
                         help="Hint: prefer CPU for offline dream cycle if supported (not enforced here).")
 
+    # RelMem configuration
+    parser.add_argument("--relmem-reg-alpha", type=float, default=1e-3,
+                        help="Weight for inverse_loss_safe regularization")
+    parser.add_argument("--relmem-reg-beta", type=float, default=5e-4,
+                        help="Weight for inheritance_pass regularization")
+    parser.add_argument("--relmem-bind-iou", type=float, default=0.25,
+                        help="IoU threshold for RelMem concept binding on success")
+    parser.add_argument("--relmem-log-interval", type=int, default=200,
+                        help="Log RelMem stats every N steps")
+    
     # Dream pretrain args
     parser.add_argument("--dream-pretrain-epochs", type=int, default=0,
                         help="Number of epochs for Dream/ETS pretraining (default 0 = disabled)")
@@ -271,7 +281,6 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
             dream_params = []
     # if still empty, attempt recursive attribute scan (already implemented in dream.parameters())
     if len(dream_params) == 0:
-        import logging
         logging.getLogger(__name__).warning("[Dream-Pretrain] No dream params found (will attempt fallback or skip)")
         return
     
@@ -374,7 +383,6 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         dream.save_state('dream_pretrain.pth')
         logger.info("[Dream-Pretrain] saved dream_pretrain.pth")
     except Exception:
-        import logging
         logging.getLogger(__name__).exception("[Dream-Pretrain] Could not save dream state")
 
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
@@ -475,22 +483,115 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                             if global_step % 100 == 0:  # Log occasionally
                                 logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
                 
-                # ---- RelMem auxiliary loss every N steps (lightweight) ----
-                if hasattr(topas_model, "relmem") and topas_model.relmem is not None and (global_step % 25 == 0):
+                # ---- RelMem auxiliary loss every N steps (fixed implementation) ----
+                relmem_loss_interval = getattr(args, 'relmem_loss_interval', 25) if 'args' in locals() else 25
+                if hasattr(topas_model, "relmem") and topas_model.relmem is not None and (global_step % relmem_loss_interval == 0):
                     try:
-                        relmem_aux = topas_model.relmem.inheritance_pass_plus()
-                        # Use shape-safe inverse loss  
+                        reg_alpha = getattr(args, 'relmem_reg_alpha', 1e-3) if 'args' in locals() else 1e-3
+                        reg_beta = getattr(args, 'relmem_reg_beta', 5e-4) if 'args' in locals() else 5e-4
+                        
+                        # Replace broken inverse_loss() with inverse_loss_safe()
+                        relmem_aux = torch.tensor(0.0, device=device)
                         if hasattr(topas_model.relmem, 'inverse_loss_safe'):
-                            relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss_safe()
-                        elif hasattr(topas_model.relmem, "inverse_loss"):
-                            try:
-                                relmem_aux = relmem_aux + 0.5 * topas_model.relmem.inverse_loss()
-                            except Exception:
-                                pass  # Skip inverse loss if it fails
-                        if torch.is_tensor(relmem_aux):
-                            total_loss = total_loss + 0.01 * relmem_aux
+                            relmem_aux = relmem_aux + reg_alpha * topas_model.relmem.inverse_loss_safe()
+                        
+                        # Add inheritance_pass regularization
+                        if hasattr(topas_model.relmem, 'inheritance_pass'):
+                            relmem_aux = relmem_aux + reg_beta * topas_model.relmem.inheritance_pass()
+                        elif hasattr(topas_model.relmem, 'inheritance_pass_plus'):
+                            relmem_aux = relmem_aux + reg_beta * topas_model.relmem.inheritance_pass_plus()
+                        
+                        if torch.is_tensor(relmem_aux) and relmem_aux.item() > 0:
+                            total_loss = total_loss + relmem_aux
+                            if global_step % 100 == 0:
+                                logging.info(f"Step {global_step}: RelMem aux loss={relmem_aux.item():.6f}")
                     except Exception as e:
-                        pass
+                        if global_step % 100 == 0:
+                            logging.warning(f"RelMem auxiliary loss failed: {e}")
+                
+                # RelMem binding on success (check if we have metrics to evaluate)
+                if return_metrics:
+                    try:
+                        # Quick metrics for binding decision
+                        preds = logits.argmax(dim=-1)  # [B, H*W]
+                        targets_flat = target_grid.view(B, -1)  # [B, H*W]
+                        exact_match = (preds == targets_flat).all(dim=1).float().mean().item()
+                        
+                        # Compute IoU for binding threshold
+                        ious = []
+                        for c in range(10):  # NUM_COLORS
+                            pred_c = (preds == c)
+                            target_c = (targets_flat == c)
+                            intersection = (pred_c & target_c).sum().float()
+                            union = (pred_c | target_c).sum().float()
+                            if union > 0:
+                                ious.append((intersection / union).item())
+                        mean_iou = sum(ious) / len(ious) if ious else 0.0
+                        
+                        # Enhanced RelMem concept binding on success
+                        if hasattr(topas_model, 'relmem') and topas_model.relmem is not None:
+                            # Extract brain latent from outputs
+                            brain_latent = None
+                            if hasattr(outputs, 'brain') and outputs['brain'] is not None:
+                                brain_latent = outputs['brain']
+                            elif 'brain' in outputs and outputs['brain'] is not None:
+                                brain_latent = outputs['brain']
+                            elif 'latent' in outputs and outputs['latent'] is not None:
+                                brain_latent = outputs['latent']
+                            
+                            if brain_latent is not None:
+                                # Check for success criteria with configurable threshold
+                                bind_iou_threshold = getattr(args, 'relmem_bind_iou', 0.25) if 'args' in locals() else 0.25
+                                em_success = exact_match > 0
+                                iou_success = mean_iou >= bind_iou_threshold
+                                
+                                if (em_success or iou_success):
+                                    # Perform concept binding
+                                    try:
+                                        if hasattr(topas_model, '_relmem_try_bind'):
+                                            binding_stats = topas_model._relmem_try_bind(
+                                                brain=brain_latent,
+                                                ops_used=outputs.get('extras', {}).get('ops_used', []),
+                                                iou=mean_iou,
+                                                em=em_success
+                                            )
+                                        else:
+                                            # Fallback binding method
+                                            binding_stats = {'relmem_bound': False}
+                                            if hasattr(topas_model.relmem, 'bind_concept'):
+                                                topas_model.relmem.bind_concept(brain_latent, success_metric=mean_iou)
+                                                binding_stats['relmem_bound'] = True
+                                                binding_stats['relmem_concept_id'] = 'auto'
+                                        
+                                        if binding_stats.get('relmem_bound') and global_step % 100 == 0:
+                                            concept_id = binding_stats.get('relmem_concept_id', 'unknown')
+                                            logging.info(f"RelMem bound concept {concept_id} on success (EM={exact_match:.3f}, IoU={mean_iou:.3f})")
+                                    except Exception as e:
+                                        if global_step % 200 == 0:
+                                            logging.warning(f"RelMem concept binding failed: {e}")
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            logging.warning(f"RelMem binding failed: {e}")
+                
+                # RelMem regularization
+                relmem_reg_loss = torch.tensor(0.0, device=device)
+                if hasattr(topas_model, 'relmem') and topas_model.relmem is not None:
+                    try:
+                        # Compute RelMem regularization
+                        reg_alpha = getattr(args, 'relmem_reg_alpha', 0.01) if 'args' in locals() else 0.01
+                        reg_beta = getattr(args, 'relmem_reg_beta', 0.02) if 'args' in locals() else 0.02
+                        
+                        if hasattr(topas_model.relmem, 'compute_regularization'):
+                            relmem_reg_loss = topas_model.relmem.compute_regularization(alpha=reg_alpha, beta=reg_beta)
+                        elif hasattr(topas_model.relmem, 'regularization_loss'):
+                            relmem_reg_loss = topas_model.relmem.regularization_loss() * reg_alpha
+                            
+                        if torch.is_tensor(relmem_reg_loss) and relmem_reg_loss.item() > 0:
+                            total_loss = total_loss + relmem_reg_loss
+                            
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            logging.warning(f"RelMem regularization failed: {e}")
                 
                 loss = total_loss
             else:
@@ -509,6 +610,17 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
         
         scaler.step(optimizer)
         scaler.update()
+        
+        # Apply post-optimizer hooks for RelMem
+        if hasattr(topas_model, 'relmem') and topas_model.relmem is not None:
+            try:
+                if hasattr(topas_model.relmem, 'apply_post_optimizer_hooks'):
+                    topas_model.relmem.apply_post_optimizer_hooks()
+                elif hasattr(topas_model.relmem, 'post_optimizer_step'):
+                    topas_model.relmem.post_optimizer_step()
+            except Exception as e:
+                if global_step % 500 == 0:
+                    logging.warning(f"RelMem post-optimizer hooks failed: {e}")
 
         if return_metrics:
             # Pass model and grids for comprehensive metrics including EBR
@@ -624,7 +736,7 @@ def main():
                         else:
                             print(f"[SelfPlay] No puzzles generated (fallback used) at step={global_step}")
                 except Exception as e:
-                    import logging, traceback
+                    import traceback
                     logging.getLogger(__name__).exception("[SelfPlay] failure: %s", e)
                 
                 # Sample and compute self-play loss
@@ -669,6 +781,34 @@ def main():
                         loss = loss + sp_loss_contribution
                     if loss is not None:
                         epoch_losses.append(loss)
+            
+            # Enhanced RelMem stats logging
+            relmem_log_interval = getattr(trainer_cli_args, 'relmem_log_interval', 200) if 'trainer_cli_args' in globals() else 200
+            if global_step % relmem_log_interval == 0:
+                try:
+                    relmem_stats = {}
+                    if hasattr(topas_model, 'relmem') and topas_model.relmem is not None:
+                        if hasattr(topas_model.relmem, 'get_stats'):
+                            relmem_stats = topas_model.relmem.get_stats()
+                        elif hasattr(topas_model.relmem, 'stats'):
+                            relmem_stats = topas_model.relmem.stats()
+                        else:
+                            # Enhanced basic stats collection
+                            relmem_stats = {
+                                'concepts_count': getattr(topas_model.relmem, 'concepts_count', 0),
+                                'relations_count': len(getattr(topas_model.relmem, 'relations', [])),
+                                'last_binding_success': getattr(topas_model.relmem, 'last_binding_success', False),
+                                'regularization_strength': getattr(topas_model.relmem, 'regularization_strength', 0.0),
+                                'active_concepts': getattr(topas_model.relmem, 'active_concepts', 0)
+                            }
+                    
+                    if relmem_stats:
+                        stats_str = ', '.join([f"{k}={v}" for k, v in relmem_stats.items()])
+                        logging.info(f"[Step {global_step}] RelMem: {stats_str}")
+                        
+                except Exception as e:
+                    if global_step % 1000 == 0:  # Less frequent warning
+                        logging.warning(f"RelMem stats logging failed: {e}")
             
             global_step += 1
 
@@ -775,7 +915,6 @@ def main():
                         timeout = int(getattr(trainer_cli_args, "dream_full_timeout", 600))
                         bg = bool(getattr(trainer_cli_args, "dream_background", False))
                         force_cpu = bool(getattr(trainer_cli_args, "dream_force_cpu", False))
-                        import logging
                         logging.info("[Dream-Trainer] Triggering full dream cycle (epoch %d)", epoch+1)
                         stats = run_dream_cycle_safe(topas_model,
                                                      timeout_sec=timeout,
@@ -822,7 +961,7 @@ def main():
                     else:
                         logging.info("[Dream-Trainer] Dream disabled in model config; skipping full cycle.")
         except Exception as e:
-            import logging, traceback
+            import traceback
             logging.warning("[Dream-Trainer] Dream scheduling failed: %s", traceback.format_exc())
 
     # Save final checkpoint

@@ -94,6 +94,14 @@ class TrainLogger:
                     msg += f" depth={relmem_info['relmem_depth']:.2f}"
                 if "relmem_exceptions" in relmem_info:
                     msg += f" exceptions={int(relmem_info['relmem_exceptions'])}"
+                if "concepts_count" in relmem_info:
+                    msg += f" concepts={relmem_info['concepts_count']}"
+                if "relations_count" in relmem_info:
+                    msg += f" relations={relmem_info['relations_count']}"
+                if "last_binding_success" in relmem_info:
+                    msg += f" bind_ok={int(relmem_info['last_binding_success'])}"
+                if "regularization_loss" in relmem_info:
+                    msg += f" reg_loss={relmem_info['regularization_loss']:.4f}"
                 if "inverse_loss" in relmem_info:
                     msg += f" inv_loss={relmem_info.get('inverse_loss',0):.3f}"
                 if relmem_info.get("hebbian_applied"): 

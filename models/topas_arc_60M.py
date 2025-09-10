@@ -950,6 +950,23 @@ class TopasARC60M(nn.Module):
             # Project encoder output to match slot dimensions (using initialized projection)
             glob_proj = self.encoder_proj(glob)  # [B, width] → [B, slot_dim]
             brain = torch.cat([glob_proj, pooled], dim=-1)
+            
+            # Dream micro-ticks and token caching
+            if hasattr(self, 'dream_engine') and self.dream_engine is not None:
+                try:
+                    # Cache tokens for dream processing
+                    dream_tokens = slot_vecs.detach().clone()
+                    extras["dream_tokens_cached"] = dream_tokens
+                    
+                    # Run micro-ticks if enabled
+                    dream_micro_ticks = getattr(self.config, 'dream_micro_ticks', 1)
+                    for _ in range(dream_micro_ticks):
+                        self.dream_engine.step_micro(valence=0.5, arousal=0.3)
+                        
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Dream micro-tick failed: {e}")
+            
             # --- Relational memory residual context ---
             if self.relmem is not None:
                 # tokens: slot-level relational embeddings [B, T, D]
@@ -1148,13 +1165,30 @@ class TopasARC60M(nn.Module):
             # === Enhanced RelMem Contextual Bias Fusion ===
             theme_embed = None  # Will be used for both RelMem and EBR
             
-            # Try to get theme embedding from Dream/ETS
-            if self.dream is not None and hasattr(self.dream, "theme") and hasattr(self.dream.theme, "get_embedding"):
+            # ETS→RelMem→DSL bias fusion with contextual weighting
+            contextual_bias = {}
+            if hasattr(self, 'ets') and self.ets is not None:
                 try:
-                    theme_embed = self.dream.theme.get_embedding(extras.get("latent", None))
+                    # Get theme embedding for contextual bias using brain and cached dream tokens
+                    theme_embed = self.ets.synthesize_theme(brain, extras.get("dream_tokens_cached"))
+                    extras["theme_emb"] = theme_embed
+                    
+                    # Apply contextual bias to operations
+                    if theme_embed is not None:
+                        theme_strength = torch.norm(theme_embed).item()
+                        contextual_bias = {
+                            "transform": theme_strength * 0.3,
+                            "filter": theme_strength * 0.2,
+                            "compose": theme_strength * 0.1
+                        }
                 except Exception as e:
-                    if self.config.verbose:
-                        print(f"[RelMem] Could not get theme embedding: {e}")
+                    import logging
+                    logging.warning(f"ETS contextual bias failed: {e}")
+            
+            # EBR prior scaling based on theme strength
+            if theme_embed is not None:
+                theme_strength = torch.norm(theme_embed).item()
+                extras["ebr_prior_scale"] = min(2.0, 1.0 + theme_strength * 0.5)
             
             # Apply RelMem contextual bias if available and enabled
             if self.relmem is not None and self.relmem_bias_beta > 0:
@@ -1162,40 +1196,60 @@ class TopasARC60M(nn.Module):
                     # Get slot vectors from extras (computed earlier in forward)
                     slot_vecs = extras.get("slot_vecs", None)
                     
-                    # Get contextual bias that considers slots + theme
+                    # Provide brain latent for RelMem concept binding
+                    if hasattr(self.relmem, 'receive_brain_latent'):
+                        self.relmem.receive_brain_latent(brain.detach())
+                    
+                    # Get contextual bias that considers slots + theme  
                     if hasattr(self.relmem, "get_op_bias_contextual"):
                         relmem_bias = self.relmem.get_op_bias_contextual(
                             slot_vecs=slot_vecs,
                             theme_embed=theme_embed
                         )
-                        # Merge with weighted addition
-                        for k, v in relmem_bias.items():
-                            if k in DSL_OPS:
-                                op_bias[k] = op_bias.get(k, 0.0) + float(v) * self.relmem_bias_beta
-                        
-                        if self.config.verbose:
-                            top_relmem = sorted([(k,v) for k,v in relmem_bias.items() if v > 0.1], 
-                                              key=lambda x: -x[1])[:3]
-                            if top_relmem:
-                                print(f"[RelMem] Contextual bias top ops: {top_relmem}")
+                    elif hasattr(self.relmem, "get_op_bias"):
+                        # Enhanced op_bias method with brain context
+                        relmem_bias = self.relmem.get_op_bias(
+                            dsl_ops=DSL_OPS, 
+                            scale=getattr(self.config, "relmem_op_bias_scale", 0.5),
+                            brain_context=brain.detach()
+                        )
                     else:
-                        # Fallback to basic RelMem bias
-                        rel_bias = {}
-                        for rel in ["translate", "resize", "flip_h", "flip_v", "color_map"]:
-                            if hasattr(self.relmem, "_scores") and rel in getattr(self.relmem, "relations", []):
-                                try:
-                                    with torch.no_grad():
-                                        score = float(self.relmem._scores(rel).mean().item())
-                                    rel_bias[rel] = max(0.0, score)
-                                except Exception:
-                                    pass
-                        # Combine by max (conservative): never reduce existing bias
-                        for k, v in rel_bias.items():
-                            op_bias[k] = max(op_bias.get(k, 0.0), v * self.relmem_bias_beta)
+                        relmem_bias = {}
+                    
+                    # Merge with weighted addition
+                    for k, v in relmem_bias.items():
+                        if k in DSL_OPS:
+                            op_bias[k] = op_bias.get(k, 0.0) + float(v) * self.relmem_bias_beta
+                    
+                    # Apply contextual bias from ETS
+                    for op, bias_val in contextual_bias.items():
+                        if op in op_bias:
+                            op_bias[op] += bias_val * getattr(self.config, 'theme_bias_alpha', 0.2)
+                    
+                    if self.config.verbose:
+                        top_relmem = sorted([(k,v) for k,v in relmem_bias.items() if v > 0.1], 
+                                          key=lambda x: -x[1])[:3]
+                        if top_relmem:
+                            print(f"[RelMem] Contextual bias top ops: {top_relmem}")
+                        if contextual_bias:
+                            print(f"[ETS] Contextual bias: {contextual_bias}")
                             
                 except Exception as e:
                     import logging
                     logging.getLogger(__name__).warning(f"[RelMem] Contextual bias fusion failed: {e}")
+                    # Fallback to basic RelMem bias
+                    rel_bias = {}
+                    for rel in ["translate", "resize", "flip_h", "flip_v", "color_map"]:
+                        if hasattr(self.relmem, "_scores") and rel in getattr(self.relmem, "relations", []):
+                            try:
+                                with torch.no_grad():
+                                    score = float(self.relmem._scores(rel).mean().item())
+                                rel_bias[rel] = max(0.0, score)
+                            except Exception:
+                                pass
+                    # Combine by max (conservative): never reduce existing bias
+                    for k, v in rel_bias.items():
+                        op_bias[k] = max(op_bias.get(k, 0.0), v * self.relmem_bias_beta)
                     if self.config.verbose:
                         print(f"[RelMem] Contextual bias fusion failed: {e}")
             
@@ -1292,6 +1346,33 @@ class TopasARC60M(nn.Module):
                             for i, op in enumerate(ops[:32]):
                                 if isinstance(op, str):
                                     rule_vec[i] = hash(op) % 1000 / 1000.0  # Simple hash embedding
+                            
+                            # Try RelMem concept binding on successful DSL pattern
+                            try:
+                                # Compute success metrics for binding decision
+                                if hasattr(test, 'output') and test['output'] is not None:
+                                    target_grid = test['output']
+                                    if target_grid.dim() == 2:
+                                        target_grid = target_grid.unsqueeze(0)
+                                    
+                                    # Calculate exact match and IoU
+                                    if dsl_pred is not None and dsl_pred.shape == target_grid.shape:
+                                        exact_match = (dsl_pred == target_grid).all().item()
+                                        intersection = (dsl_pred == target_grid).sum().item()
+                                        union = dsl_pred.numel()
+                                        iou = intersection / union if union > 0 else 0.0
+                                        
+                                        # Attempt RelMem binding
+                                        binding_stats = self._relmem_try_bind(
+                                            brain, ops_used=ops, iou=iou, em=exact_match
+                                        )
+                                        extras.update(binding_stats)
+                                        
+                                        if self.config.verbose and binding_stats.get("relmem_bound"):
+                                            print(f"[RelMem] Bound DSL concept: {binding_stats.get('relmem_concept_id')}")
+                            except Exception as e:
+                                if self.config.verbose:
+                                    print(f"[RelMem] Binding failed: {e}")
                             extras["rule_vec"] = rule_vec
                             print(f"[RAIL-DSL] Program found: {ops[:5]}...")
                     else:
@@ -1327,7 +1408,10 @@ class TopasARC60M(nn.Module):
                     
                     # Get theme priors for EBR if available
                     ebr_prior_scales = None
-                    if self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
+                    if extras.get("ebr_prior_scale") is not None:
+                        # Use ETS-based theme prior scaling
+                        ebr_prior_scales = {"all": extras["ebr_prior_scale"]}
+                    elif self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
                         try:
                             ebr_prior_scales = self.relmem.get_theme_priors(theme_embed)
                         except Exception:
@@ -1421,7 +1505,10 @@ class TopasARC60M(nn.Module):
                         # Get theme priors for EBR if available (reuse from earlier if exists)
                         if 'ebr_prior_scales' not in locals():
                             ebr_prior_scales = None
-                            if self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
+                            if extras.get("ebr_prior_scale") is not None:
+                                # Use ETS-based theme prior scaling
+                                ebr_prior_scales = {"all": extras["ebr_prior_scale"]}
+                            elif self.relmem is not None and 'theme_embed' in locals() and theme_embed is not None:
                                 try:
                                     ebr_prior_scales = self.relmem.get_theme_priors(theme_embed)
                                 except Exception:
@@ -1516,7 +1603,10 @@ class TopasARC60M(nn.Module):
             # Get theme priors for EBR if available (reuse from earlier if exists)
             if 'ebr_prior_scales' not in locals():
                 ebr_prior_scales = None
-                if self.relmem is not None:
+                if extras.get("ebr_prior_scale") is not None:
+                    # Use ETS-based theme prior scaling
+                    ebr_prior_scales = {"all": extras["ebr_prior_scale"]}
+                elif self.relmem is not None:
                     # Try to get theme_embed if not already available
                     if 'theme_embed' not in locals():
                         theme_embed = None
@@ -1709,7 +1799,7 @@ class TopasARC60M(nn.Module):
         if self.relmem is not None:
             try:
                 inv_w = float(getattr(self.config, "relmem_inverse_loss_w", 0.05))
-                aux_loss = aux_loss + inv_w * self.relmem.inverse_loss()
+                aux_loss = aux_loss + inv_w * self.relmem.inverse_loss_safe()
             except Exception:
                 pass
         extras["aux_loss"] = extras.get("aux_loss", 0.0) + aux_loss
@@ -2406,9 +2496,35 @@ class TopasARC60M(nn.Module):
                 
                 # Bind concept to RelMem
                 if hasattr(self.relmem, 'bind_concept'):
-                    concept_id = self.relmem.bind_concept(concept_data)
-                    stats["relmem_bound"] = True
-                    stats["relmem_concept_id"] = concept_id
+                    # Extract brain tensor for binding
+                    brain_tensor = concept_data["brain_latent"]
+                    if brain_tensor.device != self.relmem.device:
+                        brain_tensor = brain_tensor.to(self.relmem.device)
+                    
+                    # Find next available concept ID
+                    concept_id = None
+                    unused_mask = ~self.relmem.concept_used
+                    if unused_mask.any():
+                        concept_id = int(unused_mask.nonzero()[0].item())
+                    
+                    if concept_id is not None:
+                        # Bind concept with ID, tensor, and alpha
+                        alpha = getattr(self.config, 'relmem_bind_alpha', 0.1)
+                        self.relmem.bind_concept(concept_id, brain_tensor, alpha)
+                        stats["relmem_bound"] = True
+                        stats["relmem_concept_id"] = concept_id
+                        
+                        # Queue Hebbian updates for each operation used
+                        ops_used_list = concept_data.get("ops_used", [])
+                        if ops_used_list and hasattr(self.relmem, 'queue_hebbian_update'):
+                            for i, op in enumerate(ops_used_list[:5]):  # Limit to first 5 ops
+                                # Map operation to concept relationships
+                                eta = getattr(self.config, 'relmem_hebbian_eta', 0.05)
+                                self.relmem.queue_hebbian_update("has_attr", concept_id, i, eta)
+                    else:
+                        # No available concept slots
+                        import logging
+                        logging.warning("RelMem: No available concept slots for binding")
                     
             except Exception as e:
                 import logging
@@ -2761,8 +2877,11 @@ class TopasARC60M(nn.Module):
         # RelMem inverse-loss regularization
         if self.relmem is not None and self.config.relmem_inverse_loss_w > 0:
             try:
-                if hasattr(self.relmem, "inverse_loss"):
-                    # Use the A/B-based inverse_loss (more active)
+                if hasattr(self.relmem, "inverse_loss_safe"):
+                    # Use the safe A/B-based inverse_loss with proper fallback handling
+                    inv_loss = self.relmem.inverse_loss_safe()
+                elif hasattr(self.relmem, "inverse_loss"):
+                    # Fallback to original inverse_loss if safe version not available
                     inv_loss = self.relmem.inverse_loss()
                 elif hasattr(self.relmem, "compute_inverse_loss"):
                     inv_loss = self.relmem.compute_inverse_loss()
