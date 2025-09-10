@@ -2353,6 +2353,69 @@ class TopasARC60M(nn.Module):
             'brain': brain          # Control vector [B, ctrl_dim]
         }
     
+    def _extract_brain_latent(self, slots_rel: torch.Tensor, glob: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Helper to extract brain latent from relational slots.
+        
+        Args:
+            slots_rel: Relational slots tensor [B, K, D]
+            glob: Optional global features [B, D']
+            
+        Returns:
+            brain: Control vector [B, ctrl_dim]
+        """
+        # Pool slots to get brain representation
+        brain = slots_rel.mean(dim=1)  # [B, D]
+        
+        # Optionally fuse with global features
+        if glob is not None and hasattr(self, 'glob_fusion'):
+            brain = self.glob_fusion(torch.cat([brain, glob], dim=-1))
+        
+        return brain
+    
+    def _relmem_try_bind(self, brain: torch.Tensor, ops_used: Optional[List[str]] = None, 
+                        iou: Optional[float] = None, em: bool = False) -> Dict[str, Any]:
+        """
+        Helper to attempt RelMem binding on successful patterns.
+        
+        Args:
+            brain: Control vector [B, ctrl_dim]
+            ops_used: List of DSL operations used
+            iou: Intersection over Union score
+            em: Exact match flag
+            
+        Returns:
+            Dict with binding stats
+        """
+        import time
+        stats = {"relmem_bound": False, "relmem_concept_id": None}
+        
+        # Only bind on success (EM > 0 or IoU >= threshold)
+        should_bind = em or (iou is not None and iou >= getattr(self.config, 'relmem_bind_iou_threshold', 0.7))
+        
+        if should_bind and self.relmem is not None:
+            try:
+                # Create concept from brain latent and ops
+                concept_data = {
+                    "brain_latent": brain.detach().cpu(),
+                    "ops_used": ops_used or [],
+                    "iou": iou,
+                    "em": em,
+                    "timestamp": time.time()
+                }
+                
+                # Bind concept to RelMem
+                if hasattr(self.relmem, 'bind_concept'):
+                    concept_id = self.relmem.bind_concept(concept_data)
+                    stats["relmem_bound"] = True
+                    stats["relmem_concept_id"] = concept_id
+                    
+            except Exception as e:
+                import logging
+                logging.warning(f"RelMem binding failed: {e}")
+        
+        return stats
+    
     def forward_pretraining(self, test_grid: torch.Tensor, hrm_latents=None, target_shape=None, demos=None, global_step=0) -> Dict[str, torch.Tensor]:
         """
         Forward pass optimized for pretraining (no DSL search, just neural features)
@@ -2364,6 +2427,9 @@ class TopasARC60M(nn.Module):
             Dictionary with neural predictions for pretraining heads
         """
         import torch
+        
+        # Ensure extras is always dict to avoid UnboundLocalError
+        extras = _ensure_extras(None)
         
         if not self._pretraining_mode:
             raise RuntimeError("Model must be in pretraining mode to use forward_pretraining")
@@ -2403,6 +2469,26 @@ class TopasARC60M(nn.Module):
                 hrm_mean = hrm_latents
             gamma, beta = self.hrm_to_film(hrm_mean).chunk(2, dim=-1)
             slot_vecs = slot_vecs * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        
+        # Dream micro-ticks and token caching
+        if hasattr(self, 'dream_engine') and self.dream_engine is not None:
+            try:
+                # Cache tokens for dream processing
+                dream_tokens = slot_vecs.detach().clone()
+                extras["dream_tokens_cached"] = dream_tokens
+                
+                # Run micro-ticks if enabled
+                dream_micro_ticks = getattr(self.config, 'dream_micro_ticks', 1)
+                for _ in range(dream_micro_ticks):
+                    self.dream_engine.step_micro(valence=0.5, arousal=0.3)
+                    
+            except Exception as e:
+                import logging
+                logging.warning(f"Dream micro-tick failed: {e}")
+        
+        # Extract relational slots and brain latent
+        slots_rel = slot_vecs  # For now, use slot_vecs as relational slots
+        brain = self._extract_brain_latent(slots_rel, glob)
         
         # Generate per-slot logits [B, K, C]
         slot_logits = self.slot_to_logits(slot_vecs)
@@ -2540,6 +2626,31 @@ class TopasARC60M(nn.Module):
                 if hasattr(self, 'reln') and hasattr(self.reln, 'get_operation_bias'):
                     priors_dict = self.reln.get_operation_bias(slot_vecs)
                 
+                # ETS→RelMem→DSL bias fusion with contextual weighting
+                contextual_bias = {}
+                if hasattr(self, 'ets') and self.ets is not None:
+                    try:
+                        # Get theme embedding for contextual bias
+                        theme_emb = self.ets.synthesize_theme(brain, extras.get("dream_tokens_cached"))
+                        extras["theme_emb"] = theme_emb
+                        
+                        # Apply contextual bias to operations
+                        if theme_emb is not None:
+                            theme_strength = torch.norm(theme_emb).item()
+                            contextual_bias = {
+                                "transform": theme_strength * 0.3,
+                                "filter": theme_strength * 0.2,
+                                "compose": theme_strength * 0.1
+                            }
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"ETS contextual bias failed: {e}")
+                
+                # EBR prior scaling based on theme strength
+                if "theme_emb" in extras:
+                    theme_strength = torch.norm(extras["theme_emb"]).item()
+                    extras["ebr_prior_scale"] = min(2.0, 1.0 + theme_strength * 0.5)
+                
                 # Get op_bias from RelationManager
                 op_bias = self.relman.op_bias()  # existing relation manager bias
                 
@@ -2564,6 +2675,11 @@ class TopasARC60M(nn.Module):
                         
                         import logging
                         logging.getLogger().info(f"[RelMem] merged op_bias from RelMem: {list(relmem_bias.items())[:8]}")
+                        
+                        # Apply contextual bias from ETS
+                        for op, bias_val in contextual_bias.items():
+                            if op in op_bias:
+                                op_bias[op] += bias_val * self.theme_bias_alpha
                     except Exception as e:
                         import logging
                         logging.getLogger().warning(f"[RelMem] error merging op_bias: {e}")
@@ -2671,8 +2787,14 @@ class TopasARC60M(nn.Module):
             'features': features,
             'slot_vecs': slot_vecs,
             'slot_logits': slot_logits,
+            'slots_rel': slots_rel,  # Return diagnostic tensor
+            'brain': brain,          # Return diagnostic tensor
+            'theme_emb': extras.get("theme_emb"),  # Return diagnostic tensor
             'losses': losses
         }
+        
+        # Store extras for potential RelMem binding
+        predictions['extras'] = extras
         
         return predictions
     
