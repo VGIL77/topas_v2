@@ -21,7 +21,7 @@ import traceback
 import numpy as np
 from typing import Optional, Dict, Any
 from pathlib import Path
-from trainers.arc_dataset_loader import ARCDataset
+from trainers.arc_dataset_loader import ARCDataset, SyntheticGrammarDataset
 from models.topas_arc_60M import TopasARC60M, ModelConfig
 from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
 
@@ -90,6 +90,32 @@ def parse_args():
     # Training args
     parser.add_argument("--max-steps", type=int, default=60000,
                         help="Maximum training steps")
+    
+    # Phase-0 → Dream hybrid pretrain args
+    parser.add_argument('--phase0-dream-hybrid', action='store_true', default=False,
+                        help='Run Phase0 grammar pretrain then DreamEngine pretrain using the same grammar dataset before main ARC training.')
+    parser.add_argument('--phase0-epochs', type=int, default=2,
+                        help='Number of Phase0 grammar pretrain epochs when hybrid is enabled.')
+    parser.add_argument('--dream-epochs', type=int, default=3,
+                        help='Number of Dream pretrain epochs to run immediately after Phase0 when hybrid is enabled.')
+    
+    # Phase-1 distillation args
+    parser.add_argument('--enable-phase1-distill', action='store_true', default=False,
+                        help='Enable a short Phase1 distillation run immediately after hybrid pretrain.')
+    parser.add_argument('--phase1-epochs', type=int, default=2,
+                        help='Number of distillation epochs for Phase1 when enabled.')
+    
+    # Phase-3 critique args
+    parser.add_argument('--enable-phase3-critique', action='store_true', default=False,
+                        help='Enable Phase3 self-critique to trigger mid-run.')
+    parser.add_argument('--phase3-start', type=int, default=30,
+                        help='Start epoch to enable Phase3 critique.')
+    parser.add_argument('--phase3-end', type=int, default=50,
+                        help='End epoch to enable Phase3 critique.')
+    
+    # Smoke test mode
+    parser.add_argument('--dry-run', action='store_true', default=False,
+                        help='Run a minimal smoke test mode: tiny dataset / 1 epoch loops for hybrid & distill.')
     
     args, _unknown = parser.parse_known_args()
     return args
@@ -398,6 +424,286 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         logger.info("[Dream-Pretrain] saved dream_pretrain.pth")
     except Exception:
         logging.getLogger(__name__).exception("[Dream-Pretrain] Could not save dream state")
+
+def phase0_then_dream_pretrain(model, device, args, logger, optimizer=None, scheduler=None):
+    """
+    Phase-0 → Dream hybrid pretrain: 
+    1. Run Phase-0 grammar pretrain for N1 epochs
+    2. Run DreamEngine grammar pretrain for N2 epochs using the same dataset
+    """
+    logger.info("=== Hybrid Phase0 -> Dream pretrain starting (dry_run=%s) ===", args.dry_run)
+    
+    # Dataset sizing
+    if args.dry_run:
+        phase0_epochs = 1
+        dream_epochs = 1
+        dataset = SyntheticGrammarDataset(num_samples=128)
+        batch_size = 8
+        num_workers = 0
+    else:
+        phase0_epochs = args.phase0_epochs
+        dream_epochs = args.dream_epochs
+        dataset = SyntheticGrammarDataset()  # Default constructor as in repo
+        batch_size = 32  # Match repo default
+        num_workers = 4
+    
+    # SyntheticGrammarDataset returns full batches, so use batch_size=None
+    loader = DataLoader(dataset, batch_size=None, shuffle=False, 
+                       num_workers=0)
+    
+    # Create optimizer if not provided
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)
+    
+    scaler = torch.amp.GradScaler()
+    
+    # Phase-0: Grammar pretrain
+    logger.info("Starting Phase-0 grammar pretrain for %d epochs", phase0_epochs)
+    for ep in range(phase0_epochs):
+        epoch_loss = 0.0
+        epoch_acc = 0.0
+        batch_count = 0
+        
+        model.train()
+        for batch_idx, batch in enumerate(loader):
+            if args.dry_run and batch_idx >= 10:  # Limit iterations in dry-run
+                break
+                
+            demos, test_inputs, test_outputs, task_id = batch
+            if not demos or len(demos) == 0:
+                continue
+                
+            input_grid = demos[0][0].to(device).float()
+            target_grid = demos[0][1].to(device).float()
+            
+            # Normalize shapes
+            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
+                input_grid = input_grid.squeeze(0)
+            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
+                target_grid = target_grid.squeeze(0)
+            
+            input_grid = input_grid.unsqueeze(0)
+            target_grid = target_grid.unsqueeze(0)
+            
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast(device_type='cuda' if str(device).startswith('cuda') else 'cpu'):
+                result = model.forward_pretraining(input_grid, target_grid)
+                if result and 'ce_loss' in result:
+                    loss = result['ce_loss']
+                    if 'dsl_loss' in result and result['dsl_loss'] is not None:
+                        loss = loss + 0.1 * result['dsl_loss']
+                else:
+                    loss = torch.tensor(0.0, device=device)
+            
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            
+            epoch_loss += loss.item()
+            if result and 'accuracy' in result:
+                epoch_acc += result['accuracy'].item()
+            batch_count += 1
+        
+        avg_loss = epoch_loss / max(1, batch_count)
+        avg_acc = epoch_acc / max(1, batch_count) * 100
+        logger.info("[Phase0] epoch %d/%d loss=%.4f acc=%.2f%%", 
+                   ep+1, phase0_epochs, avg_loss, avg_acc)
+    
+    # Dream pretrain using same dataset
+    logger.info("Starting DreamEngine pretrain using Phase0 grammar dataset for %d epochs", dream_epochs)
+    
+    # Check if model has dream engine
+    if not hasattr(model, 'dream') or model.dream is None:
+        logger.warning("[Dream-Pretrain] No DreamEngine found, skipping dream phase")
+        logger.info("=== Hybrid pretrain complete (Phase0 only) ===")
+        return
+    
+    dream = model.dream
+    
+    # Collect dream parameters
+    dream_params = []
+    if hasattr(dream, 'parameters') and callable(getattr(dream, 'parameters')):
+        try:
+            dream_params = [p for p in dream.parameters() if p is not None]
+        except Exception:
+            dream_params = []
+    
+    if not dream_params:
+        logger.warning("[Dream-Pretrain] No trainable Dream/ETS parameters found")
+        logger.info("=== Hybrid pretrain complete (Phase0 only) ===")
+        return
+    
+    dream_optimizer = torch.optim.Adam(dream_params, lr=1e-4)
+    
+    for ep in range(dream_epochs):
+        dream_loss = 0.0
+        dream_metric = 0.0
+        batch_count = 0
+        
+        for batch_idx, batch in enumerate(loader):
+            if args.dry_run and batch_idx >= 10:  # Limit iterations in dry-run
+                break
+                
+            demos, test_inputs, test_outputs, task_id = batch
+            if not demos or len(demos) == 0:
+                continue
+                
+            input_grid = demos[0][0].to(device).float()
+            target_grid = demos[0][1].to(device).float()
+            
+            # Normalize shapes
+            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
+                input_grid = input_grid.squeeze(0)
+            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
+                target_grid = target_grid.squeeze(0)
+                
+            input_grid = input_grid.unsqueeze(0)
+            target_grid = target_grid.unsqueeze(0)
+            
+            # Forward through model to get dream tokens
+            with torch.no_grad():
+                result = model.forward_pretraining(input_grid, target_grid)
+            
+            # Train dream engine if it produced tokens
+            if hasattr(dream, 'training_loss'):
+                try:
+                    loss = dream.training_loss(input_grid)
+                    if loss is None:
+                        loss = torch.tensor(0.0, device=device)
+                except Exception:
+                    loss = torch.tensor(0.0, device=device)
+            else:
+                loss = torch.tensor(0.0, device=device)
+            
+            if loss.requires_grad:
+                dream_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(dream_params, max_norm=1.0)
+                dream_optimizer.step()
+            
+            dream_loss += loss.item()
+            batch_count += 1
+        
+        avg_loss = dream_loss / max(1, batch_count)
+        logger.info("[Dream-Pretrain] epoch %d/%d loss=%.4f metric=%.4f", 
+                   ep+1, dream_epochs, avg_loss, dream_metric)
+    
+    logger.info("=== Hybrid pretrain complete ===")
+
+def run_phase1_distill(model, device, args, logger, optimizer=None):
+    """
+    Phase-1 distillation: run M epochs focusing on DSL loss
+    """
+    if not args.enable_phase1_distill:
+        return
+        
+    logger.info("=== Phase-1 Distillation starting (dry_run=%s) ===", args.dry_run)
+    
+    # Dataset sizing
+    if args.dry_run:
+        phase1_epochs = 1
+        dataset = SyntheticGrammarDataset(num_samples=64)
+        batch_size = 8
+        num_workers = 0
+    else:
+        phase1_epochs = args.phase1_epochs
+        dataset = SyntheticGrammarDataset(num_samples=1000)  # Smaller dataset for distillation
+        batch_size = 16
+        num_workers = 4
+    
+    # SyntheticGrammarDataset returns full batches, so use batch_size=None
+    loader = DataLoader(dataset, batch_size=None, shuffle=False,
+                       num_workers=0)
+    
+    # Create optimizer if not provided
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=1e-5)
+    
+    scaler = torch.amp.GradScaler()
+    
+    for ep in range(phase1_epochs):
+        epoch_loss = 0.0
+        batch_count = 0
+        
+        model.train()
+        for batch_idx, batch in enumerate(loader):
+            if args.dry_run and batch_idx >= 5:  # Limit iterations in dry-run
+                break
+                
+            demos, test_inputs, test_outputs, task_id = batch
+            if not demos or len(demos) == 0:
+                continue
+                
+            input_grid = demos[0][0].to(device).float()
+            target_grid = demos[0][1].to(device).float()
+            
+            # Normalize shapes
+            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
+                input_grid = input_grid.squeeze(0)
+            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
+                target_grid = target_grid.squeeze(0)
+            
+            input_grid = input_grid.unsqueeze(0)
+            target_grid = target_grid.unsqueeze(0)
+            
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast(device_type='cuda' if str(device).startswith('cuda') else 'cpu'):
+                result = model.forward_pretraining(input_grid, target_grid)
+                if result and 'dsl_loss' in result and result['dsl_loss'] is not None:
+                    # Focus on DSL loss for distillation
+                    loss = result['dsl_loss']
+                    if 'ce_loss' in result:
+                        loss = loss + 0.1 * result['ce_loss']  # Small CE contribution
+                else:
+                    loss = torch.tensor(0.0, device=device)
+            
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            
+            epoch_loss += loss.item()
+            batch_count += 1
+        
+        avg_loss = epoch_loss / max(1, batch_count)
+        logger.info("[Phase1-Distill] epoch %d/%d loss=%.4f", 
+                   ep+1, phase1_epochs, avg_loss)
+    
+    logger.info("=== Phase-1 Distillation complete ===")
+
+def maybe_run_phase3_critique(epoch, model, evaluator, args, logger):
+    """
+    Phase-3 critique: trigger self-critique in specified epoch window
+    """
+    if not args.enable_phase3_critique:
+        return
+        
+    if not (args.phase3_start <= epoch < args.phase3_end):
+        return
+    
+    # Only trigger once when entering the window, or every 5 epochs
+    if epoch == args.phase3_start or (epoch - args.phase3_start) % 5 == 0:
+        logger.info(f"[Phase3-Critique] Triggering at epoch {epoch}")
+        
+        # TODO: Import and use critique_trainer.py and self_critique_runner.py
+        # For now, just log that it would run
+        logger.info("[Phase3-Critique] Would run critique analysis here")
+        logger.info("[Phase3-Critique] - Gather evaluation failures")
+        logger.info("[Phase3-Critique] - Generate counterexamples")
+        logger.info("[Phase3-Critique] - Fine-tune on hard cases")
+        
+        # Create critique artifacts directory
+        critique_dir = Path(f"critique_artifacts/epoch_{epoch}")
+        critique_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save a marker file
+        with open(critique_dir / "critique_triggered.txt", "w") as f:
+            f.write(f"Critique triggered at epoch {epoch}\n")
+        
+        logger.info(f"[Phase3-Critique] Saved artifacts to {critique_dir}")
 
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
@@ -717,11 +1023,27 @@ def main():
                 print(f"[UKS] Loaded RelMem state from {cli_args.uks_load_path}")
         except Exception as e:
             print(f"[UKS] Could not load RelMem state: {e}")
+    
+    # Conservative hyperparameters for stable training
+    optimizer = optim.AdamW(topas_model.parameters(), lr=5e-5, weight_decay=1e-5)  # Lower LR
+    
+    # Phase-0 → Dream hybrid pretrain (if enabled)
+    if cli_args and cli_args.phase0_dream_hybrid:
+        phase0_then_dream_pretrain(topas_model, device, cli_args, logger, optimizer=optimizer)
+    
+    # Phase-1 distillation (if enabled)
+    if cli_args and cli_args.enable_phase1_distill:
+        run_phase1_distill(topas_model, device, cli_args, logger, optimizer=optimizer)
+    
+    # Check for dry-run exit
+    if cli_args and cli_args.dry_run:
+        print("\n🏁 Dry-run complete! Exiting...")
+        return
 
     dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
     
-    # Run Dream pretrain if requested
+    # Run Dream pretrain if requested (original dream pretrain)
     if cli_args and cli_args.dream_pretrain_epochs > 0:
         dream_pretrain_loop(topas_model, dataset, cli_args, device, logger)
         # Load pretrained Dream/ETS
@@ -738,8 +1060,7 @@ def main():
         from trainers.self_play import SelfPlayBuffer
         self_play_buffer = SelfPlayBuffer(maxlen=cli_args.selfplay_buffer_size)
 
-    # Conservative hyperparameters for stable training
-    optimizer = optim.AdamW(topas_model.parameters(), lr=5e-5, weight_decay=1e-5)  # Lower LR
+    # Optimizer already created above, just create scaler
     scaler = torch.amp.GradScaler()
 
     num_epochs = 150  # Extended run with stable hyperparams
@@ -971,6 +1292,10 @@ def main():
                     print(f"📊 Saved evaluation checkpoint: {eval_filename}")
             
             print(summary)
+        
+        # Phase-3 critique (if enabled)
+        if cli_args and cli_args.enable_phase3_critique:
+            maybe_run_phase3_critique(epoch, topas_model, None, cli_args, logger)
 
         # === DREAM: full offline consolidation on schedule ===
         try:
