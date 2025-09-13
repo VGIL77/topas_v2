@@ -356,11 +356,11 @@ class RelationManager:
 @dataclass
 class ModelConfig:
     """Configuration for TOPAS ARC model"""
-    # Architecture - scaled to ~60M parameters
-    width: int = 640
-    depth: int = 16
+    # Architecture - scaled to ~60M parameters (competition speed)
+    width: int = 512  # Reduced from 640 for speed
+    depth: int = 8    # Reduced from 16 for speed  
     slots: int = 80
-    slot_dim: int = 512
+    slot_dim: int = 256  # Reduced from 512 for speed
     rt_layers: int = 10
     rt_heads: int = 8
     
@@ -1015,6 +1015,25 @@ class TopasARC60M(nn.Module):
                 
                 ctx_proj = self.relmem_proj(ctx_pool)    # [B, ctrl_dim] 
                 brain = brain + ctx_proj  # Residual addition instead of concat - maintains 1024
+                
+                # === RelMem auto-binding + post-update hooks ===
+                # Auto-bind slot or brain concepts each forward pass
+                if hasattr(self.relmem, "bind_concept_by_vector"):
+                    try:
+                        # Bind an average latent vector as a "concept"
+                        latent_vec = brain.mean(dim=0).detach()
+                        self.relmem.bind_concept_by_vector(latent_vec, op_name="latent")
+                    except Exception as e:
+                        if kwargs.get('step') is not None and kwargs.get('step') % 100 == 0:
+                            print(f"[RelMem WARN] Concept binding failed: {e}")
+
+                # Run Hebbian / WTA updates if available
+                if hasattr(self.relmem, "apply_post_optimizer_hooks"):
+                    try:
+                        self.relmem.apply_post_optimizer_hooks()
+                    except Exception as e:
+                        if kwargs.get('step') is not None and kwargs.get('step') % 100 == 0:
+                            print(f"[RelMem WARN] Post-opt hook failed: {e}")
             
             # RAIL ORCHESTRATION - Initialize tracking
             rail_path = []
@@ -1365,7 +1384,7 @@ class TopasARC60M(nn.Module):
                                 op_bias[k] = max(op_bias.get(k, 0.0), float(v) * self.config.relmem_op_bias_w)
 
                             import logging
-                            logging.getLogger().info(f"[RelMem] merged op_bias from RelMem: {list(relmem_bias.items())[:8]}")
+                            # Spam disabled: merged op_bias logging
                             print(f"[RelMem] Merged op_bias with {len(relmem_bias)} operations")
                         except Exception as e:
                             import logging
@@ -2637,11 +2656,18 @@ class TopasARC60M(nn.Module):
         
         # HRM FiLM conditioning (optional)
         if hrm_latents is not None:
+            # DEFENSIVE: ensure hrm_latents are float (sometimes trainer/data are int/long).
             # Collapse HRM sequence [B,T,D] → [B,D]
+            # If a caller mistakenly passed integer tensors (e.g., target_grid used wrongly),
+            # this prevents dtype errors (mean on LongTensor etc).
+            if not torch.is_floating_point(hrm_latents):
+                hrm_latents = hrm_latents.float()
             if hrm_latents.dim() == 3:
                 hrm_mean = hrm_latents.mean(dim=1)
             else:
                 hrm_mean = hrm_latents
+            # ensure hrm_mean is float and on same device as model params
+            hrm_mean = hrm_mean.to(next(self.parameters()).device).float()
             gamma, beta = self.hrm_to_film(hrm_mean).chunk(2, dim=-1)
             slot_vecs = slot_vecs * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
         
@@ -2895,7 +2921,7 @@ class TopasARC60M(nn.Module):
                             op_bias[k] = max(op_bias.get(k, 0.0), float(v) * self.config.relmem_op_bias_w)
                         
                         import logging
-                        logging.getLogger().info(f"[RelMem] merged op_bias from RelMem: {list(relmem_bias.items())[:8]}")
+                        # Spam disabled: merged op_bias logging
                         
                         # Apply contextual bias from ETS
                         for op, bias_val in contextual_bias.items():
@@ -2911,15 +2937,19 @@ class TopasARC60M(nn.Module):
                 if not op_bias:
                     logging.getLogger().info(f"[RelMem] op_bias empty after merge; relman.edges={len(getattr(self.relman, 'edges', []))}, relmem.relations={getattr(self.relmem, 'relations', [])}")
                 else:
-                    logging.getLogger().info(f"[RelMem DEBUG] relman_count={relman_bias_count}, final_count={len(op_bias)}")
+                    # Spam disabled: relman_count logging
+                    pass
                 
-                # RelMem sanity check probe
-                import logging
-                logging.getLogger().info(f"[RelMem PROBE] op_bias_count={len(op_bias)} sample={list(op_bias.items())[:10]}")
-                # Also log top-5 by weight
-                if op_bias:
-                    top5 = sorted(op_bias.items(), key=lambda x: -x[1])[:5]
-                    logging.getLogger().info(f"[RelMem PROBE] top5={top5}")
+                # Simple RelMem status (throttled)
+                if hasattr(self, '_last_relmem_log_step'):
+                    if not hasattr(self, '_last_relmem_log_step'):
+                        self._last_relmem_log_step = 0
+                    if (getattr(self, 'global_step', 0) - self._last_relmem_log_step) >= 500:
+                        import logging
+                        active_count = getattr(self.relmem, 'concept_used', torch.tensor(0))
+                        active_sum = int(active_count.sum().item()) if torch.is_tensor(active_count) else 0
+                        logging.info(f"[RelMem] active={active_sum}, ops={len(op_bias)}")
+                        self._last_relmem_log_step = getattr(self, 'global_step', 0)
                 
                 # Use beam search with real inputs
                 dsl_result = beam_search(
@@ -2997,8 +3027,8 @@ class TopasARC60M(nn.Module):
                 import logging
                 # Enhanced logging probe for inverse loss
                 weighted_loss = inv_loss * self.config.relmem_inverse_loss_w
-                logging.getLogger().info(f"[RelMem PROBE] inverse_loss_raw={inv_loss.item():.6f}, weighted={weighted_loss.item():.6f}")
-                logging.info(f"[RelMem] Applied inverse-loss: {inv_loss.item():.4f} (weighted: {weighted_loss.item():.4f})")
+                # Spam disabled: inverse_loss probe
+                # Spam disabled: inverse-loss logging
             except Exception as e:
                 import logging
                 logging.warning(f"RelMem inverse-loss skipped: {e}")

@@ -19,11 +19,103 @@ import time
 import json
 import traceback
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
-from trainers.arc_dataset_loader import ARCDataset, SyntheticGrammarDataset
+from trainers.arc_dataset_loader import ARCDataset
 from models.topas_arc_60M import TopasARC60M, ModelConfig
 from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+from trainers.self_play import SelfPlayBuffer  # used for storing dopamine rewards
+from trainers.self_critique.counterexamples import CounterexampleGenerator, Task  # Task wrapper + counterexamples
+from trainers.self_critique.star_bootstrapper import STaRBootstrapper           # STaR trace gen + verification
+from trainers.self_critique.consistency import ConsistencyEnforcer               # enforce consistency across valid traces
+from trainers.augmentation.deep_program_discoverer import mine_deep_programs                  # deep DSL programs miner (6–10 ops)
+from collections import Counter, deque
+import math
+
+# =========================
+# Dopamine & Nightmare Core
+# =========================
+
+# Global state shared across training
+op_success_count = Counter()          # track operations in successful traces (for planner op_bias)
+recent_failures: List[Any] = []       # queue of failed counterexamples for nightmares
+rolling_em = deque(maxlen=200)        # rolling window of EM to estimate failure pressure
+
+def build_op_bias(temp: float = 0.7):
+    """
+    Convert op_success_count to a softmax prior (democratic → data-driven).
+    STaR will accept planner_op_bias for roughly half the traces.
+    """
+    ops = list(op_success_count.keys())
+    if not ops:
+        # If no data yet, keep a democratic prior over 41 ops
+        ops = [f"op_{i}" for i in range(41)]
+        vals = [1.0] * len(ops)
+    else:
+        vals = [op_success_count.get(op, 1.0) for op in ops]
+    mx = max(vals) if vals else 1.0
+    exps = [math.exp((v - mx) / max(1e-6, temp)) for v in vals]
+    Z = sum(exps) if exps else 1.0
+    return {op: (e / Z) for op, e in zip(ops, exps)}
+
+def dopamine_reward(task: Task, buffer: Optional[SelfPlayBuffer], logger, global_step: int):
+    """
+    Positive reinforcement: store solved puzzle pair in SelfPlayBuffer.
+    We store (input, target) pairs; SelfPlayBuffer will generate templated variants later.
+    """
+    if buffer is None:
+        return
+    try:
+        buffer.buffer.append((task.input.detach().cpu(), task.output.detach().cpu()))
+        logger.info(f"[Dopamine] Stored 1 puzzle pair → buffer size={len(buffer.buffer)} at step {global_step}")
+    except Exception as e:
+        logger.warning(f"[Dopamine] buffer append failed: {e}")
+
+def nightmare_prune(model, failures: List[Any], optimizer, scaler, device, logger, global_step: int,
+                    alpha: float = 0.08, max_failures: int = 8):
+    """
+    Negative replay: apply small negative gradients on recent failed counterexamples.
+    Uses model.evaluate_with_ebr() logits pathway like compute_metrics() for stability.
+    """
+    if not failures:
+        return
+    # Limit the number per cycle for stability
+    batch_failures = failures[:max_failures]
+    del failures[:max_failures]
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    device_type = 'cuda' if str(device).startswith('cuda') else 'cpu'
+    total_neg = torch.tensor(0.0, device=device)
+    with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
+        for f in batch_failures:
+            try:
+                # Counterexample objects expose .task with .input/.output in Phase 3 code.
+                task = getattr(f, "task", None)
+                if task is None:
+                    continue
+                inp = task.input.to(device).unsqueeze(0)   # [1, H, W]
+                tgt = task.output.to(device).unsqueeze(0)  # [1, H, W]
+                eval_out = model.evaluate_with_ebr(inp, tgt)  # returns dict with 'logits' if healthy
+                logits = eval_out.get('logits', None)
+                if logits is None:
+                    continue
+                # Negative CE: move away from these bad solutions
+                ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                     tgt.view(-1).long().clamp(0, 9))
+                total_neg = total_neg + (-alpha * ce)
+            except Exception as e:
+                logger.debug(f"[Nightmare] skip one failure: {e}")
+                continue
+    # Backprop a small combined negative signal
+    if torch.isfinite(total_neg):
+        scaler.scale(total_neg).backward()
+        # modest step; grads are small
+        scaler.step(optimizer)
+        scaler.update()
+        logger.info(f"[Nightmare] Applied negative replay on {len(batch_failures)} failures at step {global_step} (loss={float(total_neg.item()):.4f})")
+    else:
+        logger.warning("[Nightmare] Skipped due to non-finite loss")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train TOPAS+HRM (with DreamEngine controls)")
@@ -50,6 +142,12 @@ def parse_args():
                         help="IoU threshold for RelMem concept binding on success")
     parser.add_argument("--relmem-log-interval", type=int, default=200,
                         help="Log RelMem stats every N steps")
+    
+    # Progressive RelMem bias ramping parameters
+    parser.add_argument("--relmem-bias-ramp-start", type=int, default=10,
+                        help="Epoch to start ramping up RelMem bias")
+    parser.add_argument("--relmem-bias-max", type=float, default=0.5,
+                        help="Maximum RelMem bias weight after ramping")
     
     # Dream pretrain args
     parser.add_argument("--dream-pretrain-epochs", type=int, default=0,
@@ -90,32 +188,20 @@ def parse_args():
     # Training args
     parser.add_argument("--max-steps", type=int, default=60000,
                         help="Maximum training steps")
-    
-    # Phase-0 → Dream hybrid pretrain args
-    parser.add_argument('--phase0-dream-hybrid', action='store_true', default=False,
-                        help='Run Phase0 grammar pretrain then DreamEngine pretrain using the same grammar dataset before main ARC training.')
-    parser.add_argument('--phase0-epochs', type=int, default=2,
-                        help='Number of Phase0 grammar pretrain epochs when hybrid is enabled.')
-    parser.add_argument('--dream-epochs', type=int, default=3,
-                        help='Number of Dream pretrain epochs to run immediately after Phase0 when hybrid is enabled.')
-    
-    # Phase-1 distillation args
-    parser.add_argument('--enable-phase1-distill', action='store_true', default=False,
-                        help='Enable a short Phase1 distillation run immediately after hybrid pretrain.')
-    parser.add_argument('--phase1-epochs', type=int, default=2,
-                        help='Number of distillation epochs for Phase1 when enabled.')
-    
-    # Phase-3 critique args
-    parser.add_argument('--enable-phase3-critique', action='store_true', default=False,
-                        help='Enable Phase3 self-critique to trigger mid-run.')
-    parser.add_argument('--phase3-start', type=int, default=30,
-                        help='Start epoch to enable Phase3 critique.')
-    parser.add_argument('--phase3-end', type=int, default=50,
-                        help='End epoch to enable Phase3 critique.')
-    
-    # Smoke test mode
-    parser.add_argument('--dry-run', action='store_true', default=False,
-                        help='Run a minimal smoke test mode: tiny dataset / 1 epoch loops for hybrid & distill.')
+
+    # ---- Model-size & dopaminergic/nightmare controls ----
+    parser.add_argument("--model-width", type=int, default=640,
+                        help="Hidden width for TOPAS conv backbone (default 640)")
+    parser.add_argument("--model-slots", type=int, default=64,
+                        help="Number of slots for concept vectors (default 64)")
+    parser.add_argument("--breakthrough-threshold", type=float, default=0.33,
+                        help="EM threshold to trigger dopamine capture (default 0.33)")
+    parser.add_argument("--nightmare-alpha", type=float, default=0.08,
+                        help="Negative reinforcement strength for nightmares (0.05–0.10 recommended)")
+    parser.add_argument("--nightmare-min-interval", type=int, default=200,
+                        help="Minimum steps between nightmare cycles (when failure low)")
+    parser.add_argument("--nightmare-max-interval", type=int, default=1000,
+                        help="Maximum steps between nightmare cycles (when failure high)")
     
     args, _unknown = parser.parse_known_args()
     return args
@@ -232,17 +318,40 @@ def create_models(device, cli_args=None):
         topas_config.enable_dream = True
         if hasattr(cli_args, "dream_micro_ticks"):
             topas_config.dream_micro_ticks = cli_args.dream_micro_ticks
-    topas_config.width = 512
+    # Allow moderate scaling to use GPU headroom safely
+    topas_config.width = int(getattr(cli_args, "model_width", 640))
     topas_config.depth = 8
-    topas_config.slots = 32
+    topas_config.slots = int(getattr(cli_args, "model_slots", 64))
     topas_config.slot_dim = 256
     topas_config.max_dsl_depth = 4
     topas_config.use_ebr = True
+    
+    # Progressive RelMem bias ramping - start stable, then boost
+    base_bias_w = 0.2  # Proven stable value
+    max_bias_w = getattr(cli_args, 'relmem_bias_max', 0.5)
+    ramp_start = getattr(cli_args, 'relmem_bias_ramp_start', 10)
+    
+    # Boosted RelMem DSL influence parameters (will be ramped progressively)
+    topas_config.relmem_op_bias_w = base_bias_w        # Start with proven stable
+    topas_config.relmem_op_bias_scale = 1.0           # Double from 0.5 → full scaling  
+    topas_config.relmem_bias_beta = 0.4               # Double from 0.2 → aggressive bias
+    
+    # Store ramping parameters for training loop
+    topas_config._bias_ramp_start = ramp_start
+    topas_config._bias_max = max_bias_w
+    topas_config._bias_base = base_bias_w
+    
     # Don't override enable_dream - respect CLI setting
     topas_config.verbose = True
     topas_config.pretraining_mode = True
 
     topas_model = TopasARC60M(topas_config).to(device)
+    
+    # Ensure Dream system is also moved to the correct device
+    if hasattr(topas_model, 'dream') and topas_model.dream is not None:
+        if hasattr(topas_model.dream, 'to'):
+            topas_model.dream.to(device)
+    
     print(f"✅ TOPAS: {sum(p.numel() for p in topas_model.parameters()):,} parameters")
 
     hrm_config = {
@@ -284,8 +393,11 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
     
     dream = topas_model.dream
     # Move dream to the same device as the model
-    if hasattr(dream, 'device'):
-        # Update device and move internal modules
+    if hasattr(dream, 'to'):
+        # Use the proper to() method which handles device and generator
+        dream.to(device)
+    elif hasattr(dream, 'device'):
+        # Fallback: Update device and move internal modules
         dream.device = device
         # Move internal modules if they exist
         if hasattr(dream, '_dream_color_head') and dream._dream_color_head is not None:
@@ -322,6 +434,7 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         for param in topas_model.parameters():
             param.requires_grad = False
     
+    # Use proven single-sample approach but benefit from larger Dream buffer (512)
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
     
     for epoch in range(cli_args.dream_pretrain_epochs):
@@ -330,20 +443,24 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         buffer_len = 0
         
         for batch_idx, batch in enumerate(dataloader):
-            demos, test_grid, target_grid, task_id = batch
+            # ARCDataLoader returns (demos, test_inputs, test_outputs, task_id)
+            demos, test_inputs, test_outputs, task_id = batch
             if batch_idx >= cli_args.dream_pretrain_batches:
                 break
-                
-            # Convert test_grid to tensor if it's not already
-            if not isinstance(test_grid, torch.Tensor):
-                if isinstance(test_grid, list):
-                    test_grid = test_grid[0] if len(test_grid) > 0 else torch.zeros((1, 3, 3))
+
+            # Pick the first available test input/output (if any)
+            test_grid = test_inputs[0] if test_inputs else None
+            target_grid = test_outputs[0] if test_outputs else None
+
+            # Safety: fallback to minimal tensor if dataset gives nothing
+            if test_grid is None:
+                test_grid = torch.zeros((1, 3, 3), device=device, dtype=torch.long)
+            if target_grid is None:
+                target_grid = torch.zeros_like(test_grid)
                     
-            # Ensure tensor is on the right device
+            # Ensure tensors are on the right device
             test_grid = test_grid.to(device)
-            if target_grid is not None and not isinstance(target_grid, torch.Tensor):
-                target_grid = torch.tensor(target_grid) if isinstance(target_grid, (list, np.ndarray)) else target_grid
-                target_grid = target_grid.to(device)
+            target_grid = target_grid.to(device)
                 
             # Get slot features from model (no grad if frozen)
             with torch.no_grad() if cli_args.dream_pretrain_freeze_model else torch.enable_grad():
@@ -424,286 +541,6 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
         logger.info("[Dream-Pretrain] saved dream_pretrain.pth")
     except Exception:
         logging.getLogger(__name__).exception("[Dream-Pretrain] Could not save dream state")
-
-def phase0_then_dream_pretrain(model, device, args, logger, optimizer=None, scheduler=None):
-    """
-    Phase-0 → Dream hybrid pretrain: 
-    1. Run Phase-0 grammar pretrain for N1 epochs
-    2. Run DreamEngine grammar pretrain for N2 epochs using the same dataset
-    """
-    logger.info("=== Hybrid Phase0 -> Dream pretrain starting (dry_run=%s) ===", args.dry_run)
-    
-    # Dataset sizing
-    if args.dry_run:
-        phase0_epochs = 1
-        dream_epochs = 1
-        dataset = SyntheticGrammarDataset(num_samples=128)
-        batch_size = 8
-        num_workers = 0
-    else:
-        phase0_epochs = args.phase0_epochs
-        dream_epochs = args.dream_epochs
-        dataset = SyntheticGrammarDataset()  # Default constructor as in repo
-        batch_size = 32  # Match repo default
-        num_workers = 4
-    
-    # SyntheticGrammarDataset returns full batches, so use batch_size=None
-    loader = DataLoader(dataset, batch_size=None, shuffle=False, 
-                       num_workers=0)
-    
-    # Create optimizer if not provided
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)
-    
-    scaler = torch.amp.GradScaler()
-    
-    # Phase-0: Grammar pretrain
-    logger.info("Starting Phase-0 grammar pretrain for %d epochs", phase0_epochs)
-    for ep in range(phase0_epochs):
-        epoch_loss = 0.0
-        epoch_acc = 0.0
-        batch_count = 0
-        
-        model.train()
-        for batch_idx, batch in enumerate(loader):
-            if args.dry_run and batch_idx >= 10:  # Limit iterations in dry-run
-                break
-                
-            demos, test_inputs, test_outputs, task_id = batch
-            if not demos or len(demos) == 0:
-                continue
-                
-            input_grid = demos[0][0].to(device).float()
-            target_grid = demos[0][1].to(device).float()
-            
-            # Normalize shapes
-            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
-                input_grid = input_grid.squeeze(0)
-            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
-                target_grid = target_grid.squeeze(0)
-            
-            input_grid = input_grid.unsqueeze(0)
-            target_grid = target_grid.unsqueeze(0)
-            
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type='cuda' if str(device).startswith('cuda') else 'cpu'):
-                result = model.forward_pretraining(input_grid, target_grid)
-                if result and 'ce_loss' in result:
-                    loss = result['ce_loss']
-                    if 'dsl_loss' in result and result['dsl_loss'] is not None:
-                        loss = loss + 0.1 * result['dsl_loss']
-                else:
-                    loss = torch.tensor(0.0, device=device)
-            
-            if loss.requires_grad:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            
-            epoch_loss += loss.item()
-            if result and 'accuracy' in result:
-                epoch_acc += result['accuracy'].item()
-            batch_count += 1
-        
-        avg_loss = epoch_loss / max(1, batch_count)
-        avg_acc = epoch_acc / max(1, batch_count) * 100
-        logger.info("[Phase0] epoch %d/%d loss=%.4f acc=%.2f%%", 
-                   ep+1, phase0_epochs, avg_loss, avg_acc)
-    
-    # Dream pretrain using same dataset
-    logger.info("Starting DreamEngine pretrain using Phase0 grammar dataset for %d epochs", dream_epochs)
-    
-    # Check if model has dream engine
-    if not hasattr(model, 'dream') or model.dream is None:
-        logger.warning("[Dream-Pretrain] No DreamEngine found, skipping dream phase")
-        logger.info("=== Hybrid pretrain complete (Phase0 only) ===")
-        return
-    
-    dream = model.dream
-    
-    # Collect dream parameters
-    dream_params = []
-    if hasattr(dream, 'parameters') and callable(getattr(dream, 'parameters')):
-        try:
-            dream_params = [p for p in dream.parameters() if p is not None]
-        except Exception:
-            dream_params = []
-    
-    if not dream_params:
-        logger.warning("[Dream-Pretrain] No trainable Dream/ETS parameters found")
-        logger.info("=== Hybrid pretrain complete (Phase0 only) ===")
-        return
-    
-    dream_optimizer = torch.optim.Adam(dream_params, lr=1e-4)
-    
-    for ep in range(dream_epochs):
-        dream_loss = 0.0
-        dream_metric = 0.0
-        batch_count = 0
-        
-        for batch_idx, batch in enumerate(loader):
-            if args.dry_run and batch_idx >= 10:  # Limit iterations in dry-run
-                break
-                
-            demos, test_inputs, test_outputs, task_id = batch
-            if not demos or len(demos) == 0:
-                continue
-                
-            input_grid = demos[0][0].to(device).float()
-            target_grid = demos[0][1].to(device).float()
-            
-            # Normalize shapes
-            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
-                input_grid = input_grid.squeeze(0)
-            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
-                target_grid = target_grid.squeeze(0)
-                
-            input_grid = input_grid.unsqueeze(0)
-            target_grid = target_grid.unsqueeze(0)
-            
-            # Forward through model to get dream tokens
-            with torch.no_grad():
-                result = model.forward_pretraining(input_grid, target_grid)
-            
-            # Train dream engine if it produced tokens
-            if hasattr(dream, 'training_loss'):
-                try:
-                    loss = dream.training_loss(input_grid)
-                    if loss is None:
-                        loss = torch.tensor(0.0, device=device)
-                except Exception:
-                    loss = torch.tensor(0.0, device=device)
-            else:
-                loss = torch.tensor(0.0, device=device)
-            
-            if loss.requires_grad:
-                dream_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(dream_params, max_norm=1.0)
-                dream_optimizer.step()
-            
-            dream_loss += loss.item()
-            batch_count += 1
-        
-        avg_loss = dream_loss / max(1, batch_count)
-        logger.info("[Dream-Pretrain] epoch %d/%d loss=%.4f metric=%.4f", 
-                   ep+1, dream_epochs, avg_loss, dream_metric)
-    
-    logger.info("=== Hybrid pretrain complete ===")
-
-def run_phase1_distill(model, device, args, logger, optimizer=None):
-    """
-    Phase-1 distillation: run M epochs focusing on DSL loss
-    """
-    if not args.enable_phase1_distill:
-        return
-        
-    logger.info("=== Phase-1 Distillation starting (dry_run=%s) ===", args.dry_run)
-    
-    # Dataset sizing
-    if args.dry_run:
-        phase1_epochs = 1
-        dataset = SyntheticGrammarDataset(num_samples=64)
-        batch_size = 8
-        num_workers = 0
-    else:
-        phase1_epochs = args.phase1_epochs
-        dataset = SyntheticGrammarDataset(num_samples=1000)  # Smaller dataset for distillation
-        batch_size = 16
-        num_workers = 4
-    
-    # SyntheticGrammarDataset returns full batches, so use batch_size=None
-    loader = DataLoader(dataset, batch_size=None, shuffle=False,
-                       num_workers=0)
-    
-    # Create optimizer if not provided
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=1e-5)
-    
-    scaler = torch.amp.GradScaler()
-    
-    for ep in range(phase1_epochs):
-        epoch_loss = 0.0
-        batch_count = 0
-        
-        model.train()
-        for batch_idx, batch in enumerate(loader):
-            if args.dry_run and batch_idx >= 5:  # Limit iterations in dry-run
-                break
-                
-            demos, test_inputs, test_outputs, task_id = batch
-            if not demos or len(demos) == 0:
-                continue
-                
-            input_grid = demos[0][0].to(device).float()
-            target_grid = demos[0][1].to(device).float()
-            
-            # Normalize shapes
-            if input_grid.dim() == 3 and input_grid.shape[0] == 1:
-                input_grid = input_grid.squeeze(0)
-            if target_grid.dim() == 3 and target_grid.shape[0] == 1:
-                target_grid = target_grid.squeeze(0)
-            
-            input_grid = input_grid.unsqueeze(0)
-            target_grid = target_grid.unsqueeze(0)
-            
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type='cuda' if str(device).startswith('cuda') else 'cpu'):
-                result = model.forward_pretraining(input_grid, target_grid)
-                if result and 'dsl_loss' in result and result['dsl_loss'] is not None:
-                    # Focus on DSL loss for distillation
-                    loss = result['dsl_loss']
-                    if 'ce_loss' in result:
-                        loss = loss + 0.1 * result['ce_loss']  # Small CE contribution
-                else:
-                    loss = torch.tensor(0.0, device=device)
-            
-            if loss.requires_grad:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            
-            epoch_loss += loss.item()
-            batch_count += 1
-        
-        avg_loss = epoch_loss / max(1, batch_count)
-        logger.info("[Phase1-Distill] epoch %d/%d loss=%.4f", 
-                   ep+1, phase1_epochs, avg_loss)
-    
-    logger.info("=== Phase-1 Distillation complete ===")
-
-def maybe_run_phase3_critique(epoch, model, evaluator, args, logger):
-    """
-    Phase-3 critique: trigger self-critique in specified epoch window
-    """
-    if not args.enable_phase3_critique:
-        return
-        
-    if not (args.phase3_start <= epoch < args.phase3_end):
-        return
-    
-    # Only trigger once when entering the window, or every 5 epochs
-    if epoch == args.phase3_start or (epoch - args.phase3_start) % 5 == 0:
-        logger.info(f"[Phase3-Critique] Triggering at epoch {epoch}")
-        
-        # TODO: Import and use critique_trainer.py and self_critique_runner.py
-        # For now, just log that it would run
-        logger.info("[Phase3-Critique] Would run critique analysis here")
-        logger.info("[Phase3-Critique] - Gather evaluation failures")
-        logger.info("[Phase3-Critique] - Generate counterexamples")
-        logger.info("[Phase3-Critique] - Fine-tune on hard cases")
-        
-        # Create critique artifacts directory
-        critique_dir = Path(f"critique_artifacts/epoch_{epoch}")
-        critique_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save a marker file
-        with open(critique_dir / "critique_triggered.txt", "w") as f:
-            f.write(f"Critique triggered at epoch {epoch}\n")
-        
-        logger.info(f"[Phase3-Critique] Saved artifacts to {critique_dir}")
 
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
@@ -803,12 +640,16 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                             if global_step % 100 == 0:  # Log occasionally
                                 logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
                 
-                # ---- RelMem auxiliary loss every N steps (fixed implementation) ----
+                # ---- RelMem auxiliary loss every N steps (with warm-up) ----
+                # Delay RelMem until after 5 epochs (~2000 steps)
+                relmem_warmup_epochs = 5
+                current_epoch = global_step // 400  # assumes ~400 steps/epoch
                 relmem_loss_interval = getattr(args, 'relmem_loss_interval', 25) if 'args' in locals() else 25
-                if hasattr(topas_model, "relmem") and topas_model.relmem is not None and (global_step % relmem_loss_interval == 0):
+                if (hasattr(topas_model, "relmem") and topas_model.relmem is not None and 
+                    current_epoch >= relmem_warmup_epochs and (global_step % relmem_loss_interval == 0)):
                     try:
-                        reg_alpha = getattr(args, 'relmem_reg_alpha', 1e-3) if 'args' in locals() else 1e-3
-                        reg_beta = getattr(args, 'relmem_reg_beta', 5e-4) if 'args' in locals() else 5e-4
+                        reg_alpha = getattr(args, 'relmem_reg_alpha', 1e-4) if 'args' in locals() else 1e-4  # Reduced for stability
+                        reg_beta = getattr(args, 'relmem_reg_beta', 1e-4) if 'args' in locals() else 1e-4   # Reduced for stability
                         
                         # Replace broken inverse_loss() with inverse_loss_safe()
                         relmem_aux = torch.tensor(0.0, device=device)
@@ -962,9 +803,9 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             except Exception:
                 pass
         
-        # Gradient clipping for stability
+        # Tighter gradient clipping for RelMem stability
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=0.5)  # Tighter clipping
         
         scaler.step(optimizer)
         scaler.update()
@@ -1023,27 +864,20 @@ def main():
                 print(f"[UKS] Loaded RelMem state from {cli_args.uks_load_path}")
         except Exception as e:
             print(f"[UKS] Could not load RelMem state: {e}")
-    
-    # Conservative hyperparameters for stable training
-    optimizer = optim.AdamW(topas_model.parameters(), lr=5e-5, weight_decay=1e-5)  # Lower LR
-    
-    # Phase-0 → Dream hybrid pretrain (if enabled)
-    if cli_args and cli_args.phase0_dream_hybrid:
-        phase0_then_dream_pretrain(topas_model, device, cli_args, logger, optimizer=optimizer)
-    
-    # Phase-1 distillation (if enabled)
-    if cli_args and cli_args.enable_phase1_distill:
-        run_phase1_distill(topas_model, device, cli_args, logger, optimizer=optimizer)
-    
-    # Check for dry-run exit
-    if cli_args and cli_args.dry_run:
-        print("\n🏁 Dry-run complete! Exiting...")
-        return
 
-    dataset = ARCDataset(challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training", device=str(device))
+    dataset = ARCDataset(
+        challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
+        device=str(device)
+    )
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
+
+    # === Self-play & critique stack ===
+    self_play_buffer = SelfPlayBuffer(maxlen=cli_args.selfplay_buffer_size if cli_args else 200)  # used by dopamine rewards
+    counterexample_gen = CounterexampleGenerator(device=str(device))  # for nightmare queue
+    star_bootstrapper = STaRBootstrapper(topas_model, device=str(device))  # trace generator/validator
+    consistency_enforcer = ConsistencyEnforcer(device=str(device))         # optional consistency step
     
-    # Run Dream pretrain if requested (original dream pretrain)
+    # Run Dream pretrain if requested
     if cli_args and cli_args.dream_pretrain_epochs > 0:
         dream_pretrain_loop(topas_model, dataset, cli_args, device, logger)
         # Load pretrained Dream/ETS
@@ -1054,14 +888,11 @@ def main():
             except Exception as e:
                 logger.warning(f"[Main] Failed to load dream pretrain: {e}")
     
-    # Initialize self-play if enabled
-    self_play_buffer = None
-    if cli_args and cli_args.selfplay_enable:
-        from trainers.self_play import SelfPlayBuffer
-        self_play_buffer = SelfPlayBuffer(maxlen=cli_args.selfplay_buffer_size)
+    # Self-play buffer initialized above in critique stack
 
-    # Optimizer already created above, just create scaler
-    scaler = torch.amp.GradScaler()
+    # Conservative hyperparameters for stable training with RelMem
+    optimizer = optim.AdamW(topas_model.parameters(), lr=2e-5, weight_decay=1e-5)  # Even lower LR for stability
+    scaler = torch.amp.GradScaler("cuda")  # Fixed FutureWarning
 
     num_epochs = 150  # Extended run with stable hyperparams
     total_steps = len(dataset) * num_epochs
@@ -1076,8 +907,19 @@ def main():
     global_step = 0
     best_em = 0.0
     best_acc = 0.0
+    stable_breakthrough_steps = 0  # counts metric windows at/above threshold for curriculum trigger
 
     for epoch in range(num_epochs):
+        # Progressive RelMem bias ramping
+        if hasattr(topas_model.config, '_bias_ramp_start') and epoch >= topas_model.config._bias_ramp_start:
+            # Ramp up RelMem bias for stronger breakthrough push (but only if planner-aligned success shows up)
+            ramp_progress = min(1.0, (epoch - topas_model.config._bias_ramp_start) / 10.0)
+            current_bias_w = topas_model.config._bias_base + ramp_progress * (topas_model.config._bias_max - topas_model.config._bias_base)
+            recent_successes = sum(1 for v in list(rolling_em)[-10:] if v >= getattr(cli_args, "breakthrough_threshold", 0.33))
+            if hasattr(topas_model.config, 'relmem_op_bias_w') and recent_successes >= 3:
+                topas_model.config.relmem_op_bias_w = current_bias_w
+                print(f"🎯 RelMem bias ramped to {current_bias_w:.3f} (epoch {epoch+1})")
+        
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
         epoch_losses = []
         epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': [], 'exact_match_refined': []}
@@ -1088,11 +930,93 @@ def main():
             # Compute metrics every 10 steps
             compute_metrics_now = (global_step % 10 == 0)
             
-            result = train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=compute_metrics_now, global_step=global_step)
+            result = train_step(
+                topas_model, hrm_model, batch,
+                optimizer, scaler, device,
+                return_metrics=compute_metrics_now,
+                global_step=global_step
+            )
+
+            # === Dopamine capture & planner priors ===
+            if compute_metrics_now and isinstance(result, tuple):
+                try:
+                    loss, metrics = result
+                    em_val = float(metrics.get("exact_match", 0.0))
+                    rolling_em.append(em_val)
+                    # reconstruct current task from batch for trace gen / buffer
+                    demos, test_inputs, test_outputs, task_id = batch
+                    if demos and len(demos) > 0:
+                        grid_in = demos[0][0].to(device)
+                        grid_out = demos[0][1].to(device)
+                        task = Task(input=grid_in, output=grid_out, constraints={}, metadata={})
+                    else:
+                        task = None
+
+                    if em_val >= getattr(cli_args, "breakthrough_threshold", 0.33) and task is not None:
+                        logger.info(f"[Breakthrough] EM={em_val:.2%} at step={global_step} → dopamine capture")
+                        # 1) Planner prior from successful ops (democratic→peaked)
+                        planner_bias = build_op_bias(temp=0.7)
+                        # 2) Generate/verify traces (half use planner bias internally)
+                        traces = star_bootstrapper.generate_diverse_traces(task, n_traces=8, planner_op_bias=planner_bias)
+                        validations = star_bootstrapper.verify_traces(traces, task)
+                        good_traces = [t for t, v in zip(traces, validations) if v.is_valid]
+                        # 3) Update op priors from successful traces
+                        for t in good_traces:
+                            if hasattr(t, "operations") and t.operations:
+                                op_success_count.update(t.operations)
+                        # 4) Dopamine: store solved pair into buffer
+                        dopamine_reward(task, self_play_buffer, logger, global_step)
+                        # 5) Counterexamples → nightmare queue
+                        cex = counterexample_gen.generate_from_failure(task, topas_model, n_counterexamples=5)
+                        if cex:
+                            recent_failures.extend(cex)
+                        # 6) Optional: consistency enforcement across valid traces
+                        if len(good_traces) > 1:
+                            try:
+                                consistency_enforcer.enforce_consistency(good_traces, task)
+                            except Exception:
+                                pass
+                        # 7) Stable-breakthrough counter (for curriculum)
+                        stable_breakthrough_steps += 1
+                    else:
+                        stable_breakthrough_steps = max(0, stable_breakthrough_steps - 1)
+                except Exception as e:
+                    logger.warning(f"[Dopamine] capture pipeline skipped: {e}")
+
+            # === Curriculum: escalate difficulty when breakthroughs persist ===
+            if stable_breakthrough_steps >= 100:
+                try:
+                    # Use the last seen task to mine deep programs
+                    demos, test_inputs, test_outputs, task_id = batch
+                    if demos and len(demos) > 0:
+                        grid_in = demos[0][0]
+                        grid_out = demos[0][1]
+                        deep = mine_deep_programs({"test": {"input": grid_in, "output": grid_out}}, max_depth=10)
+                        # Only keep exact matches to avoid incorrect targets
+                        exact_deep = [dp for dp in deep if dp.get("exact_match")]
+                        for _dp in exact_deep:
+                            self_play_buffer.buffer.append((grid_in.detach().cpu(), grid_out.detach().cpu()))
+                        logger.info(f"[Curriculum] Injected {len(exact_deep)} deep-program exemplars")
+                except Exception as e:
+                    logger.warning(f"[Curriculum] deep mining failed: {e}")
+                finally:
+                    stable_breakthrough_steps = 0
+
+            # === Adaptive Nightmare cycle ===
+            if len(rolling_em) >= 50 and cli_args:
+                fail_rate = 1.0 - (sum(rolling_em) / len(rolling_em))  # higher → worse
+                min_iv = int(getattr(cli_args, "nightmare_min_interval", 200))
+                max_iv = int(getattr(cli_args, "nightmare_max_interval", 1000))
+                # Map fail_rate∈[0,1] → interval [max_iv, min_iv]
+                interval = int(max_iv - (max_iv - min_iv) * max(0.0, min(1.0, fail_rate)))
+                if interval < min_iv: interval = min_iv
+                if global_step % interval == 0 and recent_failures:
+                    nightmare_prune(topas_model, recent_failures, optimizer, scaler, device, logger,
+                                    global_step, alpha=float(getattr(cli_args, "nightmare_alpha", 0.08)))
             
-            # Self-play training integration
+            # === Self-play training integration (existing) ===
             sp_loss_contribution = 0.0
-            if self_play_buffer and global_step % cli_args.selfplay_interval == 0:
+            if cli_args and cli_args.selfplay_enable and self_play_buffer and global_step % cli_args.selfplay_interval == 0:
                 try:
                     # Generate new puzzles from current batch
                     demos, test_inputs, test_outputs, task_id = batch
@@ -1292,10 +1216,6 @@ def main():
                     print(f"📊 Saved evaluation checkpoint: {eval_filename}")
             
             print(summary)
-        
-        # Phase-3 critique (if enabled)
-        if cli_args and cli_args.enable_phase3_critique:
-            maybe_run_phase3_critique(epoch, topas_model, None, cli_args, logger)
 
         # === DREAM: full offline consolidation on schedule ===
         try:
