@@ -81,6 +81,57 @@ def dopamine_reward(task: Task, buffer: Optional[SelfPlayBuffer], logger, global
     except Exception as e:
         logger.warning(f"[Dopamine] buffer append failed: {e}")
 
+def _as_star_task(task):
+    """
+    Convert task objects to format expected by STaR bootstrapper.
+    Handles Task objects, dicts, and tuples consistently.
+    
+    Args:
+        task: Task object, dict, or tuple/list with (input, output)
+        
+    Returns:
+        Dictionary with 'input' and 'output' keys for STaR compatibility
+    """
+    if task is None:
+        return None
+        
+    try:
+        # Handle Task dataclass objects
+        if hasattr(task, "input") and hasattr(task, "output"):
+            return {
+                "input": task.input,
+                "output": task.output
+            }
+        
+        # Handle dictionary format (already compatible)
+        elif isinstance(task, dict):
+            if "input" in task and "output" in task:
+                return task
+            elif "test" in task and "target" in task:
+                # Alternative naming convention
+                return {
+                    "input": task["test"],
+                    "output": task["target"]
+                }
+            else:
+                # Try to extract from nested structure
+                return task
+        
+        # Handle tuple/list format
+        elif isinstance(task, (list, tuple)) and len(task) >= 2:
+            return {
+                "input": task[0],
+                "output": task[1]
+            }
+        
+        else:
+            # Return as-is and let STaR handle it
+            return task
+            
+    except Exception as e:
+        print(f"[Task-Adapter] Warning: Failed to adapt task {type(task)}: {e}")
+        return task
+
 def nightmare_prune(model, failures: List[Any], optimizer, scaler, device, logger, global_step: int,
                     alpha: float = 0.08, max_failures: int = 8):
     """
@@ -398,6 +449,17 @@ def create_models(device, cli_args=None):
     if hasattr(topas_model, 'dream') and topas_model.dream is not None:
         if hasattr(topas_model.dream, 'to'):
             topas_model.dream.to(device)
+        
+        # Ensure Wormhole is initialized for template mining
+        if not hasattr(topas_model.dream, 'wormhole') or topas_model.dream.wormhole is None:
+            try:
+                from wormhole_offline import WormholeTemplateMiner
+                topas_model.dream.wormhole = WormholeTemplateMiner()
+                print("[TOPAS] Wormhole template miner initialized")
+            except ImportError as e:
+                print(f"[TOPAS] Warning: Could not initialize Wormhole: {e}")
+        else:
+            print("[TOPAS] Wormhole template miner already initialized")
     
     print(f"✅ TOPAS: {sum(p.numel() for p in topas_model.parameters()):,} parameters")
 
@@ -1004,8 +1066,9 @@ def main():
                         # 1) Planner prior from successful ops (democratic→peaked)
                         planner_bias = build_op_bias(temp=0.7)
                         # 2) Generate/verify traces (half use planner bias internally)
-                        traces = star_bootstrapper.generate_diverse_traces(task, n_traces=8, planner_op_bias=planner_bias)
-                        validations = star_bootstrapper.verify_traces(traces, task)
+                        star_task = _as_star_task(task)
+                        traces = star_bootstrapper.generate_diverse_traces(star_task, n_traces=8, planner_op_bias=planner_bias)
+                        validations = star_bootstrapper.verify_traces(traces, star_task)
                         good_traces = [t for t, v in zip(traces, validations) if v.is_valid]
                         # 3) Update op priors from successful traces
                         for t in good_traces:
@@ -1043,11 +1106,12 @@ def main():
                     if task is not None:
                         # Half of traces guided by current op_bias (from dopamine counts)
                         planner_bias = build_op_bias(temp=0.7)
-                        traces = star_bootstrapper.generate_diverse_traces(task, n_traces=max(6, cli_args.monologue_min_traces), planner_op_bias=planner_bias)
-                        vals = star_bootstrapper.verify_traces(traces, task)
+                        star_task = _as_star_task(task)
+                        traces = star_bootstrapper.generate_diverse_traces(star_task, n_traces=max(6, cli_args.monologue_min_traces), planner_op_bias=planner_bias)
+                        vals = star_bootstrapper.verify_traces(traces, star_task)
                         valid_traces = [t for t, v in zip(traces, vals) if v.is_valid or v.similarity_score >= 0.90]
                         if len(valid_traces) >= 2:
-                            c_res = consistency_enforcer.enforce_consistency(valid_traces, task)
+                            c_res = consistency_enforcer.enforce_consistency(valid_traces, star_task)
                             monolog_score = c_res['metrics'].overall_consistency if c_res.get('metrics') else 0.0
                             # Use monologue score to steer schedule:
                             target = float(getattr(cli_args, "monologue_consistency_target", 0.85))

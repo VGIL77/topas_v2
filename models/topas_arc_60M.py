@@ -55,10 +55,56 @@ sys.path.insert(0, parent_dir)
 from energy_refinement import EnergyRefiner
 from trainers.arc_constraints import ARCGridConstraints
 from dream_engine import DreamEngine, DreamConfig
-from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, neuro_hodge_penalty
+from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, neuro_hodge_penalty, clamp_neuromorphic_terms
 from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler
 from relational_memory_neuro import RelationalMemoryNeuro
 from models.dsl_registry import DSL_OPS
+
+# DSL Shim for STaR compatibility - provides facade for DSL operations
+class _DSLShim:
+    """
+    Provides DSL operation facade for STaR bootstrapper compatibility.
+    Exposes sample_operation() and apply() methods for trace generation.
+    """
+    def __init__(self, model_ref):
+        self.model_ref = model_ref
+        self.ops = DSL_OPS
+    
+    def sample_operation(self, grid=None, brain=None, temperature=0.7):
+        """Sample a DSL operation for trace generation"""
+        import random
+        if not self.ops:
+            return "identity", {}
+        
+        # Use model's operation bias if available
+        if hasattr(self.model_ref, 'hrm_bridge') and self.model_ref.hrm_bridge:
+            try:
+                # Try to get operation bias from the model
+                op_bias = getattr(self.model_ref, '_last_op_bias', {})
+                if op_bias:
+                    # Sample based on bias weights
+                    ops_list = list(op_bias.keys())
+                    weights = list(op_bias.values())
+                    if ops_list and weights:
+                        selected_op = random.choices(ops_list, weights=weights, k=1)[0]
+                        return selected_op, {}
+            except Exception:
+                pass
+        
+        # Fallback to uniform sampling
+        selected_op = random.choice(self.ops)
+        return selected_op, {}
+    
+    def apply(self, operation, grid, **params):
+        """Apply a DSL operation to a grid"""
+        try:
+            # Import DSL application function
+            from models.dsl_search import apply_program, DSLProgram
+            program = DSLProgram([operation])
+            return apply_program(program, grid)
+        except Exception as e:
+            print(f"[DSL-Shim] Warning: Failed to apply {operation}: {e}")
+            return grid  # Return unchanged grid on failure
 
 # HRM Planner imports - direct import from models directory
 try:
@@ -693,6 +739,11 @@ class TopasARC60M(nn.Module):
         print(f"[TOPAS] Initialized ARC {param_count:.1f}M model")
         if self._pretraining_mode:
             print(f"[TOPAS] Pretraining mode ENABLED - supports multi-head learning")
+        
+        # Initialize DSL shim for STaR bootstrapper compatibility
+        self.dsl = _DSLShim(self)
+        if self.config.verbose:
+            print(f"[TOPAS] DSL shim initialized for STaR compatibility ({len(DSL_OPS)} operations)")
     
     def init_object_mastery(self):
         """Initialize object mastery components - always integrated"""
@@ -702,6 +753,31 @@ class TopasARC60M(nn.Module):
         
         if self.config.verbose:
             print("[Object Mastery] Integrated with object slots and auxiliary losses")
+    
+    def run_program(self, program, input_grid):
+        """
+        Execute a DSL program on an input grid for trace verification.
+        Compatible with STaR bootstrapper trace validation.
+        
+        Args:
+            program: DSL program (list of operations or DSLProgram object)
+            input_grid: Input grid tensor
+            
+        Returns:
+            Output grid tensor after applying the program
+        """
+        try:
+            from models.dsl_search import apply_program, DSLProgram
+            
+            # Convert to DSLProgram if needed
+            if isinstance(program, list):
+                program = DSLProgram(program)
+            
+            return apply_program(program, input_grid)
+        except Exception as e:
+            if self.config.verbose:
+                print(f"[TOPAS] Warning: run_program failed: {e}")
+            return input_grid  # Return unchanged on failure
         
     def _flatten_logits(self, raw_logits, H: int, W: int):
         """Safely flatten logits from [B,C,H,W] or [B,H*W,C] to [B,H*W,C]"""
@@ -1114,11 +1190,24 @@ class TopasARC60M(nn.Module):
                 # Calculate CGE boost from brain features
                 cge_val = cge_boost(brain.unsqueeze(1), None, None)
                 
-                priors.update({
-                    "phi": phi_val,
-                    "kappa": kappa_val,
-                    "cge": cge_val
-                })
+                # Apply safety clamping to neuromorphic terms
+                try:
+                    phi_clamped, kappa_clamped, cge_clamped = clamp_neuromorphic_terms(phi_val, kappa_val, cge_val)
+                    priors.update({
+                        "phi": phi_clamped,
+                        "kappa": kappa_clamped,
+                        "cge": cge_clamped
+                    })
+                    if self.config.verbose:
+                        print(f"[Safety] Neuromorphic terms clamped: phi={float(phi_clamped):.4f}, kappa={float(kappa_clamped):.4f}, cge={float(cge_clamped):.4f}")
+                except Exception as clamp_error:
+                    # Fallback to unclamped values if clamping fails
+                    print(f"[WARN] Neuromorphic clamping failed: {clamp_error}, using unclamped values")
+                    priors.update({
+                        "phi": phi_val,
+                        "kappa": kappa_val,
+                        "cge": cge_val
+                    })
             except Exception as e:
                 print(f"[WARN] Metrics calculation failed: {e}, using defaults")
                 priors.update({
