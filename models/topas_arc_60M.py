@@ -3315,8 +3315,16 @@ class TopasARC60M(nn.Module):
         Returns:
             Dict with 'program' and 'final_grid' keys
         """
-        # Get input grid
-        input_grid = task.get('input', torch.zeros(1, 10, 10))
+        # Get input grid - handle both dataclass Task and dict-style task
+        if hasattr(task, "input"):
+            input_grid = task.input
+        elif isinstance(task, dict):
+            input_grid = task.get('input', torch.zeros(1, 10, 10))
+        else:
+            raise ValueError(f"Unsupported task type for sample_trace: {type(task)}")
+        
+        if input_grid is None:
+            input_grid = torch.zeros(1, 10, 10)
         if isinstance(input_grid, list):
             input_grid = torch.tensor(input_grid, dtype=torch.long)
         if input_grid.dim() == 2:

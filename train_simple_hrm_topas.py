@@ -66,7 +66,17 @@ def dopamine_reward(task: Task, buffer: Optional[SelfPlayBuffer], logger, global
     if buffer is None:
         return
     try:
-        buffer.buffer.append((task.input.detach().cpu(), task.output.detach().cpu()))
+        # Accept Task, dict, or (input, output) tuple/list
+        if hasattr(task, "input") and hasattr(task, "output"):
+            inp, out = task.input, task.output
+        elif isinstance(task, (list, tuple)) and len(task) == 2:
+            inp, out = task[0], task[1]
+        elif isinstance(task, dict):
+            inp, out = task.get("input"), task.get("output")
+        else:
+            raise TypeError(f"Unsupported task type for dopamine capture: {type(task)}")
+
+        buffer.buffer.append((inp.detach().cpu(), out.detach().cpu()))
         logger.info(f"[Dopamine] Stored 1 puzzle pair → buffer size={len(buffer.buffer)} at step {global_step}")
     except Exception as e:
         logger.warning(f"[Dopamine] buffer append failed: {e}")
@@ -86,7 +96,8 @@ def nightmare_prune(model, failures: List[Any], optimizer, scaler, device, logge
     model.train()
     optimizer.zero_grad(set_to_none=True)
     device_type = 'cuda' if str(device).startswith('cuda') else 'cpu'
-    total_neg = torch.tensor(0.0, device=device)
+
+    neg_terms = []  # collect per-failure negative CE terms to ensure a real graph
     with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
         for f in batch_failures:
             try:
@@ -96,26 +107,53 @@ def nightmare_prune(model, failures: List[Any], optimizer, scaler, device, logge
                     continue
                 inp = task.input.to(device).unsqueeze(0)   # [1, H, W]
                 tgt = task.output.to(device).unsqueeze(0)  # [1, H, W]
-                eval_out = model.evaluate_with_ebr(inp, tgt)  # returns dict with 'logits' if healthy
-                logits = eval_out.get('logits', None)
+
+                logits = None
+                # Prefer a grad-enabled path
+                try:
+                    out = model.forward_pretraining(inp, target_shape=tgt.shape[-2:])
+                    logits = out.get('logits', None) if isinstance(out, dict) else None
+                except Exception:
+                    logits = None
+
                 if logits is None:
+                    # Fallback to evaluate_with_ebr (may be no-grad depending on implementation)
+                    try:
+                        eval_out = model.evaluate_with_ebr(inp, tgt)
+                        logits = eval_out.get('logits', None)
+                    except Exception:
+                        logits = None
+
+                if logits is None or (isinstance(logits, torch.Tensor) and not logits.requires_grad):
+                    # Can't use this item for gradient-based pruning
                     continue
+
                 # Negative CE: move away from these bad solutions
                 ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                      tgt.view(-1).long().clamp(0, 9))
-                total_neg = total_neg + (-alpha * ce)
+                neg_terms.append(-alpha * ce)
             except Exception as e:
                 logger.debug(f"[Nightmare] skip one failure: {e}")
                 continue
-    # Backprop a small combined negative signal
-    if torch.isfinite(total_neg):
+
+    if len(neg_terms) == 0:
+        logger.info(f"[Nightmare] No grad-capable failures to prune at step {global_step} (skipped)")
+        return
+
+    # Aggregate (mean) to keep magnitude small and stable
+    total_neg = torch.stack(neg_terms).mean()
+
+    if torch.isfinite(total_neg) and total_neg.requires_grad:
         scaler.scale(total_neg).backward()
         # modest step; grads are small
         scaler.step(optimizer)
         scaler.update()
-        logger.info(f"[Nightmare] Applied negative replay on {len(batch_failures)} failures at step {global_step} (loss={float(total_neg.item()):.4f})")
+        logger.info(
+            f"[Nightmare] Applied negative replay on {len(neg_terms)}/{len(batch_failures)} "
+            f"failures at step {global_step} (loss={float(total_neg.item()):.4f})"
+        )
     else:
-        logger.warning("[Nightmare] Skipped due to non-finite loss")
+        logger.warning("[Nightmare] Skipped due to non-finite or no-grad loss")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train TOPAS+HRM (with DreamEngine controls)")
@@ -202,6 +240,15 @@ def parse_args():
                         help="Minimum steps between nightmare cycles (when failure low)")
     parser.add_argument("--nightmare-max-interval", type=int, default=1000,
                         help="Maximum steps between nightmare cycles (when failure high)")
+    # Mind-voice controls
+    parser.add_argument("--monologue-interval", type=int, default=200,
+                        help="Every N steps, sample traces and compute reasoning consistency")
+    parser.add_argument("--monologue-min-traces", type=int, default=4,
+                        help="Min number of traces to consider for consistency")
+    parser.add_argument("--monologue-consistency-target", type=float, default=0.85,
+                        help="Target overall consistency; below this we increase pruning, above this we ramp bias")
+    parser.add_argument("--monologue-selfplay-bonus", type=float, default=0.05,
+                        help="Increase self-play weight by this when consistency is high")
     
     args, _unknown = parser.parse_known_args()
     return args
@@ -983,6 +1030,52 @@ def main():
                 except Exception as e:
                     logger.warning(f"[Dopamine] capture pipeline skipped: {e}")
 
+            # --- Internal monologue (mind-voice) control-plane ---
+            try:
+                if cli_args and cli_args.monologue_interval > 0 and (global_step % cli_args.monologue_interval == 0):
+                    if 'task' not in locals() or task is None:
+                        # Build a minimal Task from current batch if not present
+                        demos, test_inputs, test_outputs, task_id = batch
+                        if demos and len(demos) > 0:
+                            grid_in = demos[0][0].to(device)
+                            grid_out = demos[0][1].to(device)
+                            task = Task(input=grid_in, output=grid_out, constraints={}, metadata={})
+                    if task is not None:
+                        # Half of traces guided by current op_bias (from dopamine counts)
+                        planner_bias = build_op_bias(temp=0.7)
+                        traces = star_bootstrapper.generate_diverse_traces(task, n_traces=max(6, cli_args.monologue_min_traces), planner_op_bias=planner_bias)
+                        vals = star_bootstrapper.verify_traces(traces, task)
+                        valid_traces = [t for t, v in zip(traces, vals) if v.is_valid or v.similarity_score >= 0.90]
+                        if len(valid_traces) >= 2:
+                            c_res = consistency_enforcer.enforce_consistency(valid_traces, task)
+                            monolog_score = c_res['metrics'].overall_consistency if c_res.get('metrics') else 0.0
+                            # Use monologue score to steer schedule:
+                            target = float(getattr(cli_args, "monologue_consistency_target", 0.85))
+                            if monolog_score >= target:
+                                # Confidence ↑ : gently ramp RelMem op-bias and reward self-play
+                                if hasattr(topas_model.config, 'relmem_op_bias_w'):
+                                    topas_model.config.relmem_op_bias_w = min(
+                                        getattr(topas_model.config, 'relmem_op_bias_w', 0.2) + 0.02,
+                                        getattr(topas_model.config, '_bias_max', 0.5)
+                                    )
+                                # Nudge self-play weight slightly
+                                if hasattr(cli_args, "selfplay_weight"):
+                                    cli_args.selfplay_weight = float(cli_args.selfplay_weight + cli_args.monologue_selfplay_bonus)
+                            else:
+                                # Reasoning shaky → increase nightmare pressure & shorten interval
+                                recent = getattr(cli_args, "nightmare_min_interval", 200)
+                                cli_args.nightmare_min_interval = max(100, int(0.75 * recent))
+                                # Queue a few counterexamples immediately
+                                try:
+                                    cex = counterexample_gen.generate_from_failure(task, topas_model, n_counterexamples=4)
+                                    if cex:
+                                        recent_failures.extend(cex)
+                                except Exception:
+                                    pass
+                            logger.info(f"[Monologue] consistency={monolog_score:.3f}, relmem_bias_w={getattr(topas_model.config,'relmem_op_bias_w',None)}")
+            except Exception as e:
+                logger.debug(f"[Monologue] skipped: {e}")
+
             # === Curriculum: escalate difficulty when breakthroughs persist ===
             if stable_breakthrough_steps >= 100:
                 try:
@@ -1242,19 +1335,46 @@ def main():
                                 target_shape=cached_batch['test_grid'].shape[-2:]
                             ) if cached_batch is not None else None
 
-                            dream_tokens = None
+                            hemi_stats = {}
                             if outputs is not None and "brain" in outputs and "slot_vecs" in outputs:
-                                brain = outputs["brain"]              # [B, 1152]
-                                slot_vecs = outputs["slot_vecs"]      # [B, T, 512]
+                                brain = outputs["brain"]         # [B, 1152] (symbolic/global)
+                                slot_vecs = outputs["slot_vecs"] # [B, T, 512] (perceptual/objects)
                                 B, T, _ = slot_vecs.shape
-                                # Expand brain across slots to produce [B, T, 1152]
-                                dream_tokens = brain.unsqueeze(1).expand(B, T, -1)
-
-                            if dream_tokens is None:
-                                # fallback: use whatever tokens the model cached
+                                # Left: symbolic (brain expanded to slots)
+                                left_tokens  = brain.unsqueeze(1).expand(B, T, -1)
+                                # Right: perceptual (use slot vectors; if Dream expects ctrl_dim, pad w/ zeros)
+                                if left_tokens.size(-1) != slot_vecs.size(-1):
+                                    pad = torch.zeros(B, T, left_tokens.size(-1) - slot_vecs.size(-1), device=slot_vecs.device)
+                                    right_tokens = torch.cat([slot_vecs, pad], dim=-1)
+                                else:
+                                    right_tokens = slot_vecs
+                                # Run both cycles
+                                hemi_stats['left']  = topas_model.run_dream_cycle(tokens=left_tokens,  demos_programs=outputs.get("extras", {}).get("programs") if outputs else None)
+                                hemi_stats['right'] = topas_model.run_dream_cycle(tokens=right_tokens, demos_programs=outputs.get("extras", {}).get("programs") if outputs else None)
+                                # Choose a winner (prefer refined EM if present)
+                                def score(s): 
+                                    if not isinstance(s, dict): return 0.0
+                                    return float(s.get("exact_match_refined") or s.get("em_ebr") or s.get("EM_ebr") or 0.0)
+                                left_score, right_score = score(hemi_stats['left']), score(hemi_stats['right'])
+                                winner = 'left' if left_score >= right_score else 'right'
+                                logging.info(f"[Dream-UniHemi] left={left_score:.3f} right={right_score:.3f} → winner={winner}")
+                                # Small, bounded nudge to priors based on winner
+                                if hasattr(topas_model.config, 'relmem_op_bias_w'):
+                                    delta = 0.02 if winner == 'left' else -0.01
+                                    topas_model.config.relmem_op_bias_w = float(
+                                        max(0.15, min(getattr(topas_model.config, 'relmem_op_bias_w', 0.2) + delta,
+                                                      getattr(topas_model.config, '_bias_max', 0.5)))
+                                    )
+                                # Optionally skew planner op_bias success counts slightly
+                                if winner == 'left':
+                                    op_success_count.update(["planner_align_bonus"])
+                                else:
+                                    op_success_count.update(["percept_align_bonus"])
+                                stats = hemi_stats[winner]
+                            else:
+                                # fallback: single-hemisphere like before
                                 dream_tokens = getattr(topas_model, "_dream_tokens", None)
-
-                            stats = topas_model.run_dream_cycle(tokens=dream_tokens, demos_programs=outputs.get("extras", {}).get("programs") if outputs else None)
+                                stats = topas_model.run_dream_cycle(tokens=dream_tokens, demos_programs=outputs.get("extras", {}).get("programs") if outputs else None)
                         except Exception as e:
                             logging.exception("[Dream] Full cycle failed: %s", e)
                         # If stats contains EM or other metrics, push into epoch_metrics for visibility
