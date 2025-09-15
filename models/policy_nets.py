@@ -33,9 +33,37 @@ class Episode:
     task_id: str = ""
     task_metadata: Dict = field(default_factory=dict)
 
-# Import canonical DSL operations
-from models.dsl_search import BeamCandidate, CORE_OPS
+# Import DSL registry for operation mapping
+from models.dsl_registry import IDX_TO_DSL_OP
 from models.utils import logits_from_grid, size_tensor_from_grid
+
+def stablemax_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable cross-entropy using log_softmax + nll_loss
+    Prevents overflow/underflow during breakthrough phases
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    return F.nll_loss(log_probs, targets)
+
+def op_logits_to_bias(op_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Convert operation logits to bias for DSL search
+    
+    Args:
+        op_logits: [num_ops] operation logits from policy network
+        temperature: Scaling factor for softmax conversion
+    
+    Returns:
+        Bias tensor compatible with DSL search operations
+    """
+    # Apply temperature scaling and normalize
+    scaled_logits = op_logits / temperature
+    op_probs = F.softmax(scaled_logits, dim=-1)
+    
+    # Convert to log probabilities for bias export
+    log_probs = torch.log(op_probs + 1e-8)  # Add epsilon for stability
+    
+    return log_probs
 
 @dataclass
 class PolicyPrediction:
@@ -281,8 +309,8 @@ class OpPolicyNet(nn.Module):
         
         self.idx_to_op = {v: k for k, v in self.op_to_idx.items()}
         
-    def forward(self, grid: torch.Tensor, rel_features: torch.Tensor,
-                size_oracle: torch.Tensor, theme_priors: torch.Tensor,
+    def forward(self, grid: torch.Tensor, rel_features: Optional[torch.Tensor] = None,
+                size_oracle: torch.Tensor = None, theme_priors: torch.Tensor = None,
                 program_ops: List[str] = None, seq_pos: int = 0) -> PolicyPrediction:
         """
         Predict next operation and parameters
@@ -299,6 +327,18 @@ class OpPolicyNet(nn.Module):
             PolicyPrediction with operation logits, parameters, and stop probability
         """
         B = grid.shape[0]
+        
+        # Handle optional rel_features with zeros fallback
+        if rel_features is None:
+            rel_features = torch.zeros(B, 64, device=grid.device)
+        
+        # Handle optional size_oracle and theme_priors
+        if size_oracle is None:
+            H, W = grid.shape[-2:]
+            size_oracle = torch.tensor([[H, W, H, W]], device=grid.device).float().expand(B, -1)
+        
+        if theme_priors is None:
+            theme_priors = torch.zeros(B, 10, device=grid.device)
         
         # Extract context features
         context_feat = self.context_extractor(
@@ -414,10 +454,10 @@ class OpPolicyNet(nn.Module):
                     pred = self.forward(current_grid, rel_features, size_oracle, 
                                       theme_priors, partial_program[:-1], step)
                     
-                    # Operation loss
+                    # Operation loss using stable cross-entropy
                     target_op_idx = self.op_to_idx[target_op]
-                    op_loss = F.cross_entropy(pred.op_logits, 
-                                            torch.tensor([target_op_idx], device=current_grid.device))
+                    op_loss = stablemax_cross_entropy(pred.op_logits, 
+                                                    torch.tensor([target_op_idx], device=current_grid.device))
                     total_loss = total_loss + op_loss
                     losses['op'] += op_loss.item()
                     
@@ -612,8 +652,8 @@ class MetaContextExtractor(ContextFeatureExtractor):
         
         return adaptation_context
     
-    def forward(self, grid: torch.Tensor, rel_features: torch.Tensor,
-                size_oracle: torch.Tensor, theme_priors: torch.Tensor,
+    def forward(self, grid: torch.Tensor, rel_features: Optional[torch.Tensor] = None,
+                size_oracle: torch.Tensor = None, theme_priors: torch.Tensor = None,
                 program_ops: List[str] = None, episode: Episode = None,
                 support_demos: List[Dict] = None) -> torch.Tensor:
         """Enhanced forward pass with task and adaptation context"""
@@ -701,8 +741,8 @@ class MetaOpPolicyNet(OpPolicyNet):
         print(f"[MetaOpPolicyNet] Enhanced with meta-learning capabilities")
         print(f"[MetaOpPolicyNet] Fast adaptation layers: {len(self.fast_weights)}")
     
-    def forward(self, grid: torch.Tensor, rel_features: torch.Tensor,
-                size_oracle: torch.Tensor, theme_priors: torch.Tensor,
+    def forward(self, grid: torch.Tensor, rel_features: Optional[torch.Tensor] = None,
+                size_oracle: torch.Tensor = None, theme_priors: torch.Tensor = None,
                 program_ops: List[str] = None, seq_pos: int = 0,
                 episode: Episode = None, support_demos: List[Dict] = None,
                 use_adapted_weights: bool = False) -> PolicyPrediction:
@@ -724,6 +764,18 @@ class MetaOpPolicyNet(OpPolicyNet):
             PolicyPrediction with enhanced meta-learning features
         """
         B = grid.shape[0]
+        
+        # Handle optional rel_features with zeros fallback
+        if rel_features is None:
+            rel_features = torch.zeros(B, 64, device=grid.device)
+        
+        # Handle optional size_oracle and theme_priors
+        if size_oracle is None:
+            H, W = grid.shape[-2:]
+            size_oracle = torch.tensor([[H, W, H, W]], device=grid.device).float().expand(B, -1)
+        
+        if theme_priors is None:
+            theme_priors = torch.zeros(B, 10, device=grid.device)
         
         # Extract enhanced context features
         context_feat = self.context_extractor(
@@ -903,8 +955,8 @@ class MetaOpPolicyNet(OpPolicyNet):
         target_op = self._infer_target_operation(input_grid, output_grid)
         target_idx = self.op_to_idx.get(target_op, 0)
         
-        # Cross-entropy loss on operation prediction
-        op_loss = F.cross_entropy(pred.op_logits, torch.tensor([target_idx], device=pred.op_logits.device))
+        # Cross-entropy loss on operation prediction using stable version
+        op_loss = stablemax_cross_entropy(pred.op_logits, torch.tensor([target_idx], device=pred.op_logits.device))
         
         # Encourage higher confidence for clearer transformations
         confidence_target = torch.tensor([0.8], device=pred.confidence.device)

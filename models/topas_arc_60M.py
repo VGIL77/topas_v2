@@ -63,48 +63,104 @@ from models.dsl_registry import DSL_OPS
 # DSL Shim for STaR compatibility - provides facade for DSL operations
 class _DSLShim:
     """
-    Provides DSL operation facade for STaR bootstrapper compatibility.
-    Exposes sample_operation() and apply() methods for trace generation.
+    Enhanced param-aware DSL shim for STaR bootstrapper compatibility.
+    Provides intelligent parameter defaults and HRM guidance.
     """
     def __init__(self, model_ref):
         self.model_ref = model_ref
+        from models.dsl_registry import DSL_OPS
         self.ops = DSL_OPS
-    
+
     def sample_operation(self, grid=None, brain=None, temperature=0.7):
-        """Sample a DSL operation for trace generation"""
         import random
         if not self.ops:
             return "identity", {}
-        
-        # Use model's operation bias if available
-        if hasattr(self.model_ref, 'hrm_bridge') and self.model_ref.hrm_bridge:
-            try:
-                # Try to get operation bias from the model
-                op_bias = getattr(self.model_ref, '_last_op_bias', {})
-                if op_bias:
-                    # Sample based on bias weights
-                    ops_list = list(op_bias.keys())
-                    weights = list(op_bias.values())
-                    if ops_list and weights:
-                        selected_op = random.choices(ops_list, weights=weights, k=1)[0]
-                        return selected_op, {}
-            except Exception:
-                pass
-        
-        # Fallback to uniform sampling
+
         selected_op = random.choice(self.ops)
-        return selected_op, {}
-    
+        return selected_op, self._default_params(selected_op, grid)
+
     def apply(self, operation, grid, **params):
-        """Apply a DSL operation to a grid"""
         try:
-            # Import DSL application function
-            from models.dsl_search import apply_program, DSLProgram
-            program = DSLProgram([operation])
+            from models.dsl_search import DSLProgram, apply_program
+            if not params:
+                # 1. First try HRM bridge priors
+                params = self._params_from_hrm(operation, grid)
+                # 2. If HRM gave nothing, fallback to defaults
+                if not params:
+                    params = self._default_params(operation, grid)
+
+            program = DSLProgram([(operation, params)])
             return apply_program(program, grid)
         except Exception as e:
-            print(f"[DSL-Shim] Warning: Failed to apply {operation}: {e}")
-            return grid  # Return unchanged grid on failure
+            import logging
+            logging.debug(f"[DSL-Shim] Failed to apply {operation}: {e}")
+            return grid
+
+    def _params_from_hrm(self, op, grid):
+        """Use HRM bridge control signals to bias parameters."""
+        try:
+            if hasattr(self.model_ref, "hrm_bridge") and self.model_ref.hrm_bridge:
+                ctrl = getattr(self.model_ref, "_last_hrm_control", {})
+                if not ctrl:
+                    return {}
+                # Example: HRM outputs dx/dy logits for translate
+                if op == "translate" and "dx_logits" in ctrl and "dy_logits" in ctrl:
+                    import torch
+                    dx = int(torch.argmax(ctrl["dx_logits"]).item()) - 2
+                    dy = int(torch.argmax(ctrl["dy_logits"]).item()) - 2
+                    return {"dx": dx, "dy": dy}
+                if op == "color_map" and "color_map_logits" in ctrl:
+                    # Build mapping from logits
+                    import torch
+                    probs = torch.softmax(ctrl["color_map_logits"], dim=-1)
+                    mapping = {i: int(probs[i].argmax().item()) for i in range(10)}
+                    return {"mapping": mapping}
+                # Add other parametric ops similarly...
+        except Exception:
+            pass
+        return {}
+
+    def _default_params(self, op, grid=None):
+        import numpy as np, torch
+        params = {}
+        if grid is not None and torch.is_tensor(grid):
+            H, W = grid.shape[-2:]
+        else:
+            H, W = 5, 5  # safe defaults
+
+        if op == "translate":
+            params = {"dx": np.random.randint(-2, 3), "dy": np.random.randint(-2, 3)}
+        elif op == "flood_fill":
+            params = {"x": np.random.randint(0, W), "y": np.random.randint(0, H), "color": np.random.randint(1, 10)}
+        elif op == "color_map":
+            mapping = {i: (i + 1) % 10 for i in range(10)}
+            params = {"mapping": mapping}
+        elif op == "rotate90":
+            params = {}
+        elif op == "rotate180":
+            params = {}
+        elif op == "rotate270":
+            params = {}
+        elif op == "flip_h":
+            params = {}
+        elif op == "flip_v":
+            params = {}
+        elif op == "outline":
+            params = {"color": np.random.randint(1, 10)}
+        elif op == "extract_pattern":
+            params = {"size": np.random.randint(1, min(H, W)+1)}
+        elif op in ["resize", "resize_nn", "scale"]:
+            fx, fy = np.random.randint(1, 3), np.random.randint(1, 3)
+            params = {"sx": fx, "sy": fy} if "resize" in op else {"fx": fx, "fy": fy}
+        elif op in ["crop_bbox", "crop_nonzero", "center_pad_to"]:
+            params = {"H": H, "W": W, "pad": 0}
+        elif op in ["for_each_object_translate", "for_each_object_scale", "for_each_object_recolor"]:
+            params = {"dx": 1, "dy": 0} if "translate" in op else {"factor": 2}
+        elif op == "conditional_map":
+            params = {"condition": "nonzero", "value": 1}
+        elif op == "select_by_property":
+            params = {"prop": "color", "value": 1}
+        return params
 
 # HRM Planner imports - direct import from models directory
 try:
@@ -474,7 +530,16 @@ class TopasARC60M(nn.Module):
     - Energy-based refinement for polish
     - Sacred signature compliance
     """
-    
+
+    def _ensure_tensor(self, x, device="cpu"):
+        """Helper to ensure input is a tensor, not a list or other type."""
+        import numpy as np
+        if torch.is_tensor(x):
+            return x
+        if isinstance(x, (list, tuple, np.ndarray)):
+            return torch.as_tensor(x, device=device)
+        return x
+
     def __init__(self, config: Optional[ModelConfig] = None):
         super().__init__()
         
@@ -744,7 +809,15 @@ class TopasARC60M(nn.Module):
         self.dsl = _DSLShim(self)
         if self.config.verbose:
             print(f"[TOPAS] DSL shim initialized for STaR compatibility ({len(DSL_OPS)} operations)")
-    
+
+        # Optional: one-shot external policy bias (set from trainer)
+        self._external_op_bias = None
+
+    # Convenience setter (optional but tidy)
+    def set_external_op_bias(self, op_bias: Dict[str, float]):
+        if isinstance(op_bias, dict):
+            self._external_op_bias = {str(k): float(v) for k, v in op_bias.items()}
+
     def init_object_mastery(self):
         """Initialize object mastery components - always integrated"""
         # Components already exist in slots and model
@@ -980,8 +1053,14 @@ class TopasARC60M(nn.Module):
                     # Run HRM planner to get reasoning states
                     tokens = self.grid_to_tokens(enc_in)  # [B, seq_len]
                     puzzle_ids = torch.zeros(tokens.size(0), dtype=torch.long, device=tokens.device)
-                    planner_batch = {"inputs": tokens, "labels": tokens, "puzzle_identifiers": puzzle_ids}
-                    
+
+                    # Ensure all batch elements are tensors for HRM compatibility with gradients
+                    planner_batch = {
+                        "inputs": self._ensure_tensor(tokens.clone().detach().requires_grad_(True), device=tokens.device),
+                        "labels": self._ensure_tensor(tokens.clone().detach().requires_grad_(True), device=tokens.device),
+                        "puzzle_identifiers": self._ensure_tensor(puzzle_ids, device=tokens.device)
+                    }
+
                     carry = self.planner.initial_carry(planner_batch)
                     carry, hrm_outputs = self.planner(carry=carry, batch=planner_batch)
                     
@@ -1044,6 +1123,27 @@ class TopasARC60M(nn.Module):
             # Normalize to [B, K, D]
             if slot_vecs.dim() == 2:   # e.g., [B, D] → assume K=1
                 slot_vecs = slot_vecs.unsqueeze(1)
+
+            # === HRM FiLM conditioning in main forward ===
+            # Use z_H (or z_L) from HRM to modulate slot features before relational reasoning.
+            if hrm_context is not None and (hrm_context.get('z_H') is not None or hrm_context.get('z_L') is not None):
+                try:
+                    zH = hrm_context.get('z_H')
+                    zL = hrm_context.get('z_L')
+                    hrm_lat = zH if zH is not None else zL
+                    # Collapse sequence if necessary
+                    if hrm_lat is not None:
+                        if hrm_lat.dim() == 3:   # [B, T, D] → [B, D]
+                            hrm_lat = hrm_lat.mean(dim=1)
+                        if not torch.is_floating_point(hrm_lat):
+                            hrm_lat = hrm_lat.float()
+                        gamma, beta = self.hrm_to_film(hrm_lat).chunk(2, dim=-1)  # [B, D], [B, D]
+                        # Broadcast to slots: [B, 1, D]
+                        slot_vecs = slot_vecs * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"[HRM-FiLM] Skipped FiLM due to: {e}")
+
             assert slot_vecs.dim() == 3, f"Expected slot_vecs [B,K,D], got {tuple(slot_vecs.shape)}"
             slots_rel = self.reln(slot_vecs)
             pooled = slots_rel.mean(dim=1)  # [B, slot_dim]
@@ -1083,14 +1183,15 @@ class TopasARC60M(nn.Module):
                 # tokens: slot-level relational embeddings [B, T, D]
                 tokens = slots_rel                       # [B, T, D]
                 ctx, _ = self.relmem(tokens, state=None, top_k=min(128, tokens.size(1)))
-                ctx_pool = ctx.mean(dim=1)               # [B, D]
-                
-                # PROPER FIDELITY FIX: Project and mix relational context, don't just concatenate
-                if not hasattr(self, 'relmem_proj'):
-                    self.relmem_proj = nn.Linear(ctx_pool.shape[-1], brain.shape[-1]).to(brain.device)
-                
-                ctx_proj = self.relmem_proj(ctx_pool)    # [B, ctrl_dim] 
-                brain = brain + ctx_proj  # Residual addition instead of concat - maintains 1024
+                ctx_pool = ctx.mean(dim=1)               # [B, Drel]
+
+                # Project if mismatch
+                if ctx_pool.shape[-1] != brain.shape[-1]:
+                    if not hasattr(self, "relmem_proj") or self.relmem_proj.in_features != ctx_pool.shape[-1]:
+                        self.relmem_proj = nn.Linear(ctx_pool.shape[-1], brain.shape[-1]).to(brain.device)
+                    ctx_pool = self.relmem_proj(ctx_pool)
+
+                brain = brain + ctx_pool  # Residual addition with matched dims
                 
                 # === RelMem auto-binding + post-update hooks ===
                 # Auto-bind slot or brain concepts each forward pass
@@ -1254,9 +1355,14 @@ class TopasARC60M(nn.Module):
                         current_search_depth=depth
                     )
                     
-                    # Extract DSL operation biases
-                    dsl_op_biases = bridge_outputs.get('dsl_op_biases')
+                    # Extract DSL operation biases and param priors
+                    dsl_op_biases   = bridge_outputs.get('dsl_op_biases')
                     control_signals = bridge_outputs.get('control_signals')
+                    param_priors    = bridge_outputs.get('param_priors')
+
+                    # Stash param priors for DSL shim to consume
+                    if param_priors is not None:
+                        self._last_hrm_control = param_priors
                     
                     if dsl_op_biases is not None:
                         from models.dsl_registry import DSL_OPS
@@ -1269,6 +1375,14 @@ class TopasARC60M(nn.Module):
                         )
                         depth = adapted_depth
                         beam_w = adapted_beam
+                        # Export to extras for monitoring
+                        extras.setdefault("hrm", {})
+                        try:
+                            extras["hrm"]["should_halt"] = bool(control_signals.get("should_halt", False))
+                            conf = control_signals.get("confidence", torch.tensor(0.5))
+                            extras["hrm"]["confidence"] = float(conf.mean().item() if torch.is_tensor(conf) else conf)
+                        except Exception:
+                            pass
                         
                         if self.config.verbose:
                             should_halt = control_signals.get('should_halt', torch.tensor(False))
@@ -1311,6 +1425,16 @@ class TopasARC60M(nn.Module):
             # Get detected operation bias from relation manager
             from models.dsl_registry import DSL_OPS
             op_bias = self.relman.op_bias()
+
+            # Merge external policy bias if present (one-shot)
+            ext = getattr(self, "_external_op_bias", None)
+            if isinstance(ext, dict) and ext:
+                for k, v in ext.items():
+                    if k in DSL_OPS:
+                        # conservative merge: keep the stronger bias
+                        op_bias[k] = max(op_bias.get(k, 0.0), float(v))
+                # consume once to avoid stale reuse
+                self._external_op_bias = None
             
             # === Enhanced RelMem Contextual Bias Fusion ===
             theme_embed = None  # Will be used for both RelMem and EBR
@@ -1949,7 +2073,13 @@ class TopasARC60M(nn.Module):
         if self.relmem is not None:
             try:
                 inv_w = float(getattr(self.config, "relmem_inverse_loss_w", 0.05))
-                aux_loss = aux_loss + inv_w * self.relmem.inverse_loss_safe()
+                try:
+                    inv_loss = self.relmem.inverse_loss_safe()
+                    if inv_loss.dim() > 0:  # guard against scalar 0D tensors
+                        aux_loss = aux_loss + inv_w * inv_loss
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"[RelMem] inverse_loss skipped: {e}")
             except Exception:
                 pass
         extras["aux_loss"] = extras.get("aux_loss", 0.0) + aux_loss
@@ -3111,7 +3241,12 @@ class TopasARC60M(nn.Module):
                     inv_loss = self.relmem.compute_inverse_loss()
                 else:
                     inv_loss = torch.tensor(0.0)
-                losses["relmem_inverse_loss"] = inv_loss * self.config.relmem_inverse_loss_w
+
+                # Guard against 0D tensors from inverse loss
+                if inv_loss.dim() > 0:
+                    losses["relmem_inverse_loss"] = inv_loss * self.config.relmem_inverse_loss_w
+                else:
+                    losses["relmem_inverse_loss"] = torch.tensor(0.0)
                 
                 import logging
                 # Enhanced logging probe for inverse loss
@@ -3429,7 +3564,8 @@ class TopasARC60M(nn.Module):
             brain = features.mean(dim=[2, 3])  # Global pooling
             
             # Sample operations from DSL
-            trace = []
+            # Hashable, STaR-friendly trace: sequence of operation *names* (strings)
+            trace_ops: List[str] = []
             current_grid = input_grid.clone()
             
             for _ in range(max_length):
@@ -3442,22 +3578,22 @@ class TopasARC60M(nn.Module):
                     op = ops[torch.randint(0, len(ops), (1,)).item()]
                     params = {}
                 
-                trace.append((op, params))
+                trace_ops.append(op)  # store only the op *name* for hashing/dedup
                 
                 # Stop if identity (no-op)
                 if op == 'identity':
                     break
                 
-                # Apply operation (simplified)
-                if hasattr(self.dsl, op):
-                    try:
-                        current_grid = getattr(self.dsl, op)(current_grid, **params)
-                    except:
-                        pass
+                # Optional: best-effort application using the generic apply facade.
+                # Your DSL shim ignores params anyway and builds DSLProgram([op]).
+                try:
+                    current_grid = self.dsl.apply(op, current_grid)
+                except Exception:
+                    pass
             
             # Return in required format
             return {
-                "program": trace,
+                "program": trace_ops,  # list[str], hashable and STaR-safe
                 "final_grid": current_grid.squeeze(0) if current_grid.dim() > 2 else current_grid
             }
     

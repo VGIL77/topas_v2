@@ -15,6 +15,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
+# Import canonical DSL operations from registry
+from models.dsl_registry import DSL_OPS
+
 # ======================================================
 # DSL Program + Core Operations (migrated from dsl_head.py)
 # ======================================================
@@ -33,6 +36,250 @@ class DSLProgram:
 
     def __getitem__(self, idx):
         return (self.ops[idx], self.params[idx])
+
+
+# Restrict to actually implemented operations
+IMPLEMENTED_OPS = {
+    "identity", "rotate90", "rotate180", "rotate270",
+    "flip_h", "flip_v", "color_map", "crop_bbox",
+    "flood_fill", "outline", "translate", "scale", "resize_nn",
+    "extract_objects", "fill_pattern",
+    "for_each_object", "for_each_object_translate", "for_each_object_recolor",
+    "for_each_object_rotate", "for_each_object_scale", "for_each_object_flip"
+}
+
+
+# ======================================================
+# Per-object Operation Utilities
+# ======================================================
+
+def _extract_components(grid: torch.Tensor, target_color: int = None) -> List[Dict]:
+    """Extract connected components/objects from grid"""
+    objects = []
+    H, W = grid.shape
+    visited = torch.zeros_like(grid, dtype=torch.bool)
+    
+    # If target_color specified, only extract that color
+    colors_to_extract = [target_color] if target_color is not None else torch.unique(grid).tolist()
+    colors_to_extract = [c for c in colors_to_extract if c != 0]  # Exclude background
+    
+    for color in colors_to_extract:
+        color_mask = (grid == color)
+        
+        for i in range(H):
+            for j in range(W):
+                if color_mask[i, j] and not visited[i, j]:
+                    # Found new component - extract it
+                    component_mask = torch.zeros_like(grid, dtype=torch.bool)
+                    stack = [(i, j)]
+                    
+                    # Flood fill to get all connected pixels
+                    while stack:
+                        ci, cj = stack.pop()
+                        if (ci < 0 or ci >= H or cj < 0 or cj >= W or 
+                            visited[ci, cj] or not color_mask[ci, cj]):
+                            continue
+                        
+                        visited[ci, cj] = True
+                        component_mask[ci, cj] = True
+                        
+                        # Add 4-connected neighbors
+                        for di, dj in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                            stack.append((ci + di, cj + dj))
+                    
+                    # Extract bounding box and local grid
+                    nonzero = torch.nonzero(component_mask)
+                    if len(nonzero) > 0:
+                        min_r, min_c = nonzero.min(dim=0).values
+                        max_r, max_c = nonzero.max(dim=0).values
+                        
+                        # Extract object region
+                        object_region = grid[min_r:max_r+1, min_c:max_c+1].clone()
+                        object_mask = component_mask[min_r:max_r+1, min_c:max_c+1]
+                        
+                        # Set non-object pixels to background
+                        object_region[~object_mask] = 0
+                        
+                        objects.append({
+                            'grid': object_region,
+                            'mask': object_mask,
+                            'bbox': (min_r.item(), min_c.item(), max_r.item(), max_c.item()),
+                            'color': color,
+                            'size': object_mask.sum().item()
+                        })
+    
+    return objects
+
+
+def _bbox_from_mask(mask: torch.Tensor) -> Tuple[int, int, int, int]:
+    """Get bounding box from mask"""
+    nonzero = torch.nonzero(mask)
+    if len(nonzero) > 0:
+        min_r, min_c = nonzero.min(dim=0).values
+        max_r, max_c = nonzero.max(dim=0).values
+        return (min_r.item(), min_c.item(), max_r.item(), max_c.item())
+    return (0, 0, 0, 0)
+
+
+def _apply_per_object(grid: torch.Tensor, operation: str, params: Dict[str, Any]) -> torch.Tensor:
+    """Apply operation to each object in the grid"""
+    objects = _extract_components(grid)
+    result = torch.zeros_like(grid)
+    
+    for obj in objects:
+        obj_grid = obj['grid']
+        bbox = obj['bbox']
+        
+        # Apply operation to this object
+        if operation == 'rotate90':
+            transformed = torch.rot90(obj_grid, k=-1, dims=(0, 1))
+        elif operation == 'rotate180':
+            transformed = torch.rot90(obj_grid, k=2, dims=(0, 1))
+        elif operation == 'rotate270':
+            transformed = torch.rot90(obj_grid, k=1, dims=(0, 1))
+        elif operation == 'flip_h':
+            transformed = torch.flip(obj_grid, dims=(1,))
+        elif operation == 'flip_v':
+            transformed = torch.flip(obj_grid, dims=(0,))
+        elif operation == 'color_map':
+            mapping = params.get('mapping', {})
+            transformed = obj_grid.clone()
+            for old_c, new_c in mapping.items():
+                transformed[transformed == old_c] = new_c
+        elif operation == 'translate':
+            dx, dy = params.get('dx', 0), params.get('dy', 0)
+            transformed = _translate_grid(obj_grid, dx, dy)
+        else:
+            transformed = obj_grid  # Default: no change
+        
+        # Place transformed object back (handle size changes)
+        min_r, min_c, max_r, max_c = bbox
+        th, tw = transformed.shape
+        
+        # Try to place at original position, clipping if necessary
+        end_r = min(min_r + th, grid.shape[0])
+        end_c = min(min_c + tw, grid.shape[1])
+        
+        placed_h = end_r - min_r
+        placed_w = end_c - min_c
+        
+        if placed_h > 0 and placed_w > 0:
+            region = result[min_r:end_r, min_c:end_c]
+            obj_part = transformed[:placed_h, :placed_w]
+            
+            # Only place non-background pixels
+            mask = obj_part != 0
+            region[mask] = obj_part[mask]
+    
+    return result
+
+
+def extract_objects(grid: torch.Tensor, color: int = None) -> torch.Tensor:
+    """Extract objects of specified color (or all non-background if None)"""
+    objects = _extract_components(grid, target_color=color)
+    result = torch.zeros_like(grid)
+    
+    for obj in objects:
+        bbox = obj['bbox']
+        min_r, min_c, max_r, max_c = bbox
+        result[min_r:max_r+1, min_c:max_c+1] = obj['grid']
+    
+    return result
+
+
+def fill_pattern(grid: torch.Tensor, pattern: str = 'solid') -> torch.Tensor:
+    """Fill objects with specified pattern"""
+    if pattern == 'solid':
+        return grid  # Already solid
+    elif pattern == 'checkerboard':
+        result = grid.clone()
+        H, W = result.shape
+        
+        # Create checkerboard mask
+        for i in range(H):
+            for j in range(W):
+                if result[i, j] != 0:  # Non-background
+                    if (i + j) % 2 == 0:
+                        result[i, j] = result[i, j]  # Keep original
+                    else:
+                        result[i, j] = 0  # Make background
+        return result
+    else:
+        return grid  # Default: no change
+
+
+def for_each_object_translate(grid: torch.Tensor, dx: int = 0, dy: int = 0) -> torch.Tensor:
+    """Translate each object by dx, dy"""
+    return _apply_per_object(grid, 'translate', {'dx': dx, 'dy': dy})
+
+
+def for_each_object_recolor(grid: torch.Tensor, color_map: Dict[int, int]) -> torch.Tensor:
+    """Recolor each object according to color_map"""
+    return _apply_per_object(grid, 'color_map', {'mapping': color_map})
+
+
+def for_each_object_rotate(grid: torch.Tensor, rotation: str = 'rotate90') -> torch.Tensor:
+    """Rotate each object"""
+    return _apply_per_object(grid, rotation, {})
+
+
+def for_each_object_scale(grid: torch.Tensor, fy: int = 2, fx: int = None) -> torch.Tensor:
+    """Scale each object (fx defaults to fy if not specified)"""
+    if fx is None:
+        fx = fy
+    
+    objects = _extract_components(grid)
+    result = torch.zeros_like(grid)  # May need to resize later
+    
+    for obj in objects:
+        obj_grid = obj['grid']
+        bbox = obj['bbox']
+        
+        # Scale the object
+        scaled = torch.nn.functional.interpolate(
+            obj_grid.unsqueeze(0).unsqueeze(0).float(),
+            scale_factor=(fy, fx),
+            mode="nearest"
+        ).squeeze().long()
+        
+        # Place scaled object back
+        min_r, min_c, max_r, max_c = bbox
+        sh, sw = scaled.shape
+        
+        # Extend result grid if needed
+        new_h = max(result.shape[0], min_r + sh)
+        new_w = max(result.shape[1], min_c + sw)
+        
+        if new_h > result.shape[0] or new_w > result.shape[1]:
+            new_result = torch.zeros(new_h, new_w, dtype=result.dtype)
+            new_result[:result.shape[0], :result.shape[1]] = result
+            result = new_result
+        
+        # Place non-background pixels
+        end_r = min(min_r + sh, result.shape[0])
+        end_c = min(min_c + sw, result.shape[1])
+        
+        if end_r > min_r and end_c > min_c:
+            placed_h = end_r - min_r
+            placed_w = end_c - min_c
+            
+            region = result[min_r:end_r, min_c:end_c]
+            obj_part = scaled[:placed_h, :placed_w]
+            
+            mask = obj_part != 0
+            region[mask] = obj_part[mask]
+    
+    return result
+
+
+def for_each_object_flip(grid: torch.Tensor, direction: str = 'flip_h') -> torch.Tensor:
+    """Flip each object"""
+    return _apply_per_object(grid, direction, {})
+
+
+def for_each_object(grid: torch.Tensor, operation: str = 'rotate90', **kwargs) -> torch.Tensor:
+    """Generic per-object operation"""
+    return _apply_per_object(grid, operation, kwargs)
 
 
 def apply_program(grid: torch.Tensor, program: DSLProgram) -> torch.Tensor:
@@ -83,6 +330,31 @@ def apply_program(grid: torch.Tensor, program: DSLProgram) -> torch.Tensor:
         elif op == "scale":
             fx, fy = p.get("fx", 2), p.get("fy", 2)
             out = _scale_grid(out, fx, fy)
+        # Per-object operations
+        elif op == "extract_objects":
+            color = p.get("color", None)
+            out = extract_objects(out, color)
+        elif op == "fill_pattern":
+            pattern = p.get("pattern", "solid")
+            out = fill_pattern(out, pattern)
+        elif op == "for_each_object_translate":
+            dx, dy = p.get("dx", 0), p.get("dy", 0)
+            out = for_each_object_translate(out, dx, dy)
+        elif op == "for_each_object_recolor":
+            color_map = p.get("color_map", {})
+            out = for_each_object_recolor(out, color_map)
+        elif op == "for_each_object_rotate":
+            rotation = p.get("rotation", "rotate90")
+            out = for_each_object_rotate(out, rotation)
+        elif op == "for_each_object_scale":
+            fy, fx = p.get("fy", 2), p.get("fx", None)
+            out = for_each_object_scale(out, fy, fx)
+        elif op == "for_each_object_flip":
+            direction = p.get("direction", "flip_h")
+            out = for_each_object_flip(out, direction)
+        elif op == "for_each_object":
+            operation = p.get("operation", "rotate90")
+            out = for_each_object(out, operation, **{k: v for k, v in p.items() if k != "operation"})
         else:
             continue  # Skip unknown operations
     return out
@@ -158,12 +430,8 @@ def _scale_grid(grid: torch.Tensor, fx: int, fy: int) -> torch.Tensor:
     ).squeeze().long()
 
 
-# Core DSL operations list
-CORE_OPS = [
-    "identity", "rotate90", "rotate180", "rotate270",
-    "flip_h", "flip_v", "color_map", "crop_bbox",
-    "flood_fill", "outline", "translate", "scale", "resize_nn"
-]
+# Use registry-based operations instead of hardcoded list
+CORE_OPS = [op for op in DSL_OPS if op in IMPLEMENTED_OPS]
 
 # ======================================================
 # End DSL Operations Migration
@@ -307,7 +575,7 @@ COMMON_PATTERNS = [
     )
 ]
 
-def verify_candidate(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any) -> bool:
+def verify_candidate(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any = None) -> bool:
     """Check if candidate solves all demonstrations with enhanced error handling"""
     try:
         for inp, out in demos:
@@ -325,7 +593,7 @@ def verify_candidate(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any
             
             # Apply candidate program with timeout protection
             try:
-                pred = candidate.apply(inp, dsl_head)
+                pred = candidate.apply(inp)
             except Exception as e:
                 logger.debug(f"Program execution failed: {e}")
                 return False
@@ -344,7 +612,7 @@ def verify_candidate(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any
         return False
 
 
-def compute_heuristic_score(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any) -> float:
+def compute_heuristic_score(candidate: BeamCandidate, demos: List[Tuple], dsl_head: Any = None) -> float:
     """Compute A* heuristic score (admissible estimate of remaining cost)"""
     heuristic = 0.0
     
@@ -363,7 +631,7 @@ def compute_heuristic_score(candidate: BeamCandidate, demos: List[Tuple], dsl_he
                 out = torch.from_numpy(out)
             
             try:
-                pred = candidate.apply(inp, dsl_head)
+                pred = candidate.apply(inp)
                 # Compute structural similarity
                 if pred.shape == out.shape:
                     similarity = (pred == out).float().mean().item()
@@ -439,7 +707,7 @@ def score_candidate(candidate: BeamCandidate, demos: List[Tuple], priors: Dict, 
                 pred = cached_result
             else:
                 try:
-                    pred = candidate.apply(inp, dsl_head)
+                    pred = candidate.apply(inp)
                     if cache:
                         cache.put(candidate.program_hash, input_hash, pred)
                 except Exception as e:
@@ -968,7 +1236,7 @@ def enhanced_astar_search(demos, test, priors, dsl_head, template_library, cache
             if verify_candidate(candidate, demos, dsl_head):
                 if verbose:
                     print(f"[BEAM] Template solution found: {candidate.ops}")
-                result = candidate.apply(test, dsl_head)
+                result = candidate.apply(test)
                 if return_rule_info:
                     return result, {"program": candidate.ops}
                 return result
@@ -1027,7 +1295,7 @@ def enhanced_astar_search(demos, test, priors, dsl_head, template_library, cache
                 if verify_candidate(expansion, demos, dsl_head):
                     if verbose:
                         print(f"[BEAM] Solution found at depth {expansion.depth}: {expansion.ops}")
-                    result = expansion.apply(test, dsl_head)
+                    result = expansion.apply(test)
                     if return_rule_info:
                         return result, {"program": expansion.ops}
                     return result

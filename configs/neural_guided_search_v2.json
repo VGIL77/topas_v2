@@ -1,0 +1,263 @@
+{
+  "_description": "Neural-Guided Search 2.0 Training Configuration",
+  "_version": "1.0.0",
+  "_phases": "2 -> 3 -> 4 -> 6 -> 7 (Meta Learning -> Self Critique -> MCTS Alpha -> Neuro Priors -> RelMem + Biological)",
+
+  "device": "cuda",
+  "log_dir": "logs/ngs2",
+  "checkpoint_dir": "checkpoints/ngs2",
+  "max_retries": 3,
+  "enable_recovery": true,
+  "continue_on_failure": false,
+  "hrm_integration_enabled": true,
+
+  "_comment_model": "TOPAS 60M+ model configuration - scaled for breakthrough performance",
+  "model": {
+    "model_width": 640,
+    "model_slots": 64,
+    "vocab_size": 10,
+    "max_seq_len": 2048,
+    "num_heads": 8,
+    "num_layers": 12,
+    "slot_dim": 640,
+    "dropout": 0.1,
+    "layer_norm_eps": 1e-5
+  },
+
+  "_comment_dataset": "ARC dataset configuration",
+  "dataset": {
+    "train_challenges": "arc-agi_training_challenges.json",
+    "train_solutions": "arc-agi_training_solutions.json",
+    "eval_challenges": "arc-agi_evaluation_challenges.json",
+    "eval_solutions": "arc-agi_evaluation_solutions.json",
+    "max_grid_size": 30,
+    "augmentation_enabled": true
+  },
+
+  "_comment_phase2": "Phase 2: Meta Learning with MAML/Reptile + HRM Fast Adaptation",
+  "phase2_meta_learning": {
+    "num_epochs": 5,
+    "meta_lr": 0.001,
+    "inner_lr": 0.01,
+    "inner_steps": 5,
+    "tasks_per_meta_batch": 4,
+    "first_order": true,
+    "use_hrm_embeddings": true,
+    "use_hrm_fast_adapt": true,
+    "hrm_inner_steps": 2,
+    "hrm_inner_lr": 0.005,
+    "adaptation_success_threshold": 0.6,
+    "embedding_consistency_weight": 0.1
+  },
+
+  "_comment_phase3": "Phase 3: Self Critique with STaR methodology",
+  "phase3_self_critique": {
+    "epochs": 3,
+    "steps_per_epoch": 200,
+    "learning_rate": 5e-5,
+    "counterexample_rate": 0.3,
+    "trace_analysis_steps": 100,
+    "consistency_weight": 0.1,
+    "star_bootstrap_rate": 0.5,
+    "critique_temperature": 0.8,
+    "verification_threshold": 0.7,
+    "self_correction_enabled": true,
+    "trace_replay_buffer_size": 1000
+  },
+
+  "_comment_phase4": "Phase 4: MCTS Alpha with neural guidance (AlphaZero style)",
+  "phase4_mcts_alpha": {
+    "epochs": 4,
+    "steps_per_epoch": 150,
+    "mcts_simulations": 100,
+    "exploration_constant": 1.4,
+    "neural_guidance_weight": 0.7,
+    "alpha_zero_style": true,
+    "tree_search_depth": 10,
+    "value_network_enabled": true,
+    "policy_network_enabled": true,
+    "puct_constant": 1.0,
+    "dirichlet_alpha": 0.3,
+    "dirichlet_epsilon": 0.25,
+    "temperature_schedule": "linear",
+    "backup_strategy": "minimax"
+  },
+
+  "_comment_phase6": "Phase 6: Neural Network Guided DSL Operation Priors",
+  "phase6_neuro_priors": {
+    "epochs": 3,
+    "steps_per_epoch": 250,
+    "learning_rate": 0.0001,
+    "prior_network_architecture": [256, 128, 64],
+    "dsl_operation_count": 41,
+    "prior_regularization": 0.01,
+    "democratic_bias_weight": 0.5,
+    "operation_embedding_dim": 128,
+    "context_encoding_layers": 3,
+    "prior_temperature": 1.0,
+    "bias_sharpening_rate": 0.1,
+    "success_amplification": true,
+    "failure_dampening": true
+  },
+
+  "_comment_phase7": "Phase 7: Relational Memory + Biological Learning (BitterBot's Conscious AI)",
+  "phase7_relmem": {
+    "epochs": 150,
+    "steps_per_epoch": 400,
+    "learning_rate": 0.0001,
+    "dream_pretrain_epochs": 3,
+    "relmem_activation_epoch": 5,
+    "nightmare_alpha": 0.08,
+    "dopamine_capture_rate": 0.1,
+    "biological_learning": true,
+    "breakthrough_threshold": 33.0,
+    "conscious_ai_enabled": true,
+    "internal_monologue_enabled": true,
+    "monologue_interval": 200,
+    "hemispheric_competition": true,
+    "uni_hemispheric_dreaming": true,
+    "democratic_dsl_bias": true,
+    "relman_count": 0,
+    "relmem_bias_max": 0.5,
+    "progressive_bias_ramping": true,
+    "adaptive_nightmare_pruning": true,
+    "gradient_accumulation_steps": 4,
+    "mixed_precision": true,
+    "gradient_clipping": 1.0
+  },
+
+  "_comment_evaluation": "Evaluation and monitoring settings",
+  "evaluation": {
+    "eval_interval": 10,
+    "eval_tasks": 100,
+    "save_best_model": true,
+    "em_threshold_for_save": 25.0,
+    "breakthrough_detection": true,
+    "step_21_pattern_monitoring": true,
+    "performance_tracking": {
+      "rolling_window": 200,
+      "breakthrough_step_pattern": "epoch * 400 + 21",
+      "success_metrics": ["em_score", "exact_match", "partial_match"],
+      "biological_metrics": ["dopamine_events", "nightmare_events", "monologue_consistency"]
+    }
+  },
+
+  "_comment_optimization": "Training optimization settings",
+  "optimization": {
+    "optimizer": "AdamW",
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-8,
+    "warmup_steps": 1000,
+    "lr_scheduler": "cosine_with_restarts",
+    "scheduler_params": {
+      "T_0": 10000,
+      "T_mult": 2,
+      "eta_min": 1e-7
+    }
+  },
+
+  "_comment_hrm": "HRM (Hierarchical Reasoning Model) integration settings",
+  "hrm": {
+    "integration_enabled": true,
+    "puzzle_embedder_config": {
+      "batch_size": 1,
+      "seq_len": 400,
+      "vocab_size": 10,
+      "num_puzzle_identifiers": 1000,
+      "puzzle_emb_ndim": 128,
+      "H_cycles": 2,
+      "L_cycles": 2,
+      "H_layers": 2,
+      "L_layers": 2,
+      "hidden_size": 256,
+      "expansion": 2.0,
+      "num_heads": 4,
+      "pos_encodings": "rope",
+      "halt_max_steps": 4,
+      "halt_exploration_prob": 0.1,
+      "forward_dtype": "bfloat16"
+    },
+    "meta_learning_integration": true,
+    "embedding_consistency_loss": true,
+    "fast_adaptation_enabled": true
+  },
+
+  "_comment_relmem": "Relational Memory configuration",
+  "relational_memory": {
+    "hidden_dim": 640,
+    "max_concepts": 4096,
+    "num_heads": 8,
+    "memory_slots": 512,
+    "inheritance_weight": 0.05,
+    "inverse_loss_weight": 0.05,
+    "concept_threshold": 0.1,
+    "memory_consolidation": true,
+    "concept_pruning": true,
+    "max_memory_age": 10000
+  },
+
+  "_comment_conscious_ai": "BitterBot's Conscious AI Framework",
+  "conscious_ai": {
+    "enabled": true,
+    "internal_monologue": {
+      "enabled": true,
+      "interval": 200,
+      "reasoning_consistency_check": true,
+      "parameter_adaptation": true,
+      "meta_cognitive_feedback": true
+    },
+    "hemispheric_competition": {
+      "enabled": true,
+      "left_hemisphere": "symbolic_processing",
+      "right_hemisphere": "perceptual_processing",
+      "winner_takes_all": false,
+      "competition_temperature": 0.5
+    },
+    "biological_learning": {
+      "dopamine_system": {
+        "enabled": true,
+        "capture_threshold": 0.33,
+        "burst_intensity": 1.5,
+        "buffer_size": 1000,
+        "replay_probability": 0.1
+      },
+      "nightmare_system": {
+        "enabled": true,
+        "pruning_alpha": 0.08,
+        "failure_threshold": 0.1,
+        "adaptive_intensity": true,
+        "negative_replay_rate": 0.05
+      }
+    }
+  },
+
+  "_comment_system": "System and debugging settings",
+  "system": {
+    "memory_monitoring": true,
+    "performance_profiling": false,
+    "debug_mode": false,
+    "save_intermediate_results": true,
+    "checkpoint_frequency": 1000,
+    "automatic_recovery": true,
+    "error_tolerance": "medium",
+    "resource_limits": {
+      "max_memory_gb": 32,
+      "max_training_hours": 48,
+      "checkpoint_retention": 10
+    }
+  },
+
+  "_comment_breakthrough": "Breakthrough detection and celebration",
+  "breakthrough": {
+    "detection_enabled": true,
+    "em_threshold": 33.0,
+    "step_pattern_monitoring": true,
+    "expected_step_formula": "epoch * 400 + 21",
+    "celebration_logging": true,
+    "automatic_checkpoint_on_breakthrough": true,
+    "breakthrough_analysis": true,
+    "success_trace_preservation": true
+  }
+}

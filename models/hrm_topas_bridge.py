@@ -110,19 +110,20 @@ class HRMGuidedDSLSelector(nn.Module):
         # Adaptive halting controller
         self.halting_controller = nn.Linear(config.hrm_hidden_size, 2)  # halt/continue
         
-    def forward(self, z_H: torch.Tensor, z_L: torch.Tensor, 
-                current_depth: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, z_H: torch.Tensor, z_L: torch.Tensor,
+                current_depth: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Generate DSL operation biases and halting decisions.
-        
+        Generate DSL operation biases, halting decisions, and parameter priors.
+
         Args:
             z_H: [B, hrm_hidden_size] - HRM H-level (abstract planning)
             z_L: [B, hrm_hidden_size] - HRM L-level (rapid computation)
             current_depth: Current search depth
-            
+
         Returns:
             dsl_op_logits: [B, dsl_ops_count] - DSL operation selection biases
             control_signals: Dict with halting and refinement signals
+            param_priors: Dict of predicted parameter distributions for key ops
         """
         batch_size = z_H.size(0)
         
@@ -153,12 +154,39 @@ class HRMGuidedDSLSelector(nn.Module):
             'q_continue_logits': q_continue,
             'should_halt': should_halt,
             'confidence': confidence,
-            'adaptive_depth': torch.where(should_halt, 
-                                        torch.clamp(torch.tensor(current_depth - 1), min=1),
-                                        torch.tensor(current_depth + 1))
+            'adaptive_depth': torch.where(
+                should_halt,
+                torch.clamp(torch.tensor(current_depth), min=1, max=12),
+                torch.clamp(torch.tensor(current_depth + 1), min=1, max=12)
+            )
         }
-        
-        return dsl_op_logits, control_signals
+
+        # === Parameter Priors ===
+        param_priors: Dict[str, torch.Tensor] = {}
+        try:
+            # Example: simple linear heads for common parametric ops
+            if not hasattr(self, "translate_head"):
+                self.translate_head = nn.Linear(self.config.hrm_hidden_size, 4).to(z_L.device)
+            if not hasattr(self, "color_head"):
+                self.color_head = nn.Linear(self.config.hrm_hidden_size, 10).to(z_H.device)
+            if not hasattr(self, "scale_head"):
+                self.scale_head = nn.Linear(self.config.hrm_hidden_size, 2).to(z_L.device)
+
+            # Translate: predict logits over dx, dy in [-2..1] (4 bins each)
+            translate_logits = self.translate_head(z_L)
+            param_priors["dx_logits"] = translate_logits[:, :2]  # first 2 dims
+            param_priors["dy_logits"] = translate_logits[:, 2:]  # last 2 dims
+
+            # Color map: logits over 10 colors
+            param_priors["color_map_logits"] = self.color_head(z_H)
+
+            # Scale/resize factors (sx, sy)
+            param_priors["scale_logits"] = self.scale_head(z_L)
+        except Exception as e:
+            import logging
+            logging.debug(f"[HRMGuidedDSLSelector] param priors skipped: {e}")
+
+        return dsl_op_logits, control_signals, param_priors
 
 
 class PuzzleEmbeddingIntegrator(nn.Module):
@@ -241,6 +269,13 @@ class HRMTOPASBridge(nn.Module):
             nn.ReLU(),
             nn.Linear(config.topas_width, config.topas_width)
         )
+
+        # Value head for EM likelihood prediction (Neural-Guided Search 2.0)
+        self.value_head = nn.Sequential(
+            nn.Linear(config.topas_width + config.hrm_hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
         
     def forward(self, 
                 grid_features: torch.Tensor,
@@ -260,8 +295,13 @@ class HRMTOPASBridge(nn.Module):
             integration_outputs: Dict containing:
                 - enhanced_features: Enhanced grid features
                 - dsl_op_biases: DSL operation selection biases
+                - dsl_op_logits: Raw DSL operation logits
                 - control_signals: Halting and depth control signals
+                - param_priors: Parameter priors for DSL operations
+                - value_logit: EM likelihood prediction for Neural-Guided Search 2.0
                 - attention_features: Cross-attention enhanced features
+                - bidirectional_signals: HRM<->TOPAS communication signals
+                - feature_alignment_weights: Feature fusion weights
         """
         B, C, H, W = grid_features.shape
         
@@ -289,7 +329,7 @@ class HRMTOPASBridge(nn.Module):
         attended_features = attended_features.transpose(1, 2).view(B, C, H, W)
         
         # 6. Generate DSL operation biases and control signals
-        dsl_op_logits, control_signals = self.dsl_selector(z_H, z_L, current_search_depth)
+        dsl_op_logits, control_signals, param_priors = self.dsl_selector(z_H, z_L, current_search_depth)
         
         # 7. Bidirectional feature alignment
         # HRM -> TOPAS direction
@@ -302,6 +342,10 @@ class HRMTOPASBridge(nn.Module):
         # 8. Final feature fusion
         combined_signal = torch.cat([topas_global, z_H], dim=-1)  # [B, topas_width + hrm_hidden_size]
         alignment_weights = torch.sigmoid(self.feature_aligner(combined_signal))  # [B, topas_width]
+
+        # Value head for EM likelihood prediction (Neural-Guided Search 2.0)
+        value_input = torch.cat([topas_global, z_H], dim=-1)  # [B, topas_width + hrm_hidden_size]
+        value_logit = self.value_head(value_input).squeeze(-1)  # [B]
         
         # Apply alignment weights spatially
         alignment_weights = alignment_weights.view(B, -1, 1, 1).expand(B, -1, H, W)
@@ -313,6 +357,8 @@ class HRMTOPASBridge(nn.Module):
             'dsl_op_biases': F.softmax(dsl_op_logits, dim=-1),
             'dsl_op_logits': dsl_op_logits,
             'control_signals': control_signals,
+            'param_priors': param_priors,
+            'value_logit': value_logit,  # EM likelihood prediction for Neural-Guided Search 2.0
             'attention_features': attended_features,
             'bidirectional_signals': {
                 'hrm_to_topas': hrm_to_topas_signal,

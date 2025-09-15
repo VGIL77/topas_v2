@@ -19,9 +19,13 @@ import time
 import json
 import traceback
 import numpy as np
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from trainers.arc_dataset_loader import ARCDataset
+try:
+    from arc2_dataset_loader import ARC2Dataset
+except ImportError:
+    ARC2Dataset = None
 from models.topas_arc_60M import TopasARC60M, ModelConfig
 from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
 from trainers.self_play import SelfPlayBuffer  # used for storing dopamine rewards
@@ -29,8 +33,38 @@ from trainers.self_critique.counterexamples import CounterexampleGenerator, Task
 from trainers.self_critique.star_bootstrapper import STaRBootstrapper           # STaR trace gen + verification
 from trainers.self_critique.consistency import ConsistencyEnforcer               # enforce consistency across valid traces
 from trainers.augmentation.deep_program_discoverer import mine_deep_programs                  # deep DSL programs miner (6–10 ops)
+from models.policy_nets import OpPolicyNet, op_logits_to_bias                              # policy-guided search
 from collections import Counter, deque
-import math
+from typing import Callable
+import math, statistics, time
+import numpy as np
+import random
+import hashlib   # NEW
+
+# Alpha-ARC X additions
+try:
+    from trainers.puct_search import puct_search
+except Exception:
+    puct_search = None
+try:
+    from trainers.replay import PrioritizedReplay
+except Exception:
+    PrioritizedReplay = None
+try:
+    from trainers.near_miss import near_miss_repair
+except Exception:
+    near_miss_repair = None
+
+def _canonical_puzzle_id(task_id, modulo: int = 1000) -> int:
+    """
+    Map any task identifier (int/str/uuid) to a stable int in [0, modulo).
+    Matches HRM config num_puzzle_identifiers=1000.
+    """
+    try:
+        return int(task_id) % modulo
+    except Exception:
+        h = int(hashlib.sha1(str(task_id).encode("utf-8")).hexdigest()[:8], 16)
+        return h % modulo
 
 # =========================
 # Dopamine & Nightmare Core
@@ -40,6 +74,328 @@ import math
 op_success_count = Counter()          # track operations in successful traces (for planner op_bias)
 recent_failures: List[Any] = []       # queue of failed counterexamples for nightmares
 rolling_em = deque(maxlen=200)        # rolling window of EM to estimate failure pressure
+
+# =========================
+# Additional Dopamine Helpers (Production-Grade)
+# =========================
+
+def _extract_entropy_reduction(dream_stats) -> float:
+    try:
+        if isinstance(dream_stats, dict):
+            if "entropy_reduction" in dream_stats:
+                return float(dream_stats["entropy_reduction"])
+            if "entropy_before" in dream_stats and "entropy_after" in dream_stats:
+                eb = float(dream_stats["entropy_before"]); ea = float(dream_stats["entropy_after"])
+                return max(0.0, eb - ea)
+    except Exception:
+        pass
+    return 0.0
+
+def _extract_mdl_gain(mined_templates) -> float:
+    try:
+        if not mined_templates:
+            return 0.0
+        gains = []
+        for t in mined_templates:
+            if isinstance(t, dict) and "mdl_gain" in t:
+                gains.append(float(t["mdl_gain"]))
+            else:
+                gains.append(1.0)
+        return float(sum(gains))
+    except Exception:
+        return 0.0
+
+def _novelty_estimate(enc_inp: Tuple[Tuple[int,int], Tuple[int,...]], buffer, k: int = 64) -> float:
+    try:
+        (_, fa) = enc_inp
+        fa = list(fa)
+        if not hasattr(buffer, "buffer") or len(buffer.buffer) == 0:
+            return 1.0
+        sample = buffer.buffer[-k:] if len(buffer.buffer) > k else buffer.buffer
+        def sim(a, b):
+            enc_b = b[0]   # (enc_inp, enc_out) OR (enc_inp, enc_out, score)
+            (_, fb) = enc_b
+            n = min(len(fa), len(fb))
+            if n == 0: return 0.0
+            eq = sum(1 for i in range(n) if fa[i] == fb[i])
+            return eq / n
+        mx = 0.0
+        for item in sample:
+            try:
+                mx = max(mx, sim(enc_inp, item))
+            except Exception:
+                continue
+        return max(0.0, 1.0 - mx)
+    except Exception:
+        return 0.5
+
+def _squash(x: float, temp: float = 1.0) -> float:
+    try:
+        return math.tanh(x / max(1e-6, temp))
+    except Exception:
+        return 0.0
+
+def _dopamine_score(em: float, acc: float, iou: float, program_len: int,
+                    entropy_red: float, mdl_gain: float, novelty: float,
+                    Lmax: int = 12) -> Tuple[float, Dict[str, float]]:
+    w_em, w_acc, w_iou = 1.0, 0.25, 0.5
+    w_len, w_ent, w_mdl, w_nov = -0.10, 0.30, 0.50, 0.20
+    L = min(max(0, program_len), Lmax)
+    len_pen = L / max(1, Lmax)
+    raw = (w_em * em) + (w_acc * acc) + (w_iou * iou) + (w_ent * entropy_red) \
+          + (w_mdl * mdl_gain) + (w_nov * novelty) + (w_len * len_pen)
+    R = _squash(raw, temp=1.0)
+    comps = dict(em=em, acc=acc, iou=iou, len=L, len_pen=len_pen,
+                 entropy_red=entropy_red, mdl_gain=mdl_gain, novelty=novelty,
+                 raw=raw, squashed=R)
+    return R, comps
+
+def _stringify_ops(ops: Any) -> List[str]:
+    out = []
+    if not ops:
+        return out
+    for op in ops:
+        if isinstance(op, dict):
+            try:
+                key = f"composite_{hash(str(sorted(op.items())))}"
+            except Exception:
+                key = f"composite_{hash(str(op))}"
+            out.append(key)
+        else:
+            out.append(str(op))
+    return out
+
+def _hamming(a: torch.Tensor, b: torch.Tensor) -> int:
+    """
+    Compute Hamming distance between two tensors.
+    """
+    if a is None or b is None or a.shape != b.shape:
+        return 10**9
+    return (a.view(-1) != b.view(-1)).sum().item()
+
+def _sc_run_star(star_bootstrapper, task, planner_bias, n: int) -> list:
+    """
+    Self-consistency booster: run STaR N times with small jitter in priors.
+    Return list of valid traces.
+    """
+    traces_all = []
+    import copy, random
+    for _ in range(max(1, n)):
+        pb = None
+        if isinstance(planner_bias, dict):
+            # tiny jitter (root-Dirichlet-like) for diversity
+            pb = {k: max(1e-6, v * (0.9 + 0.2 * random.random())) for k, v in planner_bias.items()}
+        tr = star_bootstrapper.generate_diverse_traces(task, n_traces=8, planner_op_bias=pb or planner_bias)
+        traces_all.extend(tr)
+    return traces_all
+
+def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device) -> list:
+    """
+    Compose a program by running PUCT selection sequentially for puct_depth steps.
+    Each step: run small PUCT on current grid to pick next op, apply via DSL shim.
+    """
+    if puct_search is None:
+        return []
+    state_grid = test_input.clone()
+    program_ops = []
+
+    def priors_fn(grid_s):
+        # one forward to get policy priors (dsl_op_logits) on this state
+        try:
+            out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
+            extras = out.get("extras", {}) if isinstance(out, dict) else {}
+            logits = extras.get("dsl_op_logits") or extras.get("policy_logits")
+            if logits is None: return {}
+            probs = torch.softmax(logits[0], dim=-1).detach().cpu().numpy().tolist()
+            from models.dsl_registry import DSL_OPS
+            prior = {op: float(p) for op, p in zip(DSL_OPS, probs)}
+            # root Dirichlet
+            import numpy as np
+            if len(prior) and cli_args.root_dirichlet_eps > 0:
+                eps = cli_args.root_dirichlet_eps
+                alpha = cli_args.root_dirichlet_alpha
+                noise = np.random.dirichlet([alpha]*len(prior))
+                keys = list(prior.keys())
+                for i, k in enumerate(keys):
+                    prior[k] = float((1-eps)*prior[k] + eps*noise[i])
+            return prior
+        except Exception:
+            return {}
+
+    def value_fn(grid_s):
+        try:
+            out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
+            v = out.get("extras", {}).get("value_logit")
+            return torch.sigmoid(v)[0].item() if v is not None else 0.1
+        except Exception:
+            return 0.1
+
+    def expand_fn(grid_s, op):
+        try:
+            return model.dsl.apply(op, grid_s)
+        except Exception:
+            return grid_s
+
+    for _ in range(max(1, int(cli_args.puct_depth))):
+        best_op, _ = puct_search(
+            state_grid, priors_fn, value_fn, expand_fn,
+            max_nodes=int(cli_args.puct_nodes),
+            c_puct=float(cli_args.c_puct)
+        )
+        try:
+            state_grid = model.dsl.apply(best_op, state_grid)
+            program_ops.append(best_op)
+            if torch.is_tensor(target_grid) and (state_grid.shape == target_grid.shape) and (state_grid == target_grid).all():
+                break
+        except Exception:
+            break
+    return program_ops
+    return out
+
+# =========================
+# Dopamine state (EMA + refractory)
+# =========================
+class _EMA:
+    def __init__(self, beta=0.9, init=0.0):
+        self.beta = beta
+        self.m = init
+        self.initialized = False
+    def update(self, x: float) -> float:
+        if not self.initialized:
+            self.m = x
+            self.initialized = True
+        else:
+            self.m = self.beta * self.m + (1 - self.beta) * x
+        return self.m
+    def value(self) -> float:
+        return self.m
+
+_dopamine_ema = _EMA(beta=0.9, init=0.0)
+_last_dopamine_step = -10**9  # refractory tracking
+
+# =========================
+# Enhanced Dopamine Helper Functions
+# =========================
+def _extract_program_len(programs: List) -> int:
+    """Extract representative program length from operations list."""
+    if not programs:
+        return 0
+    total_len = 0
+    count = 0
+    for prog in programs:
+        if isinstance(prog, (list, tuple)):
+            total_len += len(prog)
+            count += 1
+        elif hasattr(prog, '__len__'):
+            total_len += len(prog)
+            count += 1
+    return total_len // max(1, count)
+
+def _safe_iou(pred_grid: torch.Tensor, target_grid: torch.Tensor) -> float:
+    """Safely compute IoU between prediction and target grids."""
+    try:
+        if pred_grid.shape != target_grid.shape:
+            return 0.0
+        pred_flat = pred_grid.view(-1)
+        target_flat = target_grid.view(-1)
+        intersection = (pred_flat == target_flat).sum().float()
+        union = pred_flat.numel()
+        return (intersection / union).item() if union > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _extract_entropy_reduction(dream_stats: Optional[Dict]) -> float:
+    """Extract entropy reduction metric from dream statistics."""
+    if not isinstance(dream_stats, dict):
+        return 0.0
+    return float(dream_stats.get('entropy_reduction', 0.0))
+
+def _extract_mdl_gain(mined_templates: List) -> float:
+    """Extract MDL gain from mined program templates."""
+    if not mined_templates:
+        return 0.0
+    # Simple heuristic: more complex templates = higher MDL gain
+    total_complexity = sum(len(str(t)) for t in mined_templates)
+    return min(1.0, total_complexity / 100.0)
+
+def _novelty_estimate(encoded_input: tuple, buffer: Any, k: int = 64) -> float:
+    """Estimate novelty of input relative to buffer contents."""
+    if not hasattr(buffer, 'buffer') or len(buffer.buffer) < k:
+        return 1.0  # High novelty if buffer sparse
+    try:
+        # Count similar patterns in recent buffer
+        recent = buffer.buffer[-k:]
+        matches = sum(1 for inp, _ in recent if inp == encoded_input)
+        return max(0.0, 1.0 - matches / k)
+    except Exception:
+        return 0.5
+
+def _dopamine_score(em: float, acc: float, iou: float, program_len: int, 
+                   entropy_red: float, mdl_gain: float, novelty: float, Lmax: int = 12) -> tuple:
+    """
+    Multi-factor dopamine scoring with component breakdown.
+    Returns: (total_score, components_dict)
+    """
+    # Core performance (0.6 weight)
+    perf_score = 0.4 * em + 0.3 * acc + 0.3 * iou
+    
+    # Program efficiency bonus (0.2 weight) 
+    eff_score = max(0.0, 1.0 - program_len / Lmax) if program_len > 0 else 0.0
+    
+    # Learning signal (0.2 weight)
+    learn_score = 0.5 * entropy_red + 0.3 * mdl_gain + 0.2 * novelty
+    
+    total = 0.6 * perf_score + 0.2 * eff_score + 0.2 * learn_score
+    
+    components = {
+        'perf': perf_score, 'eff': eff_score, 'learn': learn_score,
+        'em': em, 'acc': acc, 'iou': iou, 'prog_len': program_len,
+        'ent_red': entropy_red, 'mdl': mdl_gain, 'novel': novelty
+    }
+    
+    return total, components
+
+# =========================
+# Canonical grid encoding
+# =========================
+def _encode_grid_tensor(grid: torch.Tensor) -> tuple:
+    """
+    Canonical, hashable encoding for ARC grids.
+    Returns: ((H, W), tuple(flat_int_values))
+    Fixed: Ensure complete detachment from GPU and any unhashable references
+    """
+    if isinstance(grid, torch.Tensor):
+        # Ensure complete detachment and conversion to CPU
+        g = grid.detach().cpu().clone().long()
+        if g.dim() == 3 and g.size(0) == 1:
+            g = g.squeeze(0)
+        assert g.dim() == 2, f"Expected [H,W], got {tuple(g.shape)}"
+        H, W = g.shape
+        # Ensure all values are plain Python ints, not tensor scalars
+        flat_values = []
+        for x in g.view(-1):
+            flat_values.append(int(x.item()))  # Use .item() to extract scalar value
+        
+        # Create the final tuple and verify it's hashable before returning
+        result = ((int(H), int(W)), tuple(flat_values))
+        try:
+            hash(result)  # Verify hashability
+        except TypeError as e:
+            raise ValueError(f"Generated unhashable grid encoding: H={H}, W={W}, values_type={type(flat_values)}, error={e}")
+        
+        return result
+    # already encoded?
+    if isinstance(grid, tuple) and len(grid) == 2 and isinstance(grid[0], tuple):
+        return grid
+    raise TypeError(f"Unsupported grid type for encoding: {type(grid)}")
+
+def _decode_grid(enc: tuple) -> torch.Tensor:
+    """
+    Decode canonical grid encoding back to torch.LongTensor [H,W].
+    """
+    (H, W), flat = enc
+    arr = np.array(flat, dtype=np.int64).reshape(H, W)
+    return torch.from_numpy(arr).long()
 
 def build_op_bias(temp: float = 0.7):
     """
@@ -58,79 +414,145 @@ def build_op_bias(temp: float = 0.7):
     Z = sum(exps) if exps else 1.0
     return {op: (e / Z) for op, e in zip(ops, exps)}
 
-def dopamine_reward(task: Task, buffer: Optional[SelfPlayBuffer], logger, global_step: int):
+def build_policy_guided_bias(grid_in: torch.Tensor, grid_out: torch.Tensor, 
+                           op_policy: Optional[Any], device, temp: float = 0.7):
     """
-    Positive reinforcement: store solved puzzle pair in SelfPlayBuffer.
-    We store (input, target) pairs; SelfPlayBuffer will generate templated variants later.
+    Enhanced op-bias that combines historical success counts with policy net predictions.
+    Returns hybrid bias: 50% historical + 50% policy-guided.
+    """
+    # Start with historical bias (proven successful)
+    historical_bias = build_op_bias(temp)
+    
+    # Add policy-guided bias if available
+    if op_policy is not None:
+        try:
+            # Build minimal context for policy prediction  
+            # Ensure grid is properly formatted [B, H, W] for policy
+            if grid_in.dim() == 4:  # [B, C, H, W] → remove channel dim if present
+                policy_grid = grid_in.squeeze(1) if grid_in.size(1) == 1 else grid_in[:, 0]
+            elif grid_in.dim() == 3:  # [B, H, W] or [C, H, W]
+                if grid_in.size(0) == 1:  # [1, H, W]
+                    policy_grid = grid_in
+                else:  # [C, H, W] → [1, H, W]  
+                    policy_grid = grid_in[0:1]
+            elif grid_in.dim() == 2:  # [H, W] → [1, H, W]
+                policy_grid = grid_in.unsqueeze(0)
+            else:
+                raise ValueError(f"Unexpected grid dimensions: {grid_in.shape}")
+                
+            B, H, W = policy_grid.shape
+            rel_features = None  # Will use zeros fallback in policy
+            size_oracle = torch.tensor([[H, W, H, W]], device=device).float()
+            theme_priors = torch.zeros(1, 10, device=device)
+            
+            # Get policy prediction with properly shaped grid
+            with torch.no_grad():
+                pred = op_policy(policy_grid, rel_features, size_oracle, theme_priors, program_ops=[])
+                raw_policy_bias = op_logits_to_bias(pred.op_logits)
+                
+                # Ensure policy_bias is a proper dict (robust type checking)
+                if isinstance(raw_policy_bias, dict):
+                    policy_bias = raw_policy_bias
+                elif hasattr(raw_policy_bias, 'keys'):
+                    policy_bias = dict(raw_policy_bias)  # Convert dict-like to dict
+                else:
+                    # Fallback: create uniform policy bias if conversion fails
+                    policy_bias = {f"op_{i}": 1.0/41 for i in range(41)}
+            
+            # Hybrid: 50% historical + 50% policy-guided (with safe key access)
+            hybrid_bias = {}
+            all_ops = set(historical_bias.keys()) | set(policy_bias.keys())
+            for op in all_ops:
+                hist_val = historical_bias.get(op, 1.0 / len(all_ops))
+                policy_val = policy_bias.get(op, 1.0 / len(all_ops))
+                hybrid_bias[op] = 0.5 * hist_val + 0.5 * policy_val
+                
+            return hybrid_bias
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[Policy] guided bias failed: {e}")
+    
+    # Fallback to historical only
+    return historical_bias
+
+def dopamine_reward(task, buffer, logger, global_step, score: float = 1.0, components: Dict = None):
+    """
+    Enhanced dopamine capture with importance scoring:
+    - Always store as canonical hashable tuples: ((H,W), tuple(flattened))
+    - Enriched buffer with (enc_in, enc_out, score) for importance replay
+    - Bypass ALL unhashable dict/Tensor issues
+    - Log buffer growth and reward details
     """
     if buffer is None:
         return
     try:
-        # Accept Task, dict, or (input, output) tuple/list
-        if hasattr(task, "input") and hasattr(task, "output"):
-            inp, out = task.input, task.output
-        elif isinstance(task, (list, tuple)) and len(task) == 2:
-            inp, out = task[0], task[1]
-        elif isinstance(task, dict):
-            inp, out = task.get("input"), task.get("output")
+        inp_t = task['input'] if isinstance(task, dict) else getattr(task, 'input', None)
+        out_t = task['output'] if isinstance(task, dict) else getattr(task, 'output', None)
+        if inp_t is None or out_t is None:
+            raise ValueError("dopamine_reward: task missing input/output")
+        # Ensure [H,W] tensors for encoding
+        if isinstance(inp_t, torch.Tensor) and inp_t.dim() == 3 and inp_t.size(0) == 1:
+            inp_t = inp_t.squeeze(0)
+        if isinstance(out_t, torch.Tensor) and out_t.dim() == 3 and out_t.size(0) == 1:
+            out_t = out_t.squeeze(0)
+        enc_inp = _encode_grid_tensor(inp_t)
+        enc_out = _encode_grid_tensor(out_t)
+        
+        # Verify encodings are truly hashable before storage
+        try:
+            hash(enc_inp)
+            hash(enc_out)
+            hash(score)  # Ensure score is also hashable
+        except TypeError as hash_err:
+            raise ValueError(f"Generated unhashable encoding: enc_inp={type(enc_inp)}, enc_out={type(enc_out)}, score={type(score)}, error={hash_err}")
+        
+        # Enhanced buffer storage with importance score
+        if score > 0:
+            buffer.buffer.append((enc_inp, enc_out, score))
         else:
-            raise TypeError(f"Unsupported task type for dopamine capture: {type(task)}")
-
-        buffer.buffer.append((inp.detach().cpu(), out.detach().cpu()))
-        logger.info(f"[Dopamine] Stored 1 puzzle pair → buffer size={len(buffer.buffer)} at step {global_step}")
+            buffer.buffer.append((enc_inp, enc_out))  # Fallback to old format
+            
+        if logger:
+            # Safely format components to avoid any unhashable issues in logging
+            comp_str = ""
+            if components:
+                try:
+                    # Convert components dict to a safe string representation
+                    safe_components = {k: float(v) if hasattr(v, '__float__') else str(v) 
+                                     for k, v in components.items() if v is not None}
+                    comp_str = f" components={safe_components}"
+                except Exception as comp_err:
+                    comp_str = f" components=<error: {comp_err}>"
+            logger.info(f"[Dopamine] Stored pair (score={score:.3f}) → buffer size={len(buffer.buffer)} at step {global_step}{comp_str}")
     except Exception as e:
-        logger.warning(f"[Dopamine] buffer append failed: {e}")
+        if logger:
+            logger.warning(f"[Dopamine] capture pipeline skipped at step {global_step}: {e}")
 
 def _as_star_task(task):
     """
-    Convert task objects to format expected by STaR bootstrapper.
-    Handles Task objects, dicts, and tuples consistently.
-    
-    Args:
-        task: Task object, dict, or tuple/list with (input, output)
-        
-    Returns:
-        Dictionary with 'input' and 'output' keys for STaR compatibility
+    Normalize any input into a proper Task dataclass.
+    Guarantees .input/.output attributes for downstream (STaR, dopamine, Wormhole).
     """
     if task is None:
         return None
-        
-    try:
-        # Handle Task dataclass objects
-        if hasattr(task, "input") and hasattr(task, "output"):
-            return {
-                "input": task.input,
-                "output": task.output
-            }
-        
-        # Handle dictionary format (already compatible)
-        elif isinstance(task, dict):
-            if "input" in task and "output" in task:
-                return task
-            elif "test" in task and "target" in task:
-                # Alternative naming convention
-                return {
-                    "input": task["test"],
-                    "output": task["target"]
-                }
-            else:
-                # Try to extract from nested structure
-                return task
-        
-        # Handle tuple/list format
-        elif isinstance(task, (list, tuple)) and len(task) >= 2:
-            return {
-                "input": task[0],
-                "output": task[1]
-            }
-        
-        else:
-            # Return as-is and let STaR handle it
-            return task
-            
-    except Exception as e:
-        print(f"[Task-Adapter] Warning: Failed to adapt task {type(task)}: {e}")
+
+    # Already Task
+    if isinstance(task, Task):
         return task
+
+    # Dict-like
+    if isinstance(task, dict):
+        return Task(
+            input=task.get("input") or task.get("test"),
+            output=task.get("output") or task.get("target"),
+            constraints=task.get("constraints", {}),
+            metadata=task.get("metadata", {})
+        )
+
+    # Tuple/list
+    if isinstance(task, (list, tuple)) and len(task) >= 2:
+        return Task(input=task[0], output=task[1], constraints={}, metadata={})
+
+    raise TypeError(f"Unsupported task type: {type(task)}")
 
 def nightmare_prune(model, failures: List[Any], optimizer, scaler, device, logger, global_step: int,
                     alpha: float = 0.08, max_failures: int = 8):
@@ -277,6 +699,8 @@ def parse_args():
     # Training args
     parser.add_argument("--max-steps", type=int, default=60000,
                         help="Maximum training steps")
+    parser.add_argument("--dataset", type=str, default="arc1", choices=["arc1", "arc2"],
+                        help="Dataset to use: arc1 (original training) or arc2 (ARC Prize 2025)")
 
     # ---- Model-size & dopaminergic/nightmare controls ----
     parser.add_argument("--model-width", type=int, default=640,
@@ -300,7 +724,27 @@ def parse_args():
                         help="Target overall consistency; below this we increase pruning, above this we ramp bias")
     parser.add_argument("--monologue-selfplay-bonus", type=float, default=0.05,
                         help="Increase self-play weight by this when consistency is high")
-    
+
+    # Alpha-ARC X Neural-Guided Search 2.0 parameters
+    parser.add_argument("--search-alg", type=str, default="beam", choices=["beam", "puct"],
+                        help="Search algorithm: beam or puct")
+    parser.add_argument("--puct-nodes", type=int, default=100,
+                        help="Number of PUCT search nodes")
+    parser.add_argument("--c-puct", type=float, default=1.414,
+                        help="PUCT exploration constant")
+    parser.add_argument("--puct-depth", type=int, default=8,
+                        help="Maximum PUCT search depth")
+    parser.add_argument("--root-dirichlet-alpha", type=float, default=0.3,
+                        help="Dirichlet noise alpha for root node")
+    parser.add_argument("--root-dirichlet-eps", type=float, default=0.25,
+                        help="Dirichlet noise epsilon for root node")
+    parser.add_argument("--sc-star", action="store_true", default=False,
+                        help="Enable Self-Critique STaR wrapper")
+    parser.add_argument("--near-miss-hamming-pct", type=float, default=0.15,
+                        help="Near-miss Hamming distance threshold percentage")
+    parser.add_argument("--replay-cap", type=int, default=2000,
+                        help="Replay buffer capacity")
+
     args, _unknown = parser.parse_known_args()
     return args
 
@@ -651,6 +1095,13 @@ def dream_pretrain_loop(topas_model, dataset, cli_args, device, logger):
     except Exception:
         logging.getLogger(__name__).exception("[Dream-Pretrain] Could not save dream state")
 
+    # CRITICAL: Unfreeze model after dream pretraining if it was frozen
+    if cli_args.dream_pretrain_freeze_model:
+        logger.info("[Dream-Pretrain] Unfreezing model parameters for main training")
+        topas_model.train()
+        for param in topas_model.parameters():
+            param.requires_grad = True
+
 def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_metrics=False, global_step=0):
     """Single training step with safer AMP, optional HRM->TOPAS bridge, and robust loss handling."""
     optimizer.zero_grad()
@@ -725,10 +1176,11 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 # Cross-entropy with label smoothing
                 label_smoothing = 0.05
                 ce_loss = nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)), 
+                    logits.reshape(-1, logits.size(-1)),
                     target_flat.reshape(-1),
                     label_smoothing=label_smoothing
                 )
+                ce_loss = ce_loss.float()  # Ensure float32 for AMP/GradScaler
                 
                 # Batch debug probe for CE spikes
                 if global_step % 100 == 0 and ce_loss > 2.0:  # Log when CE loss is high
@@ -744,10 +1196,59 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 total_loss = ce_loss
                 if 'losses' in outputs and outputs['losses']:
                     for loss_name, loss_value in outputs['losses'].items():
-                        if loss_name == 'dsl_loss':
+                        if isinstance(loss_value, torch.Tensor) and loss_value.requires_grad:
                             total_loss = total_loss + loss_value  # Weight already applied in model
                             if global_step % 100 == 0:  # Log occasionally
-                                logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, dsl_loss={loss_value:.3f}")
+                                logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, {loss_name}={loss_value:.3f}")
+
+                # === Joint HRM Training with ACT Loss ===
+                if hasattr(topas_model, 'planner_loss_head') and global_step > 1000:  # After initial warmup
+                    try:
+                        # HRM supervision targets (reuse grid tokens)
+                        tokens = topas_model.grid_to_tokens(input_grid)
+                        # task_id was already unpacked above from the dataloader tuple
+                        raw_pid = task_id
+                        if isinstance(raw_pid, torch.Tensor):
+                            pid = int(raw_pid.item())
+                        elif isinstance(raw_pid, (int, np.integer)):
+                            pid = int(raw_pid)
+                        elif isinstance(raw_pid, str):
+                            # map string → stable integer in [0, 999]
+                            pid = int(hashlib.sha1(raw_pid.encode()).hexdigest(), 16) % 1000
+                        else:
+                            pid = int(hashlib.sha1(str(raw_pid).encode()).hexdigest(), 16) % 1000
+                        puzzle_ids = torch.tensor([pid], device=tokens.device, dtype=torch.long)
+                        
+                        # Ensure all tensors are on the same device
+                        batch_dict = {
+                            "inputs": tokens.to(device),
+                            "labels": tokens.to(device),  # Identity reconstruction for early training
+                            "puzzle_identifiers": puzzle_ids.to(device)
+                        }
+                        carry = topas_model.planner_loss_head.initial_carry(batch_dict)
+
+                        # Ensure carry is on correct device
+                        if isinstance(carry, dict):
+                            carry = {k: v.to(device) if torch.is_tensor(v) else v for k, v in carry.items()}
+                        elif torch.is_tensor(carry):
+                            carry = carry.to(device)
+
+                        new_carry, hrm_loss, hrm_metrics, _, _ = topas_model.planner_loss_head(
+                            return_keys=[], carry=carry, batch=batch_dict
+                        )
+                        
+                        # Only add HRM loss if it has gradients
+                        if isinstance(hrm_loss, torch.Tensor) and hrm_loss.requires_grad:
+                            total_loss = total_loss + 0.2 * hrm_loss  # Start with modest weight
+                        
+                        # Log HRM metrics
+                        if global_step % 100 == 0:
+                            lm_loss = hrm_metrics.get("lm_loss", 0.0)
+                            q_halt_loss = hrm_metrics.get("q_halt_loss", 0.0)
+                            logging.info(f"[HRM-Joint] hrm_loss={hrm_loss:.3f}, lm_loss={lm_loss:.3f}, q_halt_loss={q_halt_loss:.3f}")
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            logging.warning(f"[HRM-Joint] Supervision failed: {e}")
                 
                 # ---- RelMem auxiliary loss every N steps (with warm-up) ----
                 # Delay RelMem until after 5 epochs (~2000 steps)
@@ -757,27 +1258,36 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                 if (hasattr(topas_model, "relmem") and topas_model.relmem is not None and 
                     current_epoch >= relmem_warmup_epochs and (global_step % relmem_loss_interval == 0)):
                     try:
-                        reg_alpha = getattr(args, 'relmem_reg_alpha', 1e-4) if 'args' in locals() else 1e-4  # Reduced for stability
-                        reg_beta = getattr(args, 'relmem_reg_beta', 1e-4) if 'args' in locals() else 1e-4   # Reduced for stability
-                        
-                        # Replace broken inverse_loss() with inverse_loss_safe()
+                        reg_alpha = getattr(args, 'relmem_reg_alpha', 1e-4) if 'args' in locals() else 1e-4
+                        reg_beta  = getattr(args, 'relmem_reg_beta', 1e-4)  if 'args' in locals() else 1e-4
+
+                        # Safe aggregation: only add terms that are tensors with ≥1D.
                         relmem_aux = torch.tensor(0.0, device=device)
                         if hasattr(topas_model.relmem, 'inverse_loss_safe'):
-                            relmem_aux = relmem_aux + reg_alpha * topas_model.relmem.inverse_loss_safe()
-                        
-                        # Add inheritance_pass regularization
-                        if hasattr(topas_model.relmem, 'inheritance_pass'):
-                            relmem_aux = relmem_aux + reg_beta * topas_model.relmem.inheritance_pass()
-                        elif hasattr(topas_model.relmem, 'inheritance_pass_plus'):
-                            relmem_aux = relmem_aux + reg_beta * topas_model.relmem.inheritance_pass_plus()
+                            inv_loss = topas_model.relmem.inverse_loss_safe()
+                            if torch.is_tensor(inv_loss) and inv_loss.dim() >= 1:
+                                relmem_aux = relmem_aux + reg_alpha * inv_loss.sum()
+                        elif hasattr(topas_model.relmem, 'inverse_loss'):
+                            inv_loss = topas_model.relmem.inverse_loss()
+                            if torch.is_tensor(inv_loss) and inv_loss.dim() >= 1:
+                                relmem_aux = relmem_aux + reg_alpha * inv_loss.sum()
+
+                        # Only call inheritance_pass if a safe variant exists; otherwise skip to avoid 0D@0D matmul
+                        if hasattr(topas_model.relmem, 'inheritance_pass_safe'):
+                            inh = topas_model.relmem.inheritance_pass_safe()
+                            if torch.is_tensor(inh) and inh.dim() >= 1:
+                                relmem_aux = relmem_aux + reg_beta * inh.sum()
+                        else:
+                            # No safe variant; keep silent and skip to avoid console spam
+                            pass
                         
                         if torch.is_tensor(relmem_aux) and relmem_aux.item() > 0:
                             total_loss = total_loss + relmem_aux
                             if global_step % 100 == 0:
                                 logging.info(f"Step {global_step}: RelMem aux loss={relmem_aux.item():.6f}")
                     except Exception as e:
-                        if global_step % 100 == 0:
-                            logging.warning(f"RelMem auxiliary loss failed: {e}")
+                        # Downgrade to debug to avoid spam when RelMem lacks safe hooks
+                        logging.debug(f"RelMem auxiliary loss skipped: {e}")
                 
                 # RelMem binding on success (check if we have metrics to evaluate)
                 if return_metrics:
@@ -912,6 +1422,18 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
             except Exception:
                 pass
         
+        # Store outputs for enhanced dopamine scoring (when metrics computed)
+        if return_metrics:
+            try:
+                globals()['last_outputs_for_dopamine'] = {
+                    'outputs': outputs,
+                    'input_grid': input_grid.detach().cpu(),
+                    'target_grid': target_grid.detach().cpu(),
+                    'global_step': global_step
+                }
+            except Exception:
+                pass
+        
         # Tighter gradient clipping for RelMem stability
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(topas_model.parameters(), max_norm=0.5)  # Tighter clipping
@@ -949,11 +1471,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
-    # Apply CLI dream settings
+    # Apply CLI dream + dataset settings
     try:
         cli_args = parse_args()
     except Exception:
         cli_args = None
+
+    dataset_choice = getattr(cli_args, "dataset", "arc1") if cli_args else "arc1"
 
     topas_model, hrm_model = create_models(device, cli_args)
 
@@ -974,10 +1498,19 @@ def main():
         except Exception as e:
             print(f"[UKS] Could not load RelMem state: {e}")
 
-    dataset = ARCDataset(
-        challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
-        device=str(device)
-    )
+    if dataset_choice == "arc2" and ARC2Dataset is not None:
+        print("📦 Using ARC-II dataset (arc-agi_training/evaluation/test)")
+        dataset = ARC2Dataset(
+            "arc-agi_training_challenges.json",
+            "arc-agi_training_solutions.json",
+            device=str(device)
+        )
+    else:
+        print("📦 Using ARC-1 dataset")
+        dataset = ARCDataset(
+            challenge_file="/mnt/d/Bitterbot/research/topas_v2/ARC-AGI/data/training",
+            device=str(device)
+        )
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
 
     # === Self-play & critique stack ===
@@ -985,6 +1518,31 @@ def main():
     counterexample_gen = CounterexampleGenerator(device=str(device))  # for nightmare queue
     star_bootstrapper = STaRBootstrapper(topas_model, device=str(device))  # trace generator/validator
     consistency_enforcer = ConsistencyEnforcer(device=str(device))         # optional consistency step
+    
+    # === Policy-guided search integration ===
+    try:
+        op_policy = OpPolicyNet().to(device)
+        logger.info("[Policy] OpPolicyNet initialized for guided search")
+    except Exception as e:
+        logger.warning(f"[Policy] OpPolicyNet initialization failed: {e}")
+        op_policy = None
+
+    # === Alpha-ARC X Neural-Guided Search 2.0 initialization ===
+    replay_buffer = None
+    if cli_args and PrioritizedReplay is not None:
+        try:
+            replay_buffer = PrioritizedReplay(capacity=cli_args.replay_cap)
+            logger.info(f"[Alpha-ARC X] PrioritizedReplay initialized with capacity {cli_args.replay_cap}")
+        except Exception as e:
+            logger.warning(f"[Alpha-ARC X] PrioritizedReplay initialization failed: {e}")
+
+    # Set search mode on model
+    if cli_args and hasattr(topas_model, 'config'):
+        try:
+            topas_model.config.search_alg = cli_args.search_alg
+            logger.info(f"[Alpha-ARC X] Search algorithm set to: {cli_args.search_alg}")
+        except Exception as e:
+            logger.warning(f"[Alpha-ARC X] Failed to set search algorithm: {e}")
     
     # Run Dream pretrain if requested
     if cli_args and cli_args.dream_pretrain_epochs > 0:
@@ -1019,15 +1577,19 @@ def main():
     stable_breakthrough_steps = 0  # counts metric windows at/above threshold for curriculum trigger
 
     for epoch in range(num_epochs):
-        # Progressive RelMem bias ramping
-        if hasattr(topas_model.config, '_bias_ramp_start') and epoch >= topas_model.config._bias_ramp_start:
-            # Ramp up RelMem bias for stronger breakthrough push (but only if planner-aligned success shows up)
-            ramp_progress = min(1.0, (epoch - topas_model.config._bias_ramp_start) / 10.0)
-            current_bias_w = topas_model.config._bias_base + ramp_progress * (topas_model.config._bias_max - topas_model.config._bias_base)
-            recent_successes = sum(1 for v in list(rolling_em)[-10:] if v >= getattr(cli_args, "breakthrough_threshold", 0.33))
-            if hasattr(topas_model.config, 'relmem_op_bias_w') and recent_successes >= 3:
-                topas_model.config.relmem_op_bias_w = current_bias_w
-                print(f"🎯 RelMem bias ramped to {current_bias_w:.3f} (epoch {epoch+1})")
+        # === RelMem bias scheduling ===
+        if hasattr(topas_model.config, 'relmem_op_bias_w'):
+            if epoch < 5:
+                # keep minimal bias during warmup
+                topas_model.config.relmem_op_bias_w = 0.2
+            elif 5 <= epoch < 30:
+                # ramp up toward stronger bias
+                progress = (epoch - 5) / 25.0
+                topas_model.config.relmem_op_bias_w = 0.2 + progress * (0.5 - 0.2)
+            else:
+                # decay bias slightly after stabilization
+                topas_model.config.relmem_op_bias_w = 0.3
+            print(f"[RelMem] Epoch {epoch}: bias_w={topas_model.config.relmem_op_bias_w:.3f}")
         
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
         epoch_losses = []
@@ -1057,25 +1619,175 @@ def main():
                     if demos and len(demos) > 0:
                         grid_in = demos[0][0].to(device)
                         grid_out = demos[0][1].to(device)
+                        if not torch.is_tensor(grid_in): 
+                            grid_in = torch.tensor(grid_in, device=device)
+                        if not torch.is_tensor(grid_out):
+                            grid_out = torch.tensor(grid_out, device=device)
                         task = Task(input=grid_in, output=grid_out, constraints={}, metadata={})
                     else:
                         task = None
 
                     if em_val >= getattr(cli_args, "breakthrough_threshold", 0.33) and task is not None:
                         logger.info(f"[Breakthrough] EM={em_val:.2%} at step={global_step} → dopamine capture")
-                        # 1) Planner prior from successful ops (democratic→peaked)
-                        planner_bias = build_op_bias(temp=0.7)
-                        # 2) Generate/verify traces (half use planner bias internally)
-                        star_task = _as_star_task(task)
-                        traces = star_bootstrapper.generate_diverse_traces(star_task, n_traces=8, planner_op_bias=planner_bias)
-                        validations = star_bootstrapper.verify_traces(traces, star_task)
-                        good_traces = [t for t, v in zip(traces, validations) if v.is_valid]
-                        # 3) Update op priors from successful traces
-                        for t in good_traces:
-                            if hasattr(t, "operations") and t.operations:
-                                op_success_count.update(t.operations)
-                        # 4) Dopamine: store solved pair into buffer
-                        dopamine_reward(task, self_play_buffer, logger, global_step)
+                        # 1) Enhanced policy-guided planner bias (hybrid approach)
+                        try:
+                            planner_bias = build_policy_guided_bias(grid_in, grid_out, op_policy, device, temp=0.7)
+                            if global_step % 100 == 0:
+                                logger.info(f"[Policy] guided bias active: {len(planner_bias)} ops")
+                        except Exception as e:
+                            logger.warning(f"[Dopamine] policy-guided bias failed: {e}")
+                            planner_bias = build_op_bias(temp=0.7)  # Fallback to historical
+                        
+                        # 2) Generate/verify traces (Alpha-ARC X enhanced with SC-STaR + PUCT)
+                        try:
+                            star_task = _as_star_task(task)
+
+                            # Alpha-ARC X: SC-STaR wrapper for enhanced trace generation
+                            if cli_args and cli_args.sc_star:
+                                traces = _sc_run_star(star_bootstrapper, star_task, planner_bias, n=3)
+                                logger.info(f"[Alpha-ARC X] SC-STaR generated {len(traces)} traces")
+                            else:
+                                traces = star_bootstrapper.generate_diverse_traces(star_task, n_traces=8, planner_op_bias=planner_bias)
+
+                            # Alpha-ARC X: PUCT planning for additional program discovery
+                            if cli_args and cli_args.search_alg == "puct" and puct_search is not None:
+                                try:
+                                    puct_programs = _puct_plan_stepwise(topas_model, demos, grid_in, grid_out, cli_args, device)
+                                    if puct_programs:
+                                        # Convert PUCT programs to trace format
+                                        from types import SimpleNamespace
+                                        puct_trace = SimpleNamespace(operations=puct_programs)
+                                        traces.append(puct_trace)
+                                        logger.info(f"[Alpha-ARC X] PUCT contributed program with {len(puct_programs)} ops")
+                                except Exception as e:
+                                    logger.warning(f"[Alpha-ARC X] PUCT planning failed: {e}")
+
+                            # Belt-and-suspenders: sanitize *before* verify to avoid any internal hashing pitfalls
+                            for t in traces:
+                                if hasattr(t, "operations") and t.operations:
+                                    t.operations = _stringify_ops(t.operations)
+                            validations = star_bootstrapper.verify_traces(traces, star_task)
+                            good_traces = [t for t, v in zip(traces, validations) if v.is_valid]
+
+                        except Exception as e:
+                            logger.warning(f"[Dopamine] STaR trace generation failed: {e}")
+                            good_traces = []
+                            star_task = _as_star_task(task)
+                        
+                        # 3) Update op priors from successful traces (with safety)
+                        try:
+                            for t in good_traces:
+                                if hasattr(t, "operations") and t.operations:
+                                    # Use _stringify_ops to ensure all operations are hashable strings
+                                    safe_ops = _stringify_ops(t.operations)
+                                    if safe_ops:
+                                        op_success_count.update(safe_ops)
+                        except Exception as e:
+                            logger.warning(f"[Dopamine] op_success_count update failed: {e}")
+                        # 4) Enhanced Dopamine: score + robust storage
+                        outputs = globals().get('last_outputs_for_dopamine', {}).get('outputs', {})
+                        programs = []
+                        try:
+                            if isinstance(outputs, dict):
+                                programs = outputs.get("extras", {}).get("programs", []) or []
+                        except Exception:
+                            pass
+                        prog_len = _extract_program_len(programs or [getattr(t, "operations", []) for t in good_traces])
+                        iou_val = float(metrics.get("iou", 0.0))
+                        if iou_val == 0.0:
+                            try:
+                                if isinstance(outputs, dict) and "grid" in outputs:
+                                    iou_val = _safe_iou(outputs["grid"][0], grid_out)
+                            except Exception:
+                                pass
+
+                        # Alpha-ARC X: Near-miss repair
+                        if cli_args and near_miss_repair is not None and outputs and iou_val > 0.0:
+                            try:
+                                pred_grid = outputs.get("grid", [None])[0] if isinstance(outputs, dict) else None
+                                if pred_grid is not None and torch.is_tensor(pred_grid):
+                                    hamming_threshold = int(cli_args.near_miss_hamming_pct * pred_grid.numel())
+                                    hamming_dist = _hamming(pred_grid, grid_out)
+                                    if hamming_dist <= hamming_threshold:
+                                        repaired_programs = near_miss_repair(pred_grid, grid_out, programs)
+                                        if repaired_programs:
+                                            # Add repaired programs to good_traces for further processing
+                                            from types import SimpleNamespace
+                                            for prog in repaired_programs:
+                                                repair_trace = SimpleNamespace(operations=prog)
+                                                good_traces.append(repair_trace)
+                                            logger.info(f"[Alpha-ARC X] Near-miss repair added {len(repaired_programs)} programs")
+                            except Exception as e:
+                                logger.warning(f"[Alpha-ARC X] Near-miss repair failed: {e}")
+                        dream_stats = None
+                        try:
+                            if hasattr(topas_model, "dream") and topas_model.dream is not None:
+                                dream_stats = getattr(topas_model.dream, "last_stats", None)
+                        except Exception:
+                            pass
+                        ent_red = _extract_entropy_reduction(dream_stats)
+                        mdl_gain = 0.0
+                        try:
+                            if hasattr(topas_model, "dream") and hasattr(topas_model.dream, "wormhole") and programs:
+                                mined = topas_model.dream.wormhole.mine_from_programs(programs, top_k=3)
+                                mdl_gain = _extract_mdl_gain(mined)
+                        except Exception:
+                            pass
+                        enc_inp = _encode_grid_tensor(grid_in)
+                        novelty = _novelty_estimate(enc_inp, self_play_buffer, k=64)
+                        R, comps = _dopamine_score(em=1.0 if em_val >= 0.999 else em_val,
+                                                   acc=float(metrics.get("accuracy", 0.0)),
+                                                   iou=iou_val, program_len=prog_len,
+                                                   entropy_red=ent_red, mdl_gain=mdl_gain,
+                                                   novelty=novelty, Lmax=12)
+                        ema = _dopamine_ema.update(R)
+                        advantage = R - ema
+                        global _last_dopamine_step
+                        refractory = (global_step - _last_dopamine_step) < 20
+                        threshold = 0.15
+                        accept = (em_val >= 0.999) or (advantage >= threshold and not refractory)
+                        if accept:
+                            dopamine_reward(star_task, self_play_buffer, logger, global_step,
+                                            score=float(advantage), components=comps)
+
+                            # Alpha-ARC X: Add successful programs to replay buffer
+                            if replay_buffer is not None:
+                                try:
+                                    for t in good_traces:
+                                        if hasattr(t, "operations") and t.operations:
+                                            safe_ops = _stringify_ops(t.operations)
+                                            if safe_ops:
+                                                priority = float(advantage) + 0.1  # Ensure positive priority
+                                                replay_buffer.add(safe_ops, priority)
+                                    if programs:
+                                        for prog in programs:
+                                            if prog:
+                                                safe_prog = _stringify_ops(prog)
+                                                if safe_prog:
+                                                    priority = float(advantage) + 0.1
+                                                    replay_buffer.add(safe_prog, priority)
+                                    logger.info(f"[Alpha-ARC X] Added {len(good_traces) + len(programs)} programs to replay buffer")
+                                except Exception as e:
+                                    logger.warning(f"[Alpha-ARC X] Replay buffer addition failed: {e}")
+
+                            try:
+                                if hasattr(topas_model, "dream") and hasattr(topas_model.dream, "wormhole") and programs:
+                                    topas_model.dream.wormhole.refresh_ttl_from_programs(programs, bonus_ttl=3)
+                            except Exception:
+                                pass
+                            try:
+                                for t in good_traces:
+                                    if hasattr(t, "operations") and t.operations:
+                                        # Use _stringify_ops to ensure all operations are hashable strings
+                                        safe_ops = _stringify_ops(t.operations)
+                                        if safe_ops:
+                                            for sop in safe_ops:
+                                                op_success_count.update({sop: max(1, int(10 * max(0.0, advantage)))})
+                            except Exception as op_err:
+                                logger.warning(f"[Dopamine] advantage-based op_count update failed: {op_err}")
+                            _last_dopamine_step = global_step
+                        else:
+                            logger.info(f"[Dopamine] Skipped (R={R:+.3f}, adv={advantage:+.3f}, ema={ema:+.3f}, refractory={refractory})")
                         # 5) Counterexamples → nightmare queue
                         cex = counterexample_gen.generate_from_failure(task, topas_model, n_counterexamples=5)
                         if cex:
@@ -1102,10 +1814,14 @@ def main():
                         if demos and len(demos) > 0:
                             grid_in = demos[0][0].to(device)
                             grid_out = demos[0][1].to(device)
+                            if not torch.is_tensor(grid_in): 
+                                grid_in = torch.tensor(grid_in, device=device)
+                            if not torch.is_tensor(grid_out):
+                                grid_out = torch.tensor(grid_out, device=device)
                             task = Task(input=grid_in, output=grid_out, constraints={}, metadata={})
                     if task is not None:
-                        # Half of traces guided by current op_bias (from dopamine counts)
-                        planner_bias = build_op_bias(temp=0.7)
+                        # Half of traces guided by policy-enhanced op_bias
+                        planner_bias = build_policy_guided_bias(grid_in, grid_out, op_policy, device, temp=0.7)
                         star_task = _as_star_task(task)
                         traces = star_bootstrapper.generate_diverse_traces(star_task, n_traces=max(6, cli_args.monologue_min_traces), planner_op_bias=planner_bias)
                         vals = star_bootstrapper.verify_traces(traces, star_task)
@@ -1125,6 +1841,46 @@ def main():
                                 # Nudge self-play weight slightly
                                 if hasattr(cli_args, "selfplay_weight"):
                                     cli_args.selfplay_weight = float(cli_args.selfplay_weight + cli_args.monologue_selfplay_bonus)
+                                
+                                # Enhanced: Dopamine reward for strong consistency scores
+                                if monolog_score >= 0.90:
+                                    try:
+                                        # Calculate consistency-based dopamine score
+                                        consistency_reward = min(1.0, monolog_score * 1.2)  # Scale and cap at 1.0
+                                        good_traces = [t for t, v in zip(traces, vals) if v.is_valid]
+                                        prog_len = _extract_program_len([getattr(t, "operations", []) for t in good_traces])
+                                        
+                                        # Use enhanced scoring with consistency bonus
+                                        R, comps = _dopamine_score(
+                                            em=consistency_reward,
+                                            acc=consistency_reward,
+                                            iou=0.8,  # Reasonable default for consistency
+                                            program_len=prog_len,
+                                            entropy_red=0.1,
+                                            mdl_gain=0.1,
+                                            novelty=0.5,
+                                            Lmax=12
+                                        )
+                                        
+                                        ema = _dopamine_ema.update(R)
+                                        advantage = R - ema
+                                        
+                                        # More lenient threshold for consistency rewards
+                                        if advantage >= 0.10:
+                                            logger.info(f"[Monologue] Consistency dopamine: score={monolog_score:.3f}, R={R:.3f}, adv={advantage:.3f}")
+                                            dopamine_reward(star_task, self_play_buffer, logger, global_step,
+                                                            score=float(advantage), components=comps)
+                                            
+                                            # Update operation success counts from consistent traces
+                                            for t in good_traces:
+                                                if hasattr(t, "operations") and t.operations:
+                                                    # Use _stringify_ops to ensure all operations are hashable strings
+                                                    safe_ops = _stringify_ops(t.operations)
+                                                    if safe_ops:
+                                                        for sop in safe_ops:
+                                                            op_success_count.update({sop: max(1, int(5 * max(0.0, advantage)))})
+                                    except Exception as e:
+                                        logger.debug(f"[Monologue] Consistency dopamine failed: {e}")
                             else:
                                 # Reasoning shaky → increase nightmare pressure & shorten interval
                                 recent = getattr(cli_args, "nightmare_min_interval", 200)
@@ -1152,7 +1908,10 @@ def main():
                         # Only keep exact matches to avoid incorrect targets
                         exact_deep = [dp for dp in deep if dp.get("exact_match")]
                         for _dp in exact_deep:
-                            self_play_buffer.buffer.append((grid_in.detach().cpu(), grid_out.detach().cpu()))
+                            # Store canonical encoded samples
+                            enc_inp = _encode_grid_tensor(grid_in)
+                            enc_out = _encode_grid_tensor(grid_out)
+                            self_play_buffer.buffer.append((enc_inp, enc_out))
                         logger.info(f"[Curriculum] Injected {len(exact_deep)} deep-program exemplars")
                 except Exception as e:
                     logger.warning(f"[Curriculum] deep mining failed: {e}")
@@ -1188,18 +1947,74 @@ def main():
                         if new_puzzles:
                             print(f"[SelfPlay] Generated {len(new_puzzles)} puzzles at step={global_step}")
                         else:
-                            print(f"[SelfPlay] No puzzles generated (fallback used) at step={global_step}")
+                            print(f"[SelfPlay] No puzzles generated at step={global_step} → trying Dream motifs")
+                            if hasattr(topas_model, "dream") and hasattr(topas_model, "painter"):
+                                try:
+                                    # Get last Dream features
+                                    dream_feat = getattr(topas_model.dream, "last_features", None)
+                                    if dream_feat is not None:
+                                        grid, logits, size = topas_model.painter(dream_feat)
+                                        enc_in = _encode_grid_tensor(grid)
+                                        # Cheap target: identity reconstruction
+                                        enc_out = _encode_grid_tensor(grid.clone())
+                                        self_play_buffer.buffer.append((enc_in, enc_out, 0.1))
+                                        print(f"[Dream→SelfPlay] Injected 1 painter-motif puzzle (buffer={len(self_play_buffer.buffer)})")
+                                except Exception as e:
+                                    print(f"[Dream→SelfPlay] Painter fallback failed: {e}")
                 except Exception as e:
                     import traceback
                     logging.getLogger(__name__).exception("[SelfPlay] failure: %s", e)
                 
-                # Sample and compute self-play loss
-                sp_samples = self_play_buffer.sample_batch(4)
-                if sp_samples:
-                    print(f"[SelfPlay] Training on {len(sp_samples)} puzzles")
-                    for sp_input, sp_target in sp_samples:
+                # Sample and compute self-play loss with importance replay
+                def extract_score(sample):
+                    """
+                    Extract score from sample tuple, handling both (input, output) and (input, output, score) formats.
+                    Dream→Painter samples carry a default score of 0.1, but we give them a small novelty bonus so they don't get drowned out.
+                    """
+                    score = 0.0
+                    if len(sample) >= 3:
+                        raw = sample[2]
+                        score = float(raw) if hasattr(raw, "__float__") else 0.0
+                    # Detect Dream-derived motifs (tiny 0.1 baseline score) and up-weight them
+                    if abs(score - 0.1) < 1e-6:
+                        score += 0.2  # novelty bonus
+                    return score
+                
+                # Sample larger batch for stochastic importance weighting
+                sp_candidates = self_play_buffer.sample_batch(32)
+                if sp_candidates:
+                    # Extract scores and compute stochastic importance weights
+                    sp_candidates_with_scores = [(s, extract_score(s)) for s in sp_candidates]
+                    scores = np.array([score for _, score in sp_candidates_with_scores])
+                    
+                    # Use stochastic importance sampling with softmax weighting
+                    if np.sum(scores) > 0:
+                        # Apply softmax with numerical stability
+                        exp_scores = np.exp(scores - np.max(scores))
+                        probabilities = exp_scores / np.sum(exp_scores)
+                        # Sample up to 4 puzzles using importance weights (boundary check)
+                        sample_size = min(4, len(sp_candidates))
+                        selected_indices = np.random.choice(len(sp_candidates), size=sample_size, replace=False, p=probabilities)
+                    else:
+                        # Fallback to uniform random sampling if no scores available (boundary check)
+                        sample_size = min(4, len(sp_candidates))
+                        selected_indices = np.random.choice(len(sp_candidates), size=sample_size, replace=False)
+                    
+                    sp_samples = [sp_candidates_with_scores[i][0] for i in selected_indices]
+                    
+                    print(f"[SelfPlay] Training on {sample_size} importance-weighted puzzles from {len(sp_candidates)} candidates")
+                    for sp_sample in sp_samples:
+                        # Handle both tuple formats: (input, output) and (input, output, score)
+                        sp_input = sp_sample[0]
+                        sp_target = sp_sample[1]
                         try:
-                            sp_output = topas_model.forward_pretraining(sp_input.unsqueeze(0), target_shape=sp_target.shape[-2:])
+                            # Decode if samples are encoded tuples
+                            if not torch.is_tensor(sp_input):
+                                sp_input = _decode_grid(sp_input)
+                            if not torch.is_tensor(sp_target):
+                                sp_target = _decode_grid(sp_target)
+                            sp_output = topas_model.forward_pretraining(sp_input.unsqueeze(0),
+                                                                        target_shape=sp_target.shape[-2:])
                             if 'logits' in sp_output:
                                 sp_loss = F.cross_entropy(sp_output['logits'].view(-1, 10), sp_target.view(-1).long().clamp(0, 9))
                                 sp_loss_contribution += sp_loss * cli_args.selfplay_weight
@@ -1216,6 +2031,19 @@ def main():
                                     topas_model.relmem.add_exception(0, "has_attr", 0)
                         except Exception:
                             pass
+
+                    # Alpha-ARC X: Sample from replay buffer for additional learning
+                    if replay_buffer is not None and len(replay_buffer) > 0:
+                        try:
+                            replay_samples = replay_buffer.sample(2)  # Sample 2 programs
+                            for program_ops, priority in replay_samples:
+                                if program_ops:
+                                    # Update op_success_count with replay programs
+                                    for op in program_ops:
+                                        op_success_count.update({op: max(1, int(priority * 5))})
+                            logger.info(f"[Alpha-ARC X] Updated op_success_count with {len(replay_samples)} replay programs")
+                        except Exception as e:
+                            logger.warning(f"[Alpha-ARC X] Replay sampling failed: {e}")
                 else:
                     print(f"[SelfPlay] No samples available for training")
             
