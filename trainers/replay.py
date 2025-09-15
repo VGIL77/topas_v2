@@ -116,6 +116,10 @@ class PrioritizedReplay:
         self.program_signatures: Dict[str, int] = defaultdict(int)
         self.operation_counts: Dict[str, int] = defaultdict(int)
 
+    def __len__(self) -> int:
+        """Return the number of traces in the buffer."""
+        return len(self.traces)
+
     def _compute_priority(self, trace: ProgramTrace) -> float:
         """
         Compute sampling priority for a trace.

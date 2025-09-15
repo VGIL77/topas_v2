@@ -1,0 +1,78 @@
+{
+  "training": {
+    "num_epochs": 150,
+    "batch_size": 32,
+    "learning_rate": 1e-4,
+    "grad_clip": 1.0,
+    "save_every": 5,
+    "log_interval": 10
+  },
+
+  "search": {
+    "search_alg": "puct",
+    "puct_nodes": 50,
+    "puct_depth": 6,
+    "c_puct": 1.25,
+    "root_dirichlet_alpha": 0.3,
+    "root_dirichlet_eps": 0.25,
+    "sc_star": 5
+  },
+
+  "replay": {
+    "enable": true,
+    "replay_cap": 100000,
+    "near_miss_hamming_pct": 5.0,
+    "sample_per_step": 2,
+    "importance_sampling": true
+  },
+
+  "dopamine": {
+    "breakthrough_threshold": 0.10,
+    "nightmare_alpha": 0.08,
+    "nightmare_min_interval": 200,
+    "nightmare_max_interval": 1000
+  },
+
+  "relmem": {
+    "relmem_enable": true,
+    "relmem_reg_alpha": 1e-3,
+    "relmem_reg_beta": 5e-4,
+    "relmem_bind_iou": 0.25,
+    "relmem_op_bias_schedule": "0:0.25,5:0.85,30:0.25",
+    "relmem_bias_ramp_start": 10,
+    "relmem_bias_max": 0.5
+  },
+
+  "dream": {
+    "enable_dream": true,
+    "dream_micro_ticks": 5,
+    "dream_full_every": 10,
+    "dream_full_timeout": 600,
+    "dream_background": false,
+    "dream_force_cpu": false,
+    "dream_pretrain_epochs": 3,
+    "dream_pretrain_freeze_model": true
+  },
+
+  "selfplay": {
+    "selfplay_enable": true,
+    "selfplay_interval": 250,
+    "selfplay_weight": 0.1,
+    "selfplay_topk": 3,
+    "selfplay_buffer_size": 200
+  },
+
+  "monologue": {
+    "monologue_interval": 200,
+    "monologue_min_traces": 6,
+    "monologue_consistency_target": 0.85,
+    "monologue_selfplay_bonus": 0.05
+  },
+
+  "eval": {
+    "eval_interval": 5,
+    "dataset": "arc2"
+  },
+
+  "device": "cuda:0"
+}
