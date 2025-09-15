@@ -182,6 +182,16 @@ class HRMGuidedDSLSelector(nn.Module):
 
             # Scale/resize factors (sx, sy)
             param_priors["scale_logits"] = self.scale_head(z_L)
+
+            # Crop bbox: coarse corners (y0,x0,y1,x1)
+            if not hasattr(self, "crop_head"):
+                self.crop_head = nn.Linear(self.config.hrm_hidden_size, 4).to(z_H.device)
+            # Flip axis prior (0: H, 1: V)
+            if not hasattr(self, "axis_head"):
+                self.axis_head = nn.Linear(self.config.hrm_hidden_size, 2).to(z_H.device)
+
+            param_priors["crop_bbox_logits"] = self.crop_head(z_H)
+            param_priors["flip_axis_logits"] = self.axis_head(z_H)
         except Exception as e:
             import logging
             logging.debug(f"[HRMGuidedDSLSelector] param priors skipped: {e}")

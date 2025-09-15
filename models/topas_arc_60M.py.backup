@@ -115,24 +115,7 @@ class _DSLShim:
                     probs = torch.softmax(ctrl["color_map_logits"], dim=-1)
                     mapping = {i: int(probs[i].argmax().item()) for i in range(10)}
                     return {"mapping": mapping}
-                # Add other parametric ops similarly...                
-                # Crop bbox from logits (y0,x0,y1,x1) in [0,1] → indices
-                if op in ("crop_bbox","crop_nonzero") and "crop_bbox_logits" in ctrl:
-                    import torch
-                    y0,x0,y1,x1 = torch.sigmoid(ctrl["crop_bbox_logits"]).tolist()
-                    H, W = grid.shape[-2], grid.shape[-1]
-                    y0i = max(0, int(y0 * (H//2)))
-                    x0i = max(0, int(x0 * (W//2)))
-                    y1i = max(y0i+1, int(y1 * H))
-                    x1i = max(x0i+1, int(x1 * W))
-                    return {"y0": y0i, "x0": x0i, "y1": y1i, "x1": x1i}
-                # Flip: choose op by axis prior
-                if op in ("flip_h","flip_v") and "flip_axis_logits" in ctrl:
-                    import torch
-                    _axis = int(torch.argmax(ctrl["flip_axis_logits"]).item())
-                    # No numeric params; op name encodes axis. Return {} so shim uses chosen op.
-                    return {}
-                
+                # Add other parametric ops similarly...
         except Exception:
             pass
         return {}

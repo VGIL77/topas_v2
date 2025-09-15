@@ -46,40 +46,6 @@ try:
     from trainers.puct_search import puct_search
 except Exception:
     puct_search = None
-
-def puct_search_flexible(*args, **kwargs):
-    """
-    Try to call the available puct_search implementation with the kwargs provided.
-    If TypeError occurs due to unexpected kwargs, try common alternative kw/positional layouts.
-    This is defensive (works with multiple flavors of puct_search).
-    """
-    if puct_search is None:
-        raise RuntimeError("puct_search not available")
-
-    # First, try the direct call
-    try:
-        return puct_search(*args, **kwargs)
-    except TypeError as e:
-        # Try common alternate kwnames:
-        alt_kwargs = dict(kwargs)
-        # Map max_nodes -> num_simulations
-        if 'max_nodes' in kwargs:
-            alt_kwargs.pop('max_nodes', None)
-            alt_kwargs['num_simulations'] = kwargs.get('max_nodes')
-
-        try:
-            return puct_search(*args, **alt_kwargs)
-        except TypeError:
-            # Last-resort try: positional fallback for classic signature
-            try:
-                if len(args) >= 4 and ('max_nodes' in kwargs or 'num_simulations' in kwargs):
-                    nodes = kwargs.get('max_nodes') or kwargs.get('num_simulations')
-                    c_puct_val = kwargs.get('c_puct', 1.4)
-                    return puct_search(args[0], args[1], args[2], args[3], nodes, c_puct_val)
-            except Exception:
-                pass
-            # Re-raise the original error for visibility
-            raise
 try:
     from trainers.replay import PrioritizedReplay
 except Exception:
@@ -88,27 +54,6 @@ try:
     from trainers.near_miss import near_miss_repair
 except Exception:
     near_miss_repair = None
-
-def move_to_device(obj, device):
-    """
-    Recursively move nested objects (dataclasses, dicts, lists, tuples, tensors) to device.
-    """
-    import dataclasses
-    if torch.is_tensor(obj):
-        return obj.to(device)
-    if dataclasses.is_dataclass(obj):
-        # create new dataclass instance with moved fields
-        kwargs = {}
-        for f in dataclasses.fields(obj):
-            val = getattr(obj, f.name)
-            kwargs[f.name] = move_to_device(val, device)
-        return obj.__class__(**kwargs)
-    if isinstance(obj, dict):
-        return {k: move_to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        seq = [move_to_device(v, device) for v in obj]
-        return type(obj)(seq)
-    return obj  # fallback: leave it as-is
 
 def _canonical_puzzle_id(task_id, modulo: int = 1000) -> int:
     """
@@ -292,31 +237,11 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
             return grid_s
 
     for _ in range(max(1, int(cli_args.puct_depth))):
-        # PUCT search requires policy and value networks - use HRM bridge components
-        try:
-            # Extract policy and value from the HRM-TOPAS bridge if available
-            if hasattr(model, 'hrm_topas_bridge'):
-                policy_net = model.hrm_topas_bridge
-                value_net = model.hrm_topas_bridge
-
-                best_program, search_stats = puct_search_flexible(
-                    demos,
-                    state_grid,
-                    policy_net,
-                    value_net,
-                    max_nodes=int(cli_args.puct_nodes),
-                    c_puct=float(cli_args.c_puct)
-                )
-
-                if best_program and hasattr(best_program, 'operations'):
-                    best_op = best_program.operations[0] if best_program.operations else None
-                else:
-                    best_op = None
-            else:
-                best_op = None
-        except Exception as e:
-            logging.debug(f"[PUCT] Planning error: {e}")
-            best_op = None
+        best_op, _ = puct_search(
+            state_grid, priors_fn, value_fn, expand_fn,
+            max_nodes=int(cli_args.puct_nodes),
+            c_puct=float(cli_args.c_puct)
+        )
         try:
             state_grid = model.dsl.apply(best_op, state_grid)
             program_ops.append(best_op)
@@ -1277,7 +1202,6 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                                 logging.info(f"Step {global_step}: ce_loss={ce_loss:.3f}, {loss_name}={loss_value:.3f}")
 
                 # === Joint HRM Training with ACT Loss ===
-                # === Joint HRM Training with ACT Loss ===
                 if hasattr(topas_model, 'planner_loss_head') and global_step > 1000:  # After initial warmup
                     try:
                         # Ensure HRM planner_loss_head is on correct device
@@ -1288,21 +1212,6 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         tokens = topas_model.grid_to_tokens(input_grid)
                         # CRITICAL: Ensure tokens are on correct device immediately
                         tokens = tokens.to(device)
-
-                        # Fix tensor size mismatch - ensure tokens match HRM expected size
-                        if hasattr(topas_model.planner_loss_head, 'inner') and hasattr(topas_model.planner_loss_head.inner.config, 'seq_len'):
-                            expected_len = topas_model.planner_loss_head.inner.config.seq_len
-                            current_len = tokens.shape[1]
-                            if current_len != expected_len:
-                                if current_len > expected_len:
-                                    # Truncate if too long
-                                    tokens = tokens[:, :expected_len]
-                                else:
-                                    # Pad if too short
-                                    pad_size = expected_len - current_len
-                                    pad_token = 0  # Use 0 as padding token
-                                    padding = torch.full((tokens.shape[0], pad_size), pad_token, device=device, dtype=tokens.dtype)
-                                    tokens = torch.cat([tokens, padding], dim=1)
 
                         # task_id was already unpacked above from the dataloader tuple
                         raw_pid = task_id
@@ -1325,15 +1234,11 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         }
                         carry = topas_model.planner_loss_head.initial_carry(batch_dict)
 
-                        # Robustly move carry (including nested dataclasses) to correct device
-                        carry = move_to_device(carry, device)
-
-                        # Debug tensor shapes before HRM forward pass
-                        logging.info(f"[HRM DEBUG] batch_dict shapes: inputs={batch_dict['inputs'].shape}, labels={batch_dict['labels'].shape}, puzzle_ids={batch_dict['puzzle_identifiers'].shape}")
-                        logging.info(f"[HRM DEBUG] carry type: {type(carry)}")
-                        if hasattr(carry, 'inner_carry'):
-                            logging.info(f"[HRM DEBUG] carry.inner_carry z_H shape: {carry.inner_carry.z_H.shape}")
-                            logging.info(f"[HRM DEBUG] carry.inner_carry z_L shape: {carry.inner_carry.z_L.shape}")
+                        # Ensure carry is on correct device
+                        if isinstance(carry, dict):
+                            carry = {k: v.to(device) if torch.is_tensor(v) else v for k, v in carry.items()}
+                        elif torch.is_tensor(carry):
+                            carry = carry.to(device)
 
                         new_carry, hrm_loss, hrm_metrics, _, _ = topas_model.planner_loss_head(
                             return_keys=[], carry=carry, batch=batch_dict
@@ -1346,7 +1251,7 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         # Only add HRM loss if it has gradients
                         if isinstance(hrm_loss, torch.Tensor) and hrm_loss.requires_grad:
                             total_loss = total_loss + 0.2 * hrm_loss  # Start with modest weight
-
+                        
                         # Log HRM metrics
                         if global_step % 100 == 0:
                             lm_loss = hrm_metrics.get("lm_loss", 0.0)
@@ -1355,12 +1260,6 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                     except Exception as e:
                         if global_step % 100 == 0:
                             logging.warning(f"[HRM-Joint] Supervision failed: {e}")
-                            # Add detailed shape debugging on failure
-                            try:
-                                logging.info(f"[HRM DEBUG] Failed batch_dict shapes: inputs={batch_dict['inputs'].shape}, labels={batch_dict['labels'].shape}")
-                                logging.info(f"[HRM DEBUG] Failed carry details: {type(carry)}")
-                            except:
-                                logging.info(f"[HRM DEBUG] Could not extract debug shapes")
                 
                 # ---- RelMem auxiliary loss every N steps (with warm-up) ----
                 # Delay RelMem until after 5 epochs (~2000 steps)
@@ -1575,6 +1474,23 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
         logging.exception("Exception in train_step")
         return None
 
+
+# === Lightweight curriculum heuristics ===
+def _heuristic_difficulty(demo_in: torch.Tensor, demo_out: torch.Tensor) -> str:
+    """Cheap proxy: size, palette, and rough difference."""
+    try:
+        H, W = demo_in.shape[-2], demo_in.shape[-1]
+        size_score = int(H*W >= 16) + int(H*W >= 64) + int(H*W >= 196)
+        palette = int(torch.unique(demo_in).numel())
+        color_score = int(palette >= 3) + int(palette >= 5)
+        diff = (demo_in.view(-1) != demo_out.view(-1)).float().mean().item()
+        diff_score = int(diff > 0.4) + int(diff > 0.7)
+        s = size_score + color_score + diff_score
+        return "easy" if s <= 2 else ("medium" if s <= 4 else "hard")
+    except Exception:
+        return "medium"
+
+
 def main():
     logger = setup_logging()
     print("🚀 Starting Simplified HRM-TOPAS Training")
@@ -1688,6 +1604,11 @@ def main():
     best_acc = 0.0
     stable_breakthrough_steps = 0  # counts metric windows at/above threshold for curriculum trigger
 
+        # === Curriculum state ===
+    active_bucket = "easy"
+    bucket_unlock_patience = 3   # consecutive high-EM ticks to unlock next
+    bucket_streak = 0
+    
     for epoch in range(num_epochs):
         # === RelMem bias scheduling ===
         if hasattr(topas_model.config, 'relmem_op_bias_w'):
@@ -1710,7 +1631,21 @@ def main():
         progress = tqdm(dataloader, desc=f"Epoch {epoch+1}")
 
         for batch_idx, batch in enumerate(progress):
-            # Compute metrics every 10 steps
+            
+            # --- Curriculum gating by heuristic difficulty ---
+            try:
+                demos, test_inputs, test_outputs, task_id = batch
+                if demos and len(demos) > 0:
+                    d_in, d_out = demos[0][0], demos[0][1]
+                    difficulty = _heuristic_difficulty(d_in, d_out)
+                    if active_bucket == "easy" and difficulty != "easy":
+                        continue
+                    if active_bucket == "medium" and difficulty == "hard":
+                        continue
+            except Exception:
+                pass
+            
+                        # Compute metrics every 10 steps
             compute_metrics_now = (global_step % 10 == 0)
             
             result = train_step(
@@ -1726,7 +1661,25 @@ def main():
                     loss, metrics = result
                     em_val = float(metrics.get("exact_match", 0.0))
                     rolling_em.append(em_val)
-                    # reconstruct current task from batch for trace gen / buffer
+                    
+                    # Curriculum unlock: promote buckets when stable high EM
+                    try:
+                        if em_val >= 0.90:
+                            bucket_streak += 1
+                        else:
+                            bucket_streak = 0
+                        if bucket_streak >= bucket_unlock_patience:
+                            if active_bucket == "easy":
+                                active_bucket = "medium"
+                                logger.info("[Curriculum] Unlocked MEDIUM tasks")
+                            elif active_bucket == "medium":
+                                active_bucket = "hard"
+                                logger.info("[Curriculum] Unlocked HARD tasks")
+                            bucket_streak = 0
+                    except Exception:
+                        pass
+                    
+                                        # reconstruct current task from batch for trace gen / buffer
                     demos, test_inputs, test_outputs, task_id = batch
                     if demos and len(demos) > 0:
                         grid_in = demos[0][0].to(device)
@@ -1862,64 +1815,23 @@ def main():
                             dopamine_reward(star_task, self_play_buffer, logger, global_step,
                                             score=float(advantage), components=comps)
 
-                            # Alpha-ARC X: Add successful programs to replay buffer with comprehensive debugging
+                            # Alpha-ARC X: Add successful programs to replay buffer
                             if replay_buffer is not None:
                                 try:
-                                    all_candidates = []
-                                    if good_traces:
-                                        all_candidates.extend(good_traces)
+                                    for t in good_traces:
+                                        if hasattr(t, "operations") and t.operations:
+                                            safe_ops = _stringify_ops(t.operations)
+                                            if safe_ops:
+                                                priority = float(advantage) + 0.1  # Ensure positive priority
+                                                replay_buffer.add(safe_ops, priority)
                                     if programs:
-                                        all_candidates.extend(programs)
-
-                                    logger.info(f"[REPLAY DEBUG] candidate_programs (count={len(all_candidates)}): {[str(p)[:30] + '...' if len(str(p)) > 30 else str(p) for p in all_candidates]}")
-
-                                    # Debug replay add filters (relaxed for breakthrough detection)
-                                    replay_min_novelty = 0.0
-                                    replay_max_len = 20
-                                    logger.info(f"[REPLAY DEBUG] replay_add_filters: min_novelty={replay_min_novelty}, max_len={replay_max_len}")
-
-                                    accepted_count = 0
-                                    for i, candidate in enumerate(all_candidates):
-                                        ok = True
-                                        try:
-                                            # Check canonicalization/extraction
-                                            if hasattr(candidate, "operations") and candidate.operations:
-                                                prog_ops = _stringify_ops(candidate.operations)
-                                            elif isinstance(candidate, (list, tuple)):
-                                                prog_ops = _stringify_ops(candidate)
-                                            else:
-                                                prog_ops = _stringify_ops([candidate])
-
-                                            logger.info(f"[REPLAY DEBUG] program[{i}] ops: {prog_ops}")
-                                            logger.info(f"[REPLAY DEBUG] program[{i}] ops_length: {len(prog_ops)}")
-
-                                            # Check length filter
-                                            if len(prog_ops) == 0:
-                                                ok = False
-                                                logger.warning(f"[REPLAY DEBUG] program[{i}] REJECTED: empty operations")
-                                            elif len(prog_ops) > replay_max_len:
-                                                ok = False
-                                                logger.warning(f"[REPLAY DEBUG] program[{i}] REJECTED: too long {len(prog_ops)} > {replay_max_len}")
-
-                                            # If passes filters, add to replay (using correct .push() method)
-                                            if ok and prog_ops:
-                                                replay_buffer.push({
-                                                    "program": prog_ops,
-                                                    "params": [{}] * len(prog_ops),
-                                                    "score": float(max(0.05, advantage)),
-                                                    "novelty": 0.3,
-                                                    "depth": len(prog_ops)
-                                                })
-                                                accepted_count += 1
-                                                logger.info(f"[REPLAY DEBUG] program[{i}] ACCEPTED and PUSHED")
-
-                                        except Exception as e:
-                                            ok = False
-                                            logger.warning(f"[REPLAY DEBUG] program[{i}] processing failed: {e}")
-
-                                    logger.info(f"[REPLAY DEBUG] final add count candidate->accepted: {len(all_candidates)} -> {accepted_count}")
-                                    logger.info(f"[Alpha-ARC X] Added {accepted_count} programs to replay buffer (buffer_size={len(replay_buffer)})")
-
+                                        for prog in programs:
+                                            if prog:
+                                                safe_prog = _stringify_ops(prog)
+                                                if safe_prog:
+                                                    priority = float(advantage) + 0.1
+                                                    replay_buffer.add(safe_prog, priority)
+                                    logger.info(f"[Alpha-ARC X] Added {len(good_traces) + len(programs)} programs to replay buffer")
                                 except Exception as e:
                                     logger.warning(f"[Alpha-ARC X] Replay buffer addition failed: {e}")
 
