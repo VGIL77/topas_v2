@@ -1620,7 +1620,32 @@ class TopasARC60M(nn.Module):
                             import logging
                             logging.getLogger().warning(f"[RelMem] error merging op_bias: {e}")
                             print(f"[RelMem] op_bias integration failed: {e}")
-                    
+
+                    # Wormhole Macro-op Biasing (BitterBot's 85% enhancement)
+                    if hasattr(self, "dream") and self.dream is not None and hasattr(self.dream, "wormhole") and self.dream.wormhole is not None:
+                        try:
+                            macro_ops = []
+                            # Retrieve top 5 macro-operations from DreamEngine's wormhole
+                            if hasattr(self.dream.wormhole, "library"):
+                                top_templates = self.dream.wormhole.library.get_templates_by_score(max_count=5)
+                                for tpl in top_templates:
+                                    if hasattr(tpl, "get_primitive_ops"):
+                                        for op_name in tpl.get_primitive_ops():
+                                            macro_ops.append(op_name)
+                            elif hasattr(self.dream.wormhole, "templates"):
+                                templates_list = list(self.dream.wormhole.templates.values())
+                                templates_list.sort(key=lambda t: getattr(t, "score", 0.0), reverse=True)
+                                for tpl in templates_list[:5]:
+                                    if hasattr(tpl, "get_primitive_ops"):
+                                        for op_name in tpl.get_primitive_ops():
+                                            macro_ops.append(op_name)
+                            for op in set(macro_ops):
+                                op_bias[op] = op_bias.get(op, 0.0) + 0.25
+                            if macro_ops:
+                                print(f"[Wormhole] Biased ops {set(macro_ops)} by +0.25")
+                        except Exception as e:
+                            print(f"[Wormhole] Macro-op bias failed: {e}")
+
                     # Enhanced beam_search call with operation bias
                     dsl_result = beam_search(demos, test_grid[0] if test_grid.dim() == 4 else test_grid, 
                                             priors, depth=depth, beam=beam_w, verbose=self.config.verbose,
@@ -2811,9 +2836,12 @@ class TopasARC60M(nn.Module):
                 # Bind concept to RelMem
                 if hasattr(self.relmem, 'bind_concept'):
                     # Extract brain tensor for binding
-                    brain_tensor = concept_data["brain_latent"]
-                    if brain_tensor.device != self.relmem.device:
-                        brain_tensor = brain_tensor.to(self.relmem.device)
+                    brain_tensor = concept_data["brain_latent"].to(self.relmem.device)
+                    # Project if dimensionality mismatch (e.g. 1024 → 256)
+                    if brain_tensor.shape[-1] != self.relmem.D:
+                        if not hasattr(self, "relmem_proj_down"):
+                            self.relmem_proj_down = nn.Linear(brain_tensor.shape[-1], self.relmem.D).to(brain_tensor.device)
+                        brain_tensor = self.relmem_proj_down(brain_tensor)
                     
                     # Find next available concept ID
                     concept_id = None

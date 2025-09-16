@@ -21,6 +21,7 @@ import traceback
 import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
+import math
 from trainers.arc_dataset_loader import ARCDataset
 try:
     from arc2_dataset_loader import ARC2Dataset
@@ -243,10 +244,18 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
             c_puct=float(cli_args.c_puct)
         )
         try:
-            state_grid = model.dsl.apply(best_op, state_grid)
-            program_ops.append(best_op)
-            if torch.is_tensor(target_grid) and (state_grid.shape == target_grid.shape) and (state_grid == target_grid).all():
-                break
+            # Ensure op is hashable before appending
+            safe_op = str(best_op) if best_op is not None else None
+            if isinstance(best_op, dict):
+                safe_list = _stringify_ops([best_op])
+                if safe_list:
+                    safe_op = safe_list[0]
+
+            if safe_op:
+                state_grid = model.dsl.apply(best_op, state_grid)
+                program_ops.append(safe_op)
+                if torch.is_tensor(target_grid) and (state_grid.shape == target_grid.shape) and (state_grid == target_grid).all():
+                    break
         except Exception:
             break
     return program_ops
@@ -695,10 +704,16 @@ def parse_args():
     # Eval args
     parser.add_argument("--eval-interval", type=int, default=5,
                         help="Run evaluation every N epochs")
+    parser.add_argument("--eval-beam-width", type=int, default=None,
+                        help="Beam width for evaluation beam search (overrides model config).")
+    parser.add_argument("--ebr-steps", type=int, default=None,
+                        help="Number of EBR refinement steps (overrides model config).")
     
     # Training args
     parser.add_argument("--max-steps", type=int, default=60000,
                         help="Maximum training steps")
+    parser.add_argument("--bucket-unlock-patience", type=int, default=0,
+                        help="Epochs with no EM improvement before unlocking next task bucket (0 disables).")
     parser.add_argument("--dataset", type=str, default="arc1", choices=["arc1", "arc2"],
                         help="Dataset to use: arc1 (original training) or arc2 (ARC Prize 2025)")
 
@@ -1226,10 +1241,34 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                             pid = int(hashlib.sha1(str(raw_pid).encode()).hexdigest(), 16) % 1000
                         puzzle_ids = torch.tensor([pid], device=device, dtype=torch.long)
                         
+                        # --- HRM token normalization ---
+                        # HRM always produces seq_len+1 logits (EOS step included).
+                        # Labels must also be padded to seq_len+1, with ignore_index=-100 for the EOS slot.
+                        seq_len = getattr(topas_model.planner.config, "seq_len", tokens.size(1))
+                        target_len = seq_len + 1
+
+                        inputs_norm = tokens.to(device)
+                        labels_norm = tokens.to(device)
+
+                        # Truncate/pad to exactly target_len
+                        if inputs_norm.size(1) > target_len:
+                            inputs_norm = inputs_norm[:, :target_len]
+                            labels_norm = labels_norm[:, :target_len]
+                        elif inputs_norm.size(1) < target_len:
+                            pad_len = target_len - inputs_norm.size(1)
+                            pad_inputs = torch.zeros(inputs_norm.size(0), pad_len, device=device, dtype=inputs_norm.dtype)
+                            pad_labels = torch.full((labels_norm.size(0), pad_len), -100, device=device, dtype=labels_norm.dtype)
+                            inputs_norm = torch.cat([inputs_norm, pad_inputs], dim=1)
+                            labels_norm = torch.cat([labels_norm, pad_labels], dim=1)
+
+                        # Debug probe
+                        if global_step % 200 == 0:
+                            logging.info(f"[HRM-Supervision] aligned inputs={inputs_norm.shape[1]}, labels={labels_norm.shape[1]}, seq_len={seq_len}, target_len={target_len}")
+
                         # Ensure all tensors are on the same device
                         batch_dict = {
-                            "inputs": tokens.to(device),
-                            "labels": tokens.to(device),  # Identity reconstruction for early training
+                            "inputs": inputs_norm,
+                            "labels": labels_norm,
                             "puzzle_identifiers": puzzle_ids.to(device)
                         }
                         carry = topas_model.planner_loss_head.initial_carry(batch_dict)
@@ -1604,10 +1643,11 @@ def main():
     best_acc = 0.0
     stable_breakthrough_steps = 0  # counts metric windows at/above threshold for curriculum trigger
 
-        # === Curriculum state ===
-    active_bucket = "easy"
-    bucket_unlock_patience = 3   # consecutive high-EM ticks to unlock next
-    bucket_streak = 0
+    # === Enhanced Curriculum state ===
+    active_bucket = 1
+    stagnation_epochs = 0
+    bucket_count = 8
+    bucket_size = math.ceil(len(dataset) / bucket_count) if len(dataset) > 0 else 1
     
     for epoch in range(num_epochs):
         # === RelMem bias scheduling ===
@@ -1625,6 +1665,8 @@ def main():
             print(f"[RelMem] Epoch {epoch}: bias_w={topas_model.config.relmem_op_bias_w:.3f}")
         
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
+        if cli_args.bucket_unlock_patience and cli_args.bucket_unlock_patience > 0:
+            print(f"[Bucket] Active bucket: {active_bucket}/{bucket_count}")
         epoch_losses = []
         epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': [], 'exact_match_refined': []}
         from tqdm import tqdm

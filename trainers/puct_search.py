@@ -676,11 +676,12 @@ def puct_search(
     policy_net: torch.nn.Module,
     value_net: torch.nn.Module,
     num_simulations: int = 800,
+    max_nodes: int = None,  # BitterBot enhancement: support legacy max_nodes parameter
     c_puct: float = 1.4,
     max_depth: int = 10,
     timeout_seconds: float = 30.0,
     device: torch.device = None
-) -> Tuple[Optional[DSLProgram], Dict[str, Any]]:
+) -> Tuple[Optional[str], float]:
     """
     Convenience function to run PUCT search with default parameters
 
@@ -696,9 +697,13 @@ def puct_search(
         device: Compute device
 
     Returns:
-        best_program: Best program found
-        search_info: Search statistics
+        best_op: Best operation found (string)
+        best_value: Value estimate (float)
     """
+    # BitterBot enhancement: Support both max_nodes and num_simulations parameters
+    if max_nodes is not None:
+        num_simulations = max_nodes
+
     searcher = PUCTSearcher(
         policy_net=policy_net,
         value_net=value_net,
@@ -707,7 +712,17 @@ def puct_search(
         device=device
     )
 
-    return searcher.search(demos, test_input, num_simulations, timeout_seconds)
+    best_program, search_info = searcher.search(demos, test_input, num_simulations, timeout_seconds)
+
+    # Extract best operation and value, ensure consistent tuple return
+    if best_program and hasattr(best_program, 'operations') and best_program.operations:
+        best_op = str(best_program.operations[0])
+        best_value = float(search_info.get('best_value', 0.0))
+    else:
+        best_op = None
+        best_value = 0.0
+
+    return best_op, best_value
 
 
 # Legacy interface compatibility for existing code

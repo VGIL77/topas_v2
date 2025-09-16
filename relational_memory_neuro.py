@@ -189,10 +189,19 @@ class RelationalMemoryNeuro(nn.Module):
         if 0 <= cid < self.N:
             self.concept_used[cid] = True
             # Queue for post-optimizer (no in-place ops during forward)
-            if vec.dim() == 1: 
+            if vec.dim() == 1:
                 vec = vec.unsqueeze(0)
+
+            # RelMem Loss Safety: Project if dimensional mismatch
+            processed_vec = vec.mean(0).detach()
+            if processed_vec.shape[-1] != self.D:
+                # Project once if dimensional mismatch
+                if not hasattr(self, "_proj_bind"):
+                    self._proj_bind = nn.Linear(processed_vec.shape[-1], self.D).to(self.device)
+                processed_vec = self._proj_bind(processed_vec)
+
             self.pending_concept_updates = getattr(self, 'pending_concept_updates', {})
-            self.pending_concept_updates[cid] = (vec.mean(0).detach().cpu(), alpha)
+            self.pending_concept_updates[cid] = (processed_vec.cpu(), alpha)
 
     def queue_hebbian_update(self, rel: str, sid: int, oid: int, eta: float = 0.1):
         """Queue Hebbian update for post-optimizer application"""
