@@ -722,7 +722,21 @@ def puct_search(
         best_op = None
         best_value = 0.0
 
-    return best_op, best_value
+    # Ensure consistent return type
+    try:
+        # If best_op is a dict, stringify it
+        if isinstance(best_op, dict):
+            from trainers.utils import _stringify_ops
+            safe_ops = _stringify_ops([best_op])
+            best_op = safe_ops[0] if safe_ops else str(best_op)
+        # If best_value is not numeric, pick a representative score
+        if isinstance(best_value, dict):
+            best_value = float(best_value.get("value", 0.0))
+        else:
+            best_value = float(best_value)
+        return best_op, best_value
+    except Exception:
+        return best_op, 0.0
 
 
 # Legacy interface compatibility for existing code

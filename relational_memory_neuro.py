@@ -407,7 +407,7 @@ class RelationalMemoryNeuro(nn.Module):
         if hasattr(self, 'pending_concept_updates') and self.pending_concept_updates:
             with torch.no_grad():
                 for cid, (vec, alpha) in self.pending_concept_updates.items():
-                    vec = vec.to(self.device)
+                    vec = vec.to(self.device, dtype=self.concept_proto.dtype)
                     self.concept_proto.data[cid] = (1 - alpha) * self.concept_proto.data[cid] + alpha * vec
             self.pending_concept_updates.clear()
         
@@ -787,3 +787,216 @@ class RelationalMemoryNeuro(nn.Module):
         except Exception as e:
             logging.getLogger(__name__).exception("[RelMem] inverse_loss unexpected error: %s", e)
             return torch.tensor(0.0, device=getattr(self,'device','cpu'))
+
+# --- Exemplar-enhanced Relational Memory -------------------------------------
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+import torch
+import torch.nn.functional as F
+
+@dataclass
+class Exemplar:
+    vec: torch.Tensor
+    freq: int
+    last_step: int
+    # Optional grounded attributes (phi/kappa/CGE/hodge etc.)
+    attrs: Optional[Dict[str, float]] = None
+
+class RelationalMemoryExemplar(RelationalMemoryNeuro):
+    """
+    Extends RelationalMemoryNeuro with per-concept exemplar libraries
+    + ripple/dream-gated consolidation + optional 'told facts' injection.
+    - Each concept stores a small set of exemplars (vec + attrs + usage stats).
+    - New inputs update closest exemplar (if similar) or create a new one.
+    - Periodic consolidation merges/prunes exemplars and recenters the prototype.
+    """
+    def __init__(
+        self, hidden_dim: int, max_concepts: int = 4096, rank: int = 16,
+        relations: List[str] = None, inverse_pairs: Dict[str, str] = None,
+        wta_frac: float = 0.1, wta_warmup_updates: int = 50, device="cpu",
+        max_exemplars_per_concept: int = 8, sim_tau: float = 0.85,
+        merge_tau: float = 0.92, prune_min_freq: int = 2
+    ):
+        super().__init__(hidden_dim, max_concepts, rank, relations, inverse_pairs,
+                         wta_frac, wta_warmup_updates, device)
+        self.max_exemplars_per_concept = max_exemplars_per_concept
+        self.sim_tau = float(sim_tau)
+        self.merge_tau = float(merge_tau)
+        self.prune_min_freq = int(prune_min_freq)
+        # exemplar store: cid -> List[Exemplar]
+        self._exemplars: Dict[int, List[Exemplar]] = {}
+        # optional name->cid for 'told facts'
+        self._symbolic_index: Dict[str, int] = {}
+
+    # ---------- Core: add/update exemplars ----------
+    @torch.no_grad()
+    def add_or_update_exemplar(
+        self, cid: int, vec: torch.Tensor, step: int,
+        attrs: Optional[Dict[str, float]] = None
+    ):
+        """Add a new exemplar or update the most similar one."""
+        cid = int(cid)
+        vec = vec.detach().to(self.device).float()
+        bank = self._exemplars.setdefault(cid, [])
+        best_i, best_sim = -1, -1.0
+        for i, ex in enumerate(bank):
+            sim = float(F.cosine_similarity(vec.unsqueeze(0), ex.vec.unsqueeze(0)))
+            if sim > best_sim:
+                best_i, best_sim = i, sim
+        if best_sim >= self.sim_tau and best_i >= 0:
+            # Light moving average toward new vec; bump freq/ts; merge attrs
+            ex = bank[best_i]
+            ex.vec = 0.9 * ex.vec + 0.1 * vec
+            ex.freq += 1
+            ex.last_step = step
+            if attrs:
+                ex.attrs = (ex.attrs or {})
+                for k, v in attrs.items():
+                    ex.attrs[k] = float(v)
+        else:
+            bank.append(Exemplar(vec=vec, freq=1, last_step=step, attrs=attrs))
+            # Bound memory
+            if len(bank) > self.max_exemplars_per_concept:
+                # drop least-frequent / oldest
+                bank.sort(key=lambda e: (e.freq, e.last_step))
+                bank.pop(0)
+
+    # ---------- Consolidation: prune/merge + recenter prototype ----------
+    @torch.no_grad()
+    def consolidate_concept(self, cid: int):
+        """Merge near-duplicate exemplars; prune low-usage; update prototype."""
+        if cid not in self._exemplars:
+            return
+        bank = self._exemplars[cid]
+        if not bank:
+            return
+
+        # 1) prune rarely used
+        bank = [e for e in bank if e.freq >= self.prune_min_freq]
+
+        # 2) merge highly-similar (greedy)
+        merged: List[Exemplar] = []
+        for e in sorted(bank, key=lambda x: -x.freq):
+            keep = True
+            for m in merged:
+                sim = float(F.cosine_similarity(e.vec.unsqueeze(0), m.vec.unsqueeze(0)))
+                if sim >= self.merge_tau:
+                    # merge into m (frequency-weighted)
+                    w1, w2 = float(m.freq), float(e.freq)
+                    m.vec = (w1 * m.vec + w2 * e.vec) / max(1e-6, (w1 + w2))
+                    m.freq += e.freq
+                    m.last_step = max(m.last_step, e.last_step)
+                    if e.attrs:
+                        m.attrs = (m.attrs or {})
+                        for k, v in e.attrs.items():
+                            m.attrs[k] = float(0.5 * m.attrs.get(k, v) + 0.5 * v)
+                    keep = False
+                    break
+            if keep:
+                merged.append(e)
+        self._exemplars[cid] = merged
+
+        # 3) recenter prototype to exemplar mean (concept_proto is learnable Param)
+        if merged:
+            mean_vec = torch.stack([e.vec for e in merged], dim=0).mean(0)
+            self.concept_proto.data[cid] = 0.8 * self.concept_proto.data[cid] + 0.2 * mean_vec
+
+    @torch.no_grad()
+    def consolidate_exemplars(self):
+        """Call this during dream/ripple cycles or every N steps."""
+        used_ids = self.concept_used.nonzero().flatten().tolist()
+        for cid in used_ids:
+            self.consolidate_concept(int(cid))
+
+    # ---------- Optional: bind sample (streaming unsupervised) ----------
+    @torch.no_grad()
+    def observe_sample(
+        self, x_tokens: torch.Tensor, step: int,
+        attrs: Optional[Dict[str, float]] = None, top_k: int = 64
+    ):
+        """
+        Light unsupervised update from relational tokens [B,T,D].
+        Picks the highest-activation concept per token and updates its exemplar bank.
+        """
+        if x_tokens.dim() != 3 or x_tokens.size(-1) != self.D:
+            return
+        B, T, D = x_tokens.shape
+        proto = self.concept_proto  # [N,D]
+        scale = float(D) ** 0.5
+        scores = torch.matmul(x_tokens, proto.t()) / scale  # [B,T,N]
+        _, idx = torch.topk(scores, k=min(top_k, self.N), dim=-1)  # [B,T,K]
+        # Use the top-1 for fast streaming update
+        cid = idx[..., 0]  # [B,T]
+        for b in range(B):
+            for t in range(T):
+                c = int(cid[b, t].item())
+                v = x_tokens[b, t].detach()
+                self.add_or_update_exemplar(c, v, step=step, attrs=attrs)
+
+    # ---------- Dream/ripple hookup ----------
+    @torch.no_grad()
+    def on_ripple_event(self, ripple_stats: Optional[Dict[str, float]] = None):
+        """
+        Hook to be called after DreamEngine ripple cycles.
+        Uses ripple coherence to adjust consolidation aggressiveness (optional).
+        """
+        self.consolidate_exemplars()
+        # Example: if coherence high, enable WTA queue on frequently used relations
+        coh = float(ripple_stats.get("ripple_phase_coherence", 1.0)) if isinstance(ripple_stats, dict) else 1.0
+        if coh > 0.8:
+            for rel in self.relations[:2]:  # small nudge
+                self.queue_wta_update(rel)
+
+    # ---------- 'Being told facts' (symbolic injection) ----------
+    @torch.no_grad()
+    def bind_fact(
+        self, subj_name: str, rel: str, obj_name: str,
+        subj_vec: Optional[torch.Tensor] = None,
+        obj_vec: Optional[torch.Tensor] = None,
+        alpha: float = 0.5
+    ):
+        """
+        Create or reuse named concepts and connect them with relation 'rel'.
+        If vectors are provided, initialize/refresh their prototypes + exemplars.
+        """
+        # (a) subject concept id
+        if subj_name not in self._symbolic_index:
+            sid = self._next_cid
+            self._symbolic_index[subj_name] = sid
+            self._next_cid += 1
+            self.concept_used[sid] = True
+            if subj_vec is not None:
+                self.concept_proto.data[sid] = subj_vec.to(self.device).float()
+                self.add_or_update_exemplar(sid, self.concept_proto.data[sid], step=0)
+        else:
+            sid = self._symbolic_index[subj_name]
+            if subj_vec is not None:
+                self.add_or_update_exemplar(sid, subj_vec.to(self.device).float(), step=0)
+
+        # (b) object concept id
+        if obj_name not in self._symbolic_index:
+            oid = self._next_cid
+            self._symbolic_index[obj_name] = oid
+            self._next_cid += 1
+            self.concept_used[oid] = True
+            if obj_vec is not None:
+                self.concept_proto.data[oid] = obj_vec.to(self.device).float()
+                self.add_or_update_exemplar(oid, self.concept_proto.data[oid], step=0)
+        else:
+            oid = self._symbolic_index[obj_name]
+            if obj_vec is not None:
+                self.add_or_update_exemplar(oid, obj_vec.to(self.device).float(), step=0)
+
+        # (c) strengthen relation with small Hebbian pulse
+        try:
+            self.queue_hebbian_update(rel, sid, oid, eta=alpha)
+        except Exception:
+            pass
+
+    # ---------- Expose exemplar stats for logging ----------
+    @torch.no_grad()
+    def exemplar_stats(self) -> Dict[str, float]:
+        total = sum(len(v) for v in self._exemplars.values())
+        active = int(self.concept_used.sum().item())
+        avg_per = float(total) / max(1, active)
+        return {"exemplar_total": float(total), "exemplar_avg_per_concept": avg_per}

@@ -190,6 +190,17 @@ def _sc_run_star(star_bootstrapper, task, planner_bias, n: int) -> list:
         traces_all.extend(tr)
     return traces_all
 
+def safe_replay_add(buffer, ops, priority, logger=None):
+    """Safely stringify ops and add them to replay buffer."""
+    if buffer is None or not ops:
+        return
+    try:
+        safe_ops = _stringify_ops(ops)
+        if safe_ops:
+            buffer.add(safe_ops, priority)
+    except Exception as e:
+        if logger: logger.warning(f"[Replay] add failed for ops={ops}: {e}")
+
 def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device) -> list:
     """
     Compose a program by running PUCT selection sequentially for puct_depth steps.
@@ -244,20 +255,13 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
             c_puct=float(cli_args.c_puct)
         )
         try:
-            # Ensure op is hashable before appending
-            safe_op = str(best_op) if best_op is not None else None
-            if isinstance(best_op, dict):
-                safe_list = _stringify_ops([best_op])
-                if safe_list:
-                    safe_op = safe_list[0]
-
-            if safe_op:
-                state_grid = model.dsl.apply(best_op, state_grid)
-                program_ops.append(safe_op)
-                if torch.is_tensor(target_grid) and (state_grid.shape == target_grid.shape) and (state_grid == target_grid).all():
-                    break
+            # Always stringify ops before appending
+            safe_ops = _stringify_ops([best_op]) if best_op is not None else []
+            if safe_ops:
+                program_ops.extend(safe_ops)
+            state_grid = expand_fn(state_grid, best_op)
         except Exception:
-            break
+            continue
     return program_ops
     return out
 
@@ -281,6 +285,28 @@ class _EMA:
 
 _dopamine_ema = _EMA(beta=0.9, init=0.0)
 _last_dopamine_step = -10**9  # refractory tracking
+
+# =========================
+# Phase 6: PriorNet for Neural DSL Operation Priors
+# =========================
+
+class PriorNet(nn.Module):
+    """Neural network for learning adaptive DSL operation priors."""
+
+    def __init__(self, input_dim=128, hidden=[256, 128, 64], num_ops=41):
+        super().__init__()
+        layers = []
+        last_dim = input_dim
+
+        for h in hidden:
+            layers.extend([nn.Linear(last_dim, h), nn.ReLU()])
+            last_dim = h
+
+        layers.append(nn.Linear(last_dim, num_ops))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 # =========================
 # Enhanced Dopamine Helper Functions
@@ -760,8 +786,67 @@ def parse_args():
     parser.add_argument("--replay-cap", type=int, default=2000,
                         help="Replay buffer capacity")
 
+    # Phase 2: Meta-learning (MAML-lite inner/outer loop)
+    parser.add_argument("--enable-meta-loop", action="store_true", default=False,
+                        help="Enable MAML-lite inner/outer meta-learning loop")
+    parser.add_argument("--meta-inner-steps", type=int, default=1,
+                        help="Inner-loop adaptation steps per meta-task")
+    parser.add_argument("--meta-tasks-per-batch", type=int, default=4,
+                        help="Number of tasks per meta-batch")
+    parser.add_argument("--meta-adapt-lr", type=float, default=5e-5,
+                        help="Learning rate for inner-loop adaptation")
+
+    # Phase 6: Neuro-priors (PriorNet for DSL op bias evolution)
+    parser.add_argument("--enable-priornet", action="store_true", default=False,
+                        help="Enable PriorNet for DSL op bias learning")
+    parser.add_argument("--priornet-hidden", type=str, default="256,128,64",
+                        help="Comma-separated hidden layer sizes for PriorNet")
+    parser.add_argument("--priornet-reg-weight", type=float, default=0.01,
+                        help="Regularization weight for PriorNet outputs")
+
     args, _unknown = parser.parse_known_args()
     return args
+
+# =========================
+# Phase 2: Meta-Learning (MAML-lite)
+# =========================
+
+def run_meta_loop(topas_model, hrm_model, dataset, cli_args, device):
+    """MAML-lite meta-learning loop for fast adaptation."""
+    import numpy as np
+    from torch import optim
+    from models.topas_arc_60M import TopasARC60M  # import your model class
+
+    # Sample meta-batch of tasks
+    tasks = [dataset[i] for i in np.random.choice(len(dataset), cli_args.meta_tasks_per_batch)]
+    meta_grads = [{n: torch.zeros_like(p) for n, p in topas_model.named_parameters() if p.requires_grad}]
+
+    for task in tasks:
+        # Create inner model by re-instantiating + loading weights (instead of deepcopy)
+        inner_model = TopasARC60M(topas_model.config).to(device)
+        inner_model.load_state_dict(topas_model.state_dict(), strict=False)
+        inner_opt = optim.SGD(inner_model.parameters(), lr=cli_args.meta_adapt_lr)
+
+        # Inner loop adaptation
+        for _ in range(cli_args.meta_inner_steps):
+            loss = train_step(inner_model, hrm_model, task, inner_opt, torch.amp.GradScaler("cuda"), device)
+            if loss is None:
+                continue
+            if not torch.is_tensor(loss):  # convert float back to tensor
+                loss = torch.tensor(loss, dtype=torch.float32, requires_grad=True, device=device)
+            inner_opt.zero_grad()
+            loss.backward()
+            inner_opt.step()
+
+        # Accumulate meta-gradients (difference between adapted and base model)
+        for (n, p_base), (_, p_inner) in zip(topas_model.named_parameters(), inner_model.named_parameters()):
+            if p_base.requires_grad:
+                meta_grads[0][n] += (p_inner.data - p_base.data)
+
+    # Apply averaged meta-gradients to base model
+    for n, p in topas_model.named_parameters():
+        if p.requires_grad:
+            p.grad = meta_grads[0][n] / float(cli_args.meta_tasks_per_batch)
 
 def run_dream_cycle_safe(model,
                          timeout_sec: int = 600,
@@ -942,6 +1027,13 @@ def create_models(device, cli_args=None):
     }
     hrm_model = HierarchicalReasoningModel_ACTV1(hrm_config).to(device)
     print(f"✅ HRM: {sum(p.numel() for p in hrm_model.parameters()):,} parameters")
+
+    # Initialize PriorNet if enabled
+    if cli_args and getattr(cli_args, "enable_priornet", False):
+        hidden = [int(x) for x in cli_args.priornet_hidden.split(",")]
+        topas_model.priornet = PriorNet(input_dim=topas_model.config.width, hidden=hidden).to(device)
+        topas_model._priornet_reg_weight = cli_args.priornet_reg_weight
+        print(f"✅ PriorNet: {sum(p.numel() for p in topas_model.priornet.parameters()):,} parameters (reg_weight={cli_args.priornet_reg_weight})")
 
     return topas_model, hrm_model
 
@@ -1242,10 +1334,10 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         puzzle_ids = torch.tensor([pid], device=device, dtype=torch.long)
                         
                         # --- HRM token normalization ---
-                        # HRM always produces seq_len+1 logits (EOS step included).
-                        # Labels must also be padded to seq_len+1, with ignore_index=-100 for the EOS slot.
-                        seq_len = getattr(topas_model.planner.config, "seq_len", tokens.size(1))
-                        target_len = seq_len + 1
+                        # Use tokens.size(1) as source of truth (already may include puzzle_emb_len).
+                        # Add +1 EOS slot to match HRM logits.
+                        base_len = tokens.size(1)
+                        target_len = base_len + 1
 
                         inputs_norm = tokens.to(device)
                         labels_norm = tokens.to(device)
@@ -1263,7 +1355,10 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
 
                         # Debug probe
                         if global_step % 200 == 0:
-                            logging.info(f"[HRM-Supervision] aligned inputs={inputs_norm.shape[1]}, labels={labels_norm.shape[1]}, seq_len={seq_len}, target_len={target_len}")
+                            # seq_len variable no longer exists; log base_len instead
+                            logging.info(
+                                f"[HRM-Supervision] aligned inputs={inputs_norm.shape[1]}, labels={labels_norm.shape[1]}, base_len={base_len}, target_len={target_len}"
+                            )
 
                         # Ensure all tensors are on the same device
                         batch_dict = {
@@ -1441,11 +1536,27 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                             
                         if torch.is_tensor(relmem_reg_loss) and relmem_reg_loss.item() > 0:
                             total_loss = total_loss + relmem_reg_loss
-                            
+
                     except Exception as e:
                         if global_step % 100 == 0:
                             logging.warning(f"RelMem regularization failed: {e}")
-                
+
+                # === Phase 6: PriorNet DSL operation bias learning ===
+                if getattr(topas_model, "priornet", None):
+                    try:
+                        context = outputs.get("brain") or outputs.get("latent")
+                        if context is not None:
+                            prior_logits = topas_model.priornet(context.mean(dim=1))
+                            prior_bias = torch.softmax(prior_logits, dim=-1)
+                            # Apply PriorNet regularization to prevent overfitting
+                            prior_reg = getattr(topas_model, "_priornet_reg_weight", 0.01) * (prior_logits**2).mean()
+                            total_loss = total_loss + prior_reg
+                            if global_step % 200 == 0:
+                                logging.info(f"[PriorNet] reg={prior_reg.item():.6f}, bias_entropy={torch.sum(-prior_bias * torch.log(prior_bias + 1e-8)).item():.3f}")
+                    except Exception as e:
+                        if global_step % 200 == 0:
+                            logging.debug(f"[PriorNet] skipped: {e}")
+
                 loss = total_loss
             else:
                 logging.error("train_step: outputs missing 'logits'; keys=%s", (list(outputs.keys()) if isinstance(outputs, dict) else type(outputs)))
@@ -1491,16 +1602,20 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
         scaler.step(optimizer)
         scaler.update()
         
-        # Apply post-optimizer hooks for RelMem
+        # Apply post-optimizer hooks for RelMem + exemplar consolidation
         if hasattr(topas_model, 'relmem') and topas_model.relmem is not None:
             try:
                 if hasattr(topas_model.relmem, 'apply_post_optimizer_hooks'):
                     topas_model.relmem.apply_post_optimizer_hooks()
                 elif hasattr(topas_model.relmem, 'post_optimizer_step'):
                     topas_model.relmem.post_optimizer_step()
+
+                # Consolidate exemplar memory every 500 steps
+                if hasattr(topas_model.relmem, "consolidate_exemplars") and global_step % 500 == 0:
+                    topas_model.relmem.consolidate_exemplars()
             except Exception as e:
                 if global_step % 500 == 0:
-                    logging.warning(f"RelMem post-optimizer hooks failed: {e}")
+                    logging.warning(f"RelMemExemplar post-optimizer failed: {e}")
 
         if return_metrics:
             # Pass model and grids for comprehensive metrics including EBR
@@ -1689,7 +1804,20 @@ def main():
             
                         # Compute metrics every 10 steps
             compute_metrics_now = (global_step % 10 == 0)
-            
+
+            # === Phase 2: Meta-learning loop ===
+            if getattr(trainer_cli_args, "enable_meta_loop", False) and global_step % 200 == 0:
+                try:
+                    # deepcopy fails on weight_norm layers — use state_dict clone
+                    from models.topas_arc_60M import TopasARC60M
+                    inner_model = TopasARC60M(topas_model.config).to(device)
+                    inner_model.load_state_dict(topas_model.state_dict(), strict=False)
+                    run_meta_loop(inner_model, hrm_model, dataset, trainer_cli_args, device)
+                    del inner_model
+                    print(f"[Meta-Learning] Applied MAML-lite update at step {global_step}")
+                except Exception as e:
+                    print(f"[Meta-Learning] Error at step {global_step}: {e}")
+
             result = train_step(
                 topas_model, hrm_model, batch,
                 optimizer, scaler, device,
@@ -1851,28 +1979,23 @@ def main():
                         advantage = R - ema
                         global _last_dopamine_step
                         refractory = (global_step - _last_dopamine_step) < 20
-                        threshold = 0.15
+                        threshold = 0.10
                         accept = (em_val >= 0.999) or (advantage >= threshold and not refractory)
                         if accept:
                             dopamine_reward(star_task, self_play_buffer, logger, global_step,
                                             score=float(advantage), components=comps)
 
-                            # Alpha-ARC X: Add successful programs to replay buffer
+                            # Alpha-ARC X: Add successful programs to replay buffer (always stringified)
                             if replay_buffer is not None:
+                                priority = float(advantage) + 0.1  # Ensure positive priority
                                 try:
                                     for t in good_traces:
                                         if hasattr(t, "operations") and t.operations:
-                                            safe_ops = _stringify_ops(t.operations)
-                                            if safe_ops:
-                                                priority = float(advantage) + 0.1  # Ensure positive priority
-                                                replay_buffer.add(safe_ops, priority)
+                                            safe_replay_add(replay_buffer, t.operations, priority, logger)
                                     if programs:
                                         for prog in programs:
                                             if prog:
-                                                safe_prog = _stringify_ops(prog)
-                                                if safe_prog:
-                                                    priority = float(advantage) + 0.1
-                                                    replay_buffer.add(safe_prog, priority)
+                                                safe_replay_add(replay_buffer, prog, priority, logger)
                                     logger.info(f"[Alpha-ARC X] Added {len(good_traces) + len(programs)} programs to replay buffer")
                                 except Exception as e:
                                     logger.warning(f"[Alpha-ARC X] Replay buffer addition failed: {e}")
@@ -2199,6 +2322,15 @@ def main():
                     if global_step % 1000 == 0:  # Less frequent warning
                         logging.warning(f"RelMem stats logging failed: {e}")
             
+            # === RelMem exemplar stats logging ===
+            if hasattr(topas_model, "relmem") and hasattr(topas_model.relmem, "exemplar_stats"):
+                if global_step % 500 == 0:
+                    try:
+                        ex_stats = topas_model.relmem.exemplar_stats()
+                        logging.info(f"[RelMemExemplar] step={global_step} total={ex_stats['exemplar_total']}, avg_per_concept={ex_stats['exemplar_avg_per_concept']:.2f}")
+                    except Exception:
+                        pass
+
             global_step += 1
 
             # Update progress bar

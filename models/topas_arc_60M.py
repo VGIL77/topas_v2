@@ -58,6 +58,8 @@ from dream_engine import DreamEngine, DreamConfig
 from phi_metrics_neuro import phi_synergy_features, kappa_floor, cge_boost, neuro_hodge_penalty, clamp_neuromorphic_terms
 from trainers.schedulers.ucb_scheduler import EnhancedUCBTaskScheduler
 from relational_memory_neuro import RelationalMemoryNeuro
+# new subclass (if pasted into same file, this import still works)
+from relational_memory_neuro import RelationalMemoryExemplar
 from models.dsl_registry import DSL_OPS
 
 # DSL Shim for STaR compatibility - provides facade for DSL operations
@@ -647,7 +649,7 @@ class TopasARC60M(nn.Module):
         self.enable_relmem = bool(getattr(self.config, "enable_relmem", True))
         if self.enable_relmem:
             hid = getattr(self, "slots").out_dim  # relational tokens live in slot space
-            self.relmem = RelationalMemoryNeuro(
+            self.relmem = RelationalMemoryExemplar(
                 hidden_dim=hid,
                 max_concepts=getattr(self.config, "relmem_max_concepts", 2048),
                 rank=getattr(self.config, "relmem_rank", 16),
@@ -1209,7 +1211,16 @@ class TopasARC60M(nn.Module):
                     ctx_pool = self.relmem_proj(ctx_pool)
 
                 brain = brain + ctx_pool  # Residual addition with matched dims
-                
+
+                # === Exemplar streaming update ===
+                if hasattr(self.relmem, "observe_sample"):
+                    try:
+                        self.relmem.observe_sample(tokens, step=kwargs.get("step", 0))
+                    except Exception as e:
+                        if kwargs.get("step") is not None and kwargs.get("step") % 200 == 0:
+                            import logging
+                            logging.getLogger(__name__).warning(f"[RelMemExemplar] observe_sample failed: {e}")
+
                 # === RelMem auto-binding + post-update hooks ===
                 # Auto-bind slot or brain concepts each forward pass
                 if hasattr(self.relmem, "bind_concept_by_vector"):
@@ -2640,7 +2651,16 @@ class TopasARC60M(nn.Module):
         
         # Tokens should now always have the correct ctrl_dim since we're using brain tokens
         # No defensive projection needed anymore
-        return self.dream.cycle_offline(tokens, demos_programs=demos_programs)
+        stats = self.dream.cycle_offline(tokens, demos_programs=demos_programs)
+        # RelMem ripple-gated consolidation
+        try:
+            ripple_stats = getattr(self.dream, "ripple", None)
+            ripple_stats = ripple_stats.metrics(reset=True) if ripple_stats else {}
+            if hasattr(self, "relmem") and hasattr(self.relmem, "on_ripple_event"):
+                self.relmem.on_ripple_event(ripple_stats)
+        except Exception:
+            pass
+        return stats
         
     def update_scheduler_metrics(self, task_id: str, metrics: Dict[str, float], 
                                 pred_grid: torch.Tensor = None, latent_state: torch.Tensor = None, 
@@ -2837,6 +2857,8 @@ class TopasARC60M(nn.Module):
                 if hasattr(self.relmem, 'bind_concept'):
                     # Extract brain tensor for binding
                     brain_tensor = concept_data["brain_latent"].to(self.relmem.device)
+                    # Safety: ensure on same dtype/device
+                    brain_tensor = brain_tensor.to(device=self.relmem.device, dtype=self.relmem.concept_proto.dtype)
                     # Project if dimensionality mismatch (e.g. 1024 → 256)
                     if brain_tensor.shape[-1] != self.relmem.D:
                         if not hasattr(self, "relmem_proj_down"):
