@@ -329,25 +329,13 @@ class RelationManager:
         """Create parameter key handling nested dictionaries"""
         if not params:
             return ()
-        
-        # MACHETE FIX: Ensure params is a dict, not tuple
-        if not isinstance(params, dict):
-            # DEBUG: Log the problematic params to find the source
-            print(f"[MACHETE DEBUG] Bad params type: {type(params)} = {params}")
-            # If params is tuple or other, return it as-is safely
+        # Always stringify dicts to make hashable
+        if isinstance(params, dict):
+            return tuple(sorted((k, str(v)) for k, v in params.items()))
+        try:
             return tuple(params) if hasattr(params, '__iter__') and not isinstance(params, str) else (params,)
-        
-        result = []
-        for k, v in sorted(params.items()):
-            if isinstance(v, dict):
-                # Handle nested dictionaries (e.g., color mappings)
-                nested_items = tuple(sorted(v.items())) if v else ()
-                result.append((k, nested_items))
-            else:
-                # Handle regular float/int values
-                result.append((k, float(v)))
-        
-        return tuple(result)
+        except Exception:
+            return (str(params),)
 
     def _key(self, src, rel, dst, params=None):
         return (src, rel, dst, self._pkey(params))
@@ -504,7 +492,7 @@ class ModelConfig:
     
     # Dream Engine
     enable_dream: bool = True
-    dream_micro_ticks: int = 1
+    dream_micro_ticks: int = 4
     dream_offline_iters: int = 50
     theme_bias_alpha: float = 0.2  # ETS theme contribution to DSL op-bias
     dream_valence_default: float = 0.7
@@ -532,7 +520,11 @@ class ModelConfig:
     relmem_rank: int = 16
     relmem_op_bias_scale: float = 0.5    # scaling factor for op bias generation
     relmem_inverse_loss_lambda: float = 1e-4  # lambda for inverse loss in training
-    
+
+    # Democratic bias toggle
+    use_democratic_bias: bool = False
+    democratic_epochs: int = 30
+
     def validate(self):
         """Validate configuration parameters"""
         assert self.width > 0, "width must be positive"
@@ -1235,10 +1227,14 @@ class TopasARC60M(nn.Module):
                 # Run Hebbian / WTA updates if available
                 if hasattr(self.relmem, "apply_post_optimizer_hooks"):
                     try:
+                        # Sync all internal buffers to model.device before hooks
+                        for name, buf in getattr(self.relmem, "buffers", {}).items():
+                            if torch.is_tensor(buf) and buf.device.type != self.device:
+                                setattr(self.relmem, name, buf.to(self.device))
                         self.relmem.apply_post_optimizer_hooks()
                     except Exception as e:
                         if kwargs.get('step') is not None and kwargs.get('step') % 100 == 0:
-                            print(f"[RelMem WARN] Post-opt hook failed: {e}")
+                            logging.warning(f"[RelMemExemplar] post-optimizer failed: {e}")
             
             # RAIL ORCHESTRATION - Initialize tracking
             rail_path = []
@@ -1599,9 +1595,15 @@ class TopasARC60M(nn.Module):
             if dsl_pred is None:
                 try:
                     print(f"[RAIL-DSL] Falling back to beam search...")
-                    
+
+                    # Before merging RelMem bias - check for democratic override
+                    if self.config.use_democratic_bias and globals().get("CURRENT_EPOCH", 0) < self.config.democratic_epochs:
+                        from models.dsl_registry import DSL_OPS
+                        op_bias = {op: 1.0/len(DSL_OPS) for op in DSL_OPS}  # strict uniform
+                        if self.config.verbose:
+                            print(f"[Bias] Democratic override active: uniform priors ({len(DSL_OPS)} ops)")
                     # Merge RelMem bias into op_bias (robust approach)
-                    if self.relmem is not None and self.config.relmem_op_bias_w > 0:
+                    elif self.relmem is not None and self.config.relmem_op_bias_w > 0:
                         try:
                             from models.dsl_registry import DSL_OPS
                             if hasattr(self.relmem, "get_op_bias"):
@@ -2139,7 +2141,17 @@ class TopasARC60M(nn.Module):
         
         grid, logits, size, extras = enforce_sacred_signature(grid, logits, size, extras, "FINAL-OUTPUT", training_mode)
         return grid, logits, size, extras
-    
+
+    def forward_for_puct(self, demos, test):
+        """
+        Light wrapper for PUCT that only returns (grid, value).
+        """
+        grid, logits, size, extras = self.forward(demos, test)
+        # Value proxy: use EM likelihood if available, else confidence 0.5
+        value = extras.get("eval_metrics", {}).get("exact@1", 0.0) \
+            if isinstance(extras, dict) else 0.5
+        return grid, value
+
     def _cache_dream_tokens(self, tokens, Hf=None, Wf=None):
         # Append to persistent buffer (detach & move to cpu to avoid GPU memory growth)
         try:
@@ -3186,10 +3198,15 @@ class TopasARC60M(nn.Module):
                 
                 # Get op_bias from RelationManager
                 op_bias = self.relman.op_bias()  # existing relation manager bias
-                
+
+                # Check for democratic override before merging
+                if self.config.use_democratic_bias and globals().get("CURRENT_EPOCH", 0) < self.config.democratic_epochs:
+                    from models.dsl_registry import DSL_OPS
+                    op_bias = {op: 1.0/len(DSL_OPS) for op in DSL_OPS}  # strict uniform
+                    if self.config.verbose:
+                        print(f"[Bias] Democratic override active: uniform priors ({len(DSL_OPS)} ops)")
                 # Defensive TOPAS merging with enhanced debug logging
-                relman_bias_count = len(op_bias)
-                if self.relmem is not None and self.config.relmem_op_bias_w > 0:
+                elif self.relmem is not None and self.config.relmem_op_bias_w > 0:
                     try:
                         # Use robust op_bias method (never empty)
                         if hasattr(self.relmem, "op_bias"):

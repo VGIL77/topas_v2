@@ -215,12 +215,32 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
         # one forward to get policy priors (dsl_op_logits) on this state
         try:
             out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
-            extras = out.get("extras", {}) if isinstance(out, dict) else {}
-            logits = extras.get("dsl_op_logits") or extras.get("policy_logits")
-            if logits is None: return {}
-            probs = torch.softmax(logits[0], dim=-1).detach().cpu().numpy().tolist()
-            from models.dsl_registry import DSL_OPS
-            prior = {op: float(p) for op, p in zip(DSL_OPS, probs)}
+
+            # Handle both dict and tuple returns
+            if isinstance(out, dict):
+                extras = out.get("extras", {})
+                logits = extras.get("dsl_op_logits") or extras.get("policy_logits") or out.get("dsl_op_logits")
+                value = float(out.get("value_logit", 0.0)) if "value_logit" in out else 0.0
+            elif isinstance(out, tuple) and len(out) >= 2:
+                # Tuple format: (priors, value) or similar
+                priors_data, value_data = out[0], out[1]
+                if isinstance(priors_data, dict):
+                    logits = None  # priors already in dict format
+                    prior = priors_data
+                else:
+                    logits = priors_data  # tensor format
+                value = float(value_data) if value_data is not None else 0.0
+            else:
+                return {}
+
+            if logits is not None:
+                if isinstance(logits, torch.Tensor):
+                    probs = torch.softmax(logits[0] if logits.dim() > 1 else logits, dim=-1).detach().cpu().numpy().tolist()
+                    from models.dsl_registry import DSL_OPS
+                    prior = {op: float(p) for op, p in zip(DSL_OPS, probs)}
+                else:
+                    prior = {}
+
             # root Dirichlet
             import numpy as np
             if len(prior) and cli_args.root_dirichlet_eps > 0:
@@ -237,8 +257,22 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
     def value_fn(grid_s):
         try:
             out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
-            v = out.get("extras", {}).get("value_logit")
-            return torch.sigmoid(v)[0].item() if v is not None else 0.1
+
+            # Handle both dict and tuple returns
+            if isinstance(out, dict):
+                v = out.get("extras", {}).get("value_logit") or out.get("value_logit")
+            elif isinstance(out, tuple) and len(out) >= 2:
+                # Tuple format: (priors, value)
+                v = out[1]
+            else:
+                v = None
+
+            if v is not None:
+                if isinstance(v, torch.Tensor):
+                    return torch.sigmoid(v)[0].item() if v.numel() > 0 else 0.1
+                else:
+                    return float(v)
+            return 0.1
         except Exception:
             return 0.1
 
@@ -748,8 +782,8 @@ def parse_args():
                         help="Hidden width for TOPAS conv backbone (default 640)")
     parser.add_argument("--model-slots", type=int, default=64,
                         help="Number of slots for concept vectors (default 64)")
-    parser.add_argument("--breakthrough-threshold", type=float, default=0.33,
-                        help="EM threshold to trigger dopamine capture (default 0.33)")
+    parser.add_argument("--breakthrough-threshold", type=float, default=0.15,
+                        help="EM threshold to trigger dopamine capture (magic-run fidelity: 0.15)")
     parser.add_argument("--nightmare-alpha", type=float, default=0.08,
                         help="Negative reinforcement strength for nightmares (0.05–0.10 recommended)")
     parser.add_argument("--nightmare-min-interval", type=int, default=200,
@@ -783,8 +817,14 @@ def parse_args():
                         help="Enable Self-Critique STaR wrapper")
     parser.add_argument("--near-miss-hamming-pct", type=float, default=0.15,
                         help="Near-miss Hamming distance threshold percentage")
-    parser.add_argument("--replay-cap", type=int, default=2000,
-                        help="Replay buffer capacity")
+    parser.add_argument("--replay-cap", type=int, default=50000,
+                        help="Replay buffer capacity (50k for richer density)")
+
+    # Democratic bias arguments
+    parser.add_argument("--democratic-bias", action="store_true", default=False,
+                        help="Force uniform 1/41 op priors for first N epochs")
+    parser.add_argument("--democratic-bias-epochs", type=int, default=30,
+                        help="Number of epochs to keep democratic bias before handing back to RelMem")
 
     # Phase 2: Meta-learning (MAML-lite inner/outer loop)
     parser.add_argument("--enable-meta-loop", action="store_true", default=False,
@@ -960,6 +1000,13 @@ def create_models(device, cli_args=None):
         topas_config.enable_dream = True
         if hasattr(cli_args, "dream_micro_ticks"):
             topas_config.dream_micro_ticks = cli_args.dream_micro_ticks
+
+    # NEW democratic bias hook
+    if cli_args and getattr(cli_args, "democratic_bias", False):
+        topas_config.use_democratic_bias = True
+        topas_config.democratic_epochs = getattr(cli_args, "democratic_bias_epochs", 30)
+        print(f"[Bias] Democratic bias ENABLED for {topas_config.democratic_epochs} epochs")
+
     # Allow moderate scaling to use GPU headroom safely
     topas_config.width = int(getattr(cli_args, "model_width", 640))
     topas_config.depth = 8
@@ -1342,16 +1389,13 @@ def train_step(topas_model, hrm_model, batch, optimizer, scaler, device, return_
                         inputs_norm = tokens.to(device)
                         labels_norm = tokens.to(device)
 
-                        # Truncate/pad to exactly target_len
-                        if inputs_norm.size(1) > target_len:
-                            inputs_norm = inputs_norm[:, :target_len]
-                            labels_norm = labels_norm[:, :target_len]
-                        elif inputs_norm.size(1) < target_len:
-                            pad_len = target_len - inputs_norm.size(1)
-                            pad_inputs = torch.zeros(inputs_norm.size(0), pad_len, device=device, dtype=inputs_norm.dtype)
-                            pad_labels = torch.full((labels_norm.size(0), pad_len), -100, device=device, dtype=labels_norm.dtype)
-                            inputs_norm = torch.cat([inputs_norm, pad_inputs], dim=1)
-                            labels_norm = torch.cat([labels_norm, pad_labels], dim=1)
+                        # Align inputs, labels, and HRM logits length safely
+                        hrm_len = hrm_logits.size(1) if 'hrm_logits' in locals() else target_len
+                        min_len = min(inputs_norm.size(1), labels_norm.size(1), hrm_len)
+                        inputs_norm = inputs_norm[:, :min_len]
+                        labels_norm = labels_norm[:, :min_len]
+                        if 'hrm_logits' in locals():
+                            hrm_logits = hrm_logits[:, :min_len, :]
 
                         # Debug probe
                         if global_step % 200 == 0:
@@ -1759,29 +1803,61 @@ def main():
     stable_breakthrough_steps = 0  # counts metric windows at/above threshold for curriculum trigger
 
     # === Enhanced Curriculum state ===
-    active_bucket = 1
+    active_bucket = "easy"  # Start with easy tasks
+    bucket_unlock_patience = 3   # consecutive EM≥0.90 ticks unlock next bucket
+    bucket_streak = 0
     stagnation_epochs = 0
     bucket_count = 8
     bucket_size = math.ceil(len(dataset) / bucket_count) if len(dataset) > 0 else 1
     
+    # Track best EM for performance-triggered bias ramping
+    best_em = 0.0
+
     for epoch in range(num_epochs):
-        # === RelMem bias scheduling ===
-        if hasattr(topas_model.config, 'relmem_op_bias_w'):
-            if epoch < 5:
-                # keep minimal bias during warmup
-                topas_model.config.relmem_op_bias_w = 0.2
-            elif 5 <= epoch < 30:
-                # ramp up toward stronger bias
-                progress = (epoch - 5) / 25.0
-                topas_model.config.relmem_op_bias_w = 0.2 + progress * (0.5 - 0.2)
+        # === Performance-triggered bias scheduling ===
+        current_em = globals().get("last_epoch_em", 0.0)
+
+        if getattr(topas_model.config, "use_democratic_bias", False):
+            # Stay democratic until we achieve 30% EM
+            if current_em < 0.30:
+                # Force uniform op priors
+                topas_model.config.relmem_op_bias_w = 0.0
+                print(f"[Bias] Epoch {epoch}: DEMOCRATIC bias active (EM={current_em:.1%} < 30%, relmem_op_bias_w=0.0)")
             else:
-                # decay bias slightly after stabilization
-                topas_model.config.relmem_op_bias_w = 0.3
-            print(f"[RelMem] Epoch {epoch}: bias_w={topas_model.config.relmem_op_bias_w:.3f}")
+                # Performance milestone reached - start ramping RelMem
+                if hasattr(topas_model.config, 'relmem_op_bias_w'):
+                    # Ramp based on epochs AFTER reaching 30% EM
+                    epochs_since_milestone = epoch - globals().get("milestone_epoch", epoch)
+                    progress = min(1.0, epochs_since_milestone / 20.0)
+                    topas_model.config.relmem_op_bias_w = 0.2 + progress * (0.5 - 0.2)
+                    print(f"[RelMem] Epoch {epoch}: EM={current_em:.1%} ≥ 30%, bias_w={topas_model.config.relmem_op_bias_w:.3f}")
+
+                    # Record when we first hit the milestone
+                    if "milestone_epoch" not in globals():
+                        globals()["milestone_epoch"] = epoch
+                        print(f"[Milestone] EM ≥ 30% achieved at epoch {epoch}!")
+        else:
+            # Fallback to existing RelMem ramp (non-democratic mode)
+            if hasattr(topas_model.config, 'relmem_op_bias_w'):
+                if epoch < 30:
+                    # Hold at 0.2 for first 30 epochs (magic-run fidelity)
+                    topas_model.config.relmem_op_bias_w = 0.2
+                else:
+                    # Then ramp to 0.5 over next 20 epochs
+                    progress = min(1.0, (epoch - 30) / 20.0)
+                    topas_model.config.relmem_op_bias_w = 0.2 + progress * (0.5 - 0.2)
+                print(f"[RelMem] Epoch {epoch}: bias_w={topas_model.config.relmem_op_bias_w:.3f}")
         
         print(f"\n📈 Epoch {epoch + 1}/{num_epochs}")
-        if cli_args.bucket_unlock_patience and cli_args.bucket_unlock_patience > 0:
-            print(f"[Bucket] Active bucket: {active_bucket}/{bucket_count}")
+        # Expose epoch counter globally for ARC2Dataset curriculum
+        globals()["CURRENT_EPOCH"] = epoch
+
+        # Reset dataloader epoch so shuffle & curriculum gating align
+        if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
+            dataloader.sampler.set_epoch(epoch)
+
+        if bucket_unlock_patience and bucket_unlock_patience > 0:
+            print(f"[Bucket] Active bucket: {active_bucket}")
         epoch_losses = []
         epoch_metrics = {'exact_match': [], 'accuracy': [], 'mean_iou': [], 'exact_match_refined': []}
         from tqdm import tqdm
@@ -1801,8 +1877,13 @@ def main():
                         continue
             except Exception:
                 pass
-            
-                        # Compute metrics every 10 steps
+
+            # Get demos and test data
+            demos, test_inputs, test_outputs, task_id = batch
+            num_examples = len(test_inputs) if test_inputs else 1
+            print(f"[Task Debug] task_id={task_id} test_cases={num_examples}")
+
+            # Compute metrics every 10 steps
             compute_metrics_now = (global_step % 10 == 0)
 
             # === Phase 2: Meta-learning loop ===
@@ -1818,12 +1899,27 @@ def main():
                 except Exception as e:
                     print(f"[Meta-Learning] Error at step {global_step}: {e}")
 
-            result = train_step(
-                topas_model, hrm_model, batch,
-                optimizer, scaler, device,
-                return_metrics=compute_metrics_now,
-                global_step=global_step
-            )
+            # Process each test case separately for dense replay
+            if test_inputs and len(test_inputs) > 1:
+                for t_in, t_out in zip(test_inputs, test_outputs or [None]*len(test_inputs)):
+                    sub_batch = (demos, [t_in], [t_out] if t_out is not None else None, task_id)
+                    result = train_step(
+                        topas_model, hrm_model, sub_batch,
+                        optimizer, scaler, device,
+                        return_metrics=compute_metrics_now,
+                        global_step=global_step
+                    )
+                    progress.update(1)
+                    global_step += 1
+            else:
+                result = train_step(
+                    topas_model, hrm_model, batch,
+                    optimizer, scaler, device,
+                    return_metrics=compute_metrics_now,
+                    global_step=global_step
+                )
+                progress.update(1)
+                global_step += 1
 
             # === Dopamine capture & planner priors ===
             if compute_metrics_now and isinstance(result, tuple):
@@ -1833,21 +1929,18 @@ def main():
                     rolling_em.append(em_val)
                     
                     # Curriculum unlock: promote buckets when stable high EM
-                    try:
-                        if em_val >= 0.90:
-                            bucket_streak += 1
-                        else:
-                            bucket_streak = 0
-                        if bucket_streak >= bucket_unlock_patience:
-                            if active_bucket == "easy":
-                                active_bucket = "medium"
-                                logger.info("[Curriculum] Unlocked MEDIUM tasks")
-                            elif active_bucket == "medium":
-                                active_bucket = "hard"
-                                logger.info("[Curriculum] Unlocked HARD tasks")
-                            bucket_streak = 0
-                    except Exception:
-                        pass
+                    if em_val >= 0.90:
+                        bucket_streak += 1
+                    else:
+                        bucket_streak = 0
+                    if bucket_streak >= bucket_unlock_patience:
+                        if active_bucket == "easy":
+                            active_bucket = "medium"
+                            logger.info("[Curriculum] Unlocked MEDIUM tasks")
+                        elif active_bucket == "medium":
+                            active_bucket = "hard"
+                            logger.info("[Curriculum] Unlocked HARD tasks")
+                        bucket_streak = 0
                     
                                         # reconstruct current task from batch for trace gen / buffer
                     demos, test_inputs, test_outputs, task_id = batch
@@ -1987,7 +2080,9 @@ def main():
 
                             # Alpha-ARC X: Add successful programs to replay buffer (always stringified)
                             if replay_buffer is not None:
-                                priority = float(advantage) + 0.1  # Ensure positive priority
+                                # Prioritize hot traces with exponential weighting
+                                import math
+                                priority = math.exp(3.0 * float(advantage))  # k=3 exponential amplification
                                 try:
                                     for t in good_traces:
                                         if hasattr(t, "operations") and t.operations:
@@ -2331,7 +2426,7 @@ def main():
                     except Exception:
                         pass
 
-            global_step += 1
+            # global_step is now incremented in the dense replay loop above
 
             # Update progress bar
             if len(epoch_losses) > 0:
@@ -2408,6 +2503,11 @@ def main():
                 avg_acc = sum(epoch_metrics['accuracy']) / len(epoch_metrics['accuracy'])
                 avg_iou = sum(epoch_metrics['mean_iou']) / len(epoch_metrics['mean_iou'])
                 summary += f", EM={avg_em:.2%}, acc={avg_acc:.2%}, IoU={avg_iou:.3f}"
+
+                # Store EM for performance-triggered bias scheduling
+                globals()["last_epoch_em"] = avg_em
+                if avg_em > best_em:
+                    best_em = avg_em
                 
                 # Add EBR refined exact match if available
                 if len(epoch_metrics['exact_match_refined']) > 0:
