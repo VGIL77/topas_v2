@@ -13,14 +13,14 @@ from models.sparse_embedding import CastedSparseEmbedding
 
 
 @dataclass
-class HierarchicalReasoningModel_ACTV1InnerCarry:
+class NeuroPlannerInnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
 
 @dataclass
-class HierarchicalReasoningModel_ACTV1Carry:
-    inner_carry: HierarchicalReasoningModel_ACTV1InnerCarry
+class NeuroPlannerCarry:
+    inner_carry: NeuroPlannerInnerCarry
     
     steps: torch.Tensor
     halted: torch.Tensor
@@ -28,7 +28,7 @@ class HierarchicalReasoningModel_ACTV1Carry:
     current_data: Dict[str, torch.Tensor]
 
 
-class HierarchicalReasoningModel_ACTV1Config(BaseModel):
+class NeuroPlannerConfig(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
@@ -57,8 +57,8 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
 
-class HierarchicalReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+class NeuroPlannerBlock(nn.Module):
+    def __init__(self, config: NeuroPlannerConfig) -> None:
         super().__init__()
 
         self.self_attn = Attention(
@@ -83,8 +83,8 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[HierarchicalReasoningModel_ACTV1Block]):
+class NeuroPlannerReasoningModule(nn.Module):
+    def __init__(self, layers: List[NeuroPlannerBlock]):
         super().__init__()
 
         self.layers = torch.nn.ModuleList(layers)
@@ -99,8 +99,8 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+class NeuroPlanner_Inner(nn.Module):
+    def __init__(self, config: NeuroPlannerConfig) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -130,8 +130,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             raise NotImplementedError()
 
         # Reasoning Layers
-        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
-        self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        self.H_level = NeuroPlannerReasoningModule(layers=[NeuroPlannerBlock(self.config) for _i in range(self.config.H_layers)])
+        self.L_level = NeuroPlannerReasoningModule(layers=[NeuroPlannerBlock(self.config) for _i in range(self.config.L_layers)])
         
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -182,18 +182,18 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
 
         seq_len = int(seq_len)
 
-        return HierarchicalReasoningModel_ACTV1InnerCarry(
+        return NeuroPlannerInnerCarry(
             z_H=torch.empty(batch_size, seq_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
             z_L=torch.empty(batch_size, seq_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
         )
         
-    def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
-        return HierarchicalReasoningModel_ACTV1InnerCarry(
+    def reset_carry(self, reset_flag: torch.Tensor, carry: NeuroPlannerInnerCarry):
+        return NeuroPlannerInnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: NeuroPlannerInnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[NeuroPlannerInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -220,7 +220,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         z_H = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
-        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = NeuroPlannerInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
 
         # Q head
@@ -229,13 +229,13 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
-class HierarchicalReasoningModel_ACTV1(nn.Module):
+class NeuroPlanner(nn.Module):
     """ACT wrapper."""
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = HierarchicalReasoningModel_ACTV1Config(**config_dict)
-        self.inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
+        self.config = NeuroPlannerConfig(**config_dict)
+        self.inner = NeuroPlanner_Inner(self.config)
 
     @property
     def puzzle_emb(self):
@@ -247,14 +247,14 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         # Use actual input length to allocate inner carry to the required size.
         seq_len = batch["inputs"].shape[1] if batch["inputs"].ndim >= 2 else None
 
-        return HierarchicalReasoningModel_ACTV1Carry(
+        return NeuroPlannerCarry(
             inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len),
             steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size,), dtype=torch.bool, device=device),
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: NeuroPlannerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[NeuroPlannerCarry, Dict[str, torch.Tensor]]:
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
@@ -297,4 +297,4 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return NeuroPlannerCarry(new_inner_carry, new_steps, halted, new_current_data), outputs

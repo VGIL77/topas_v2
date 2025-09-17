@@ -34,9 +34,10 @@ class ARC2Dataset(Dataset):
     """
 
     def __init__(self, challenge_file: str, solution_file: Optional[str] = None,
-                 device: str = "cpu", max_grid_size: int = 30):
+                 device: str = "cpu", max_grid_size: int = 30, min_test_cases: int = 0):
         self.device = device
         self.max_grid_size = max_grid_size
+        self.min_test_cases = min_test_cases
 
         if not os.path.exists(challenge_file):
             raise FileNotFoundError(f"Challenge file not found: {challenge_file}")
@@ -50,7 +51,15 @@ class ARC2Dataset(Dataset):
         else:
             self.solutions = None
 
-        self.task_ids = list(self.challenges.keys())
+        # Hard-mode curriculum shaping: only load puzzles with >= min_test_cases
+        self.task_ids = []
+        for tid, task in self.challenges.items():
+            test_cases = task.get("test", [])
+            if len(test_cases) >= self.min_test_cases:
+                self.task_ids.append(tid)
+
+        if self.min_test_cases > 0:
+            logger.info(f"[Curriculum] Loaded {len(self.task_ids)}/{len(self.challenges)} puzzles with ≥{self.min_test_cases} test cases")
 
     def __len__(self) -> int:
         return len(self.task_ids)
@@ -58,6 +67,19 @@ class ARC2Dataset(Dataset):
     def __getitem__(self, idx: int):
         tid = self.task_ids[idx]
         task = self.challenges[tid]
+
+        # Curriculum Warmup (epochs 0-4): skip trivial puzzles
+        # Guard so Dream pretrain (before epochs start) never breaks
+        current_epoch = globals().get("CURRENT_EPOCH", 9999)
+        if current_epoch < 5:
+            test_inputs_raw = task.get("test", [])
+            if test_inputs_raw:
+                first_test = test_inputs_raw[0].get("input", [])
+                H = len(first_test) if first_test else 0
+                W = len(first_test[0]) if first_test and first_test[0] else 0
+                if (H < 8 or W < 8) or (len(test_inputs_raw) < 2):
+                    # Strict skip (no resample)
+                    raise StopIteration("Skipped trivial puzzle due to curriculum gating")
 
         # Demos (train pairs)
         demos = []

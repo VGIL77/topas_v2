@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
@@ -239,7 +240,16 @@ class DreamEngine:
     def attach_relmem(self, relmem):
         """Attach a relational memory module for dream-gated plasticity."""
         self._relmem = relmem
-        
+
+        # Add projection layer if dimensions mismatch
+        if hasattr(relmem, 'D') and relmem.D != self.cfg.state_dim:
+            import logging
+            logging.info(f"[DreamEngine] Creating projection: state_dim={self.cfg.state_dim} → RelMem.D={relmem.D}")
+            self._relmem_proj = nn.Linear(self.cfg.state_dim, relmem.D).to(self.device)
+            nn.init.xavier_uniform_(self._relmem_proj.weight)
+        else:
+            self._relmem_proj = None
+
         self.nmda = NMDAGatedDreaming(
             state_dim=self.cfg.state_dim, action_dim=self.cfg.action_dim, device=self.device
         )
@@ -936,26 +946,25 @@ class DreamEngine:
             ripple_ctx = self.ripple.get_current_context() if self.ripple.is_ripple_active() else None
             losses.append(self.nmda.dream_consolidation(valence, arousal, ripple_ctx) or 0.0)
 
-        # --- Dream-gated RelMem plasticity ---
-        # Gate on valence/arousal (biologically-inspired) and scale by CIO/ripple knobs
+        # --- Dream-gated RelMem plasticity (phase-locked) ---
         try:
-            if self._relmem is not None:
-                # Determine thresholds (balanced defaults; tune as needed)
-                v_hebb, a_hebb = 0.50, 0.30
-                v_wta,  a_wta  = 0.70, 0.50
-                # CIO/ripple knobs for "how much" plasticity this window gets
+            if self._relmem is not None and ripple_ctx is not None:
+                coh = ripple_ctx.coherence
+                phase_bin = ripple_ctx.phase_bin
                 scale = float(self.cfg.stdp_gain) * float(self.cfg.ripple_rate_hz)
-                # Apply Hebbian when pleasant & engaged
-                if valence > v_hebb and arousal > a_hebb:
+
+                # Hebbian updates only during coherent ripples in early replay phases
+                if coh > 0.7 and phase_bin in [0, 1, 2]:
                     self._relmem.apply_hebbian()
-                # Apply WTA when very pleasant & strongly engaged
-                if valence > v_wta and arousal > a_wta:
-                    # Optional: call multiple times to reflect scale (bounded)
+
+                # WTA inhibition during late-phase high-coherence ripples
+                if coh > 0.8 and phase_bin in [5, 6, 7]:
                     reps = int(min(3, max(1, round(scale))))
                     for _ in range(reps):
                         self._relmem.apply_wta()
-        except Exception:
-            pass
+        except Exception as e:
+            if self.cfg.verbose:
+                print(f"[Dream→RelMem] plasticity skipped: {e}")
 
         # Get ripple metrics with reset for next cycle
         ripple_metrics = self.ripple.metrics(reset=True)

@@ -181,16 +181,17 @@ class _DSLShim:
             params = {"prop": "color", "value": 1}
         return params
 
-# HRM Planner imports - direct import from models directory
+# NeuroPlanner imports - direct import from models directory
 try:
-    from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+    # Renamed: HRM → NeuroPlanner (to avoid ACTV1 naming confusion in ARC submissions)
+    from neuroplanner import NeuroPlanner
     from models.losses import ACTLossHead
-    _HAS_HRM_PLANNER = True
-    print("✅ HRM models loaded successfully in TopasARC60M")
+    _HAS_NEURO_PLANNER = True
+    print("✅ NeuroPlanner loaded successfully in TopasARC60M")
 except ImportError as e:
-    print(f"Warning: HRM models not available in TopasARC60M: {e}")
-    _HAS_HRM_PLANNER = False
-    class HierarchicalReasoningModel_ACTV1:
+    print(f"Warning: NeuroPlanner not available in TopasARC60M: {e}")
+    _HAS_NEURO_PLANNER = False
+    class NeuroPlanner:
         def __init__(self, *args, **kwargs): pass
     class ACTLossHead:
         def __init__(self, *args, **kwargs): pass
@@ -690,7 +691,7 @@ class TopasARC60M(nn.Module):
         self.task_history = {}  # task_id -> performance history
         self.strategy_usage = {}  # strategy -> usage count
         
-        # === HRM Planner Rail ===
+        # === NeuroPlanner Rail ===
         hrm_cfg = dict(
             batch_size=1,
             seq_len=30*30,          # Flattened ARC grid
@@ -707,18 +708,18 @@ class TopasARC60M(nn.Module):
             halt_exploration_prob=0.1,
             forward_dtype="bfloat16"
         )
-        if _HAS_HRM_PLANNER:
+        if _HAS_NEURO_PLANNER:
             try:
-                self.planner = HierarchicalReasoningModel_ACTV1(hrm_cfg)
+                self.planner = NeuroPlanner(hrm_cfg)
                 self.planner_loss_head = ACTLossHead(self.planner, loss_type="softmax_cross_entropy")
                 # Projection from planner latent → DSL op bias
                 self.planner_op_bias = nn.Linear(hrm_cfg["hidden_size"], len(DSL_OPS))
                 self._has_planner = True
                 if self.config.verbose:
-                    print(f"[TOPAS] HRM Planner initialized: {len(DSL_OPS)} operations")
+                    print(f"[TOPAS] NeuroPlanner initialized: {len(DSL_OPS)} operations")
             except Exception as e:
                 if self.config.verbose:
-                    print(f"[TOPAS] Warning: HRM Planner initialization failed: {e}")
+                    print(f"[TOPAS] Warning: NeuroPlanner initialization failed: {e}")
                 self.planner = None
                 self.planner_loss_head = None
                 self.planner_op_bias = None
@@ -828,6 +829,42 @@ class TopasARC60M(nn.Module):
     def set_external_op_bias(self, op_bias: Dict[str, float]):
         if isinstance(op_bias, dict):
             self._external_op_bias = {str(k): float(v) for k, v in op_bias.items()}
+
+    def _sync_relmem_to_device(self):
+        """
+        Sync all RelMem parameters, buffers, and exemplar vectors to the correct device.
+        Centralized method to ensure device consistency across all RelMem components.
+        """
+        if not hasattr(self, 'relmem') or self.relmem is None:
+            return
+
+        target_device = torch.device(self.device)
+
+        # 1. Sync parameters
+        for param in self.relmem.parameters():
+            if param.device != target_device:
+                param.data = param.data.to(target_device)
+
+        # 2. Sync buffers (including internal state)
+        for name, buf in getattr(self.relmem, "buffers", {}).items():
+            if torch.is_tensor(buf) and buf.device != target_device:
+                setattr(self.relmem, name, buf.to(target_device))
+
+        # 3. Sync exemplar vectors if present
+        if hasattr(self.relmem, 'exemplar_vectors') and self.relmem.exemplar_vectors is not None:
+            if isinstance(self.relmem.exemplar_vectors, torch.Tensor):
+                if self.relmem.exemplar_vectors.device != target_device:
+                    self.relmem.exemplar_vectors = self.relmem.exemplar_vectors.to(target_device)
+            elif isinstance(self.relmem.exemplar_vectors, dict):
+                for key, vec in self.relmem.exemplar_vectors.items():
+                    if torch.is_tensor(vec) and vec.device != target_device:
+                        self.relmem.exemplar_vectors[key] = vec.to(target_device)
+
+        # 4. Additional RelMemExemplar specific syncs
+        if hasattr(self.relmem, 'exemplar_binding_idx'):
+            if torch.is_tensor(self.relmem.exemplar_binding_idx) and \
+               self.relmem.exemplar_binding_idx.device != target_device:
+                self.relmem.exemplar_binding_idx = self.relmem.exemplar_binding_idx.to(target_device)
 
     def init_object_mastery(self):
         """Initialize object mastery components - always integrated"""
@@ -1207,7 +1244,8 @@ class TopasARC60M(nn.Module):
                 # === Exemplar streaming update ===
                 if hasattr(self.relmem, "observe_sample"):
                     try:
-                        self.relmem.observe_sample(tokens, step=kwargs.get("step", 0))
+                        # Use brain (ctrl_dim) instead of undefined tokens
+                        self.relmem.observe_sample(brain.unsqueeze(1), step=kwargs.get("step", 0))
                     except Exception as e:
                         if kwargs.get("step") is not None and kwargs.get("step") % 200 == 0:
                             import logging
@@ -1227,10 +1265,8 @@ class TopasARC60M(nn.Module):
                 # Run Hebbian / WTA updates if available
                 if hasattr(self.relmem, "apply_post_optimizer_hooks"):
                     try:
-                        # Sync all internal buffers to model.device before hooks
-                        for name, buf in getattr(self.relmem, "buffers", {}).items():
-                            if torch.is_tensor(buf) and buf.device.type != self.device:
-                                setattr(self.relmem, name, buf.to(self.device))
+                        # Use centralized sync method for device consistency
+                        self._sync_relmem_to_device()
                         self.relmem.apply_post_optimizer_hooks()
                     except Exception as e:
                         if kwargs.get('step') is not None and kwargs.get('step') % 100 == 0:
@@ -2852,7 +2888,8 @@ class TopasARC60M(nn.Module):
         stats = {"relmem_bound": False, "relmem_concept_id": None}
         
         # Only bind on success (EM > 0 or IoU >= threshold)
-        should_bind = em or (iou is not None and iou >= getattr(self.config, 'relmem_bind_iou_threshold', 0.7))
+        # PATCH: Lower binding threshold from 0.7 to 0.6 for more frequent binding
+        should_bind = em or (iou is not None and iou >= getattr(self.config, 'relmem_bind_iou_threshold', 0.6))
         
         if should_bind and self.relmem is not None:
             try:

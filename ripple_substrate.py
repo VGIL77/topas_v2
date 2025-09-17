@@ -534,6 +534,15 @@ class RippleSubstrate:
     def get_current_context(self) -> RippleContext:
         """Get current ripple context"""
         return self.context
+
+    def replay_weight(self) -> float:
+        """
+        Compute replay weighting factor based on coherence × phase alignment.
+        High coherence and early-phase bursts = strong replay weighting.
+        """
+        coh = self.context.coherence
+        align = self.get_replay_alignment()
+        return float(coh * align)
     
     def metrics(self, reset: bool = False) -> Dict[str, Any]:
         """Get ripple metrics with optional reset

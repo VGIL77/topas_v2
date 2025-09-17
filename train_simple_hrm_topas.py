@@ -28,7 +28,7 @@ try:
 except ImportError:
     ARC2Dataset = None
 from models.topas_arc_60M import TopasARC60M, ModelConfig
-from models.hrm.hrm_act_v1 import HierarchicalReasoningModel_ACTV1
+from neuroplanner import NeuroPlanner
 from trainers.self_play import SelfPlayBuffer  # used for storing dopamine rewards
 from trainers.self_critique.counterexamples import CounterexampleGenerator, Task  # Task wrapper + counterexamples
 from trainers.self_critique.star_bootstrapper import STaRBootstrapper           # STaR trace gen + verification
@@ -215,32 +215,12 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
         # one forward to get policy priors (dsl_op_logits) on this state
         try:
             out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
-
-            # Handle both dict and tuple returns
-            if isinstance(out, dict):
-                extras = out.get("extras", {})
-                logits = extras.get("dsl_op_logits") or extras.get("policy_logits") or out.get("dsl_op_logits")
-                value = float(out.get("value_logit", 0.0)) if "value_logit" in out else 0.0
-            elif isinstance(out, tuple) and len(out) >= 2:
-                # Tuple format: (priors, value) or similar
-                priors_data, value_data = out[0], out[1]
-                if isinstance(priors_data, dict):
-                    logits = None  # priors already in dict format
-                    prior = priors_data
-                else:
-                    logits = priors_data  # tensor format
-                value = float(value_data) if value_data is not None else 0.0
-            else:
-                return {}
-
-            if logits is not None:
-                if isinstance(logits, torch.Tensor):
-                    probs = torch.softmax(logits[0] if logits.dim() > 1 else logits, dim=-1).detach().cpu().numpy().tolist()
-                    from models.dsl_registry import DSL_OPS
-                    prior = {op: float(p) for op, p in zip(DSL_OPS, probs)}
-                else:
-                    prior = {}
-
+            extras = out.get("extras", {}) if isinstance(out, dict) else {}
+            logits = extras.get("dsl_op_logits") or extras.get("policy_logits")
+            if logits is None: return {}
+            probs = torch.softmax(logits[0], dim=-1).detach().cpu().numpy().tolist()
+            from models.dsl_registry import DSL_OPS
+            prior = {op: float(p) for op, p in zip(DSL_OPS, probs)}
             # root Dirichlet
             import numpy as np
             if len(prior) and cli_args.root_dirichlet_eps > 0:
@@ -257,22 +237,8 @@ def _puct_plan_stepwise(model, demos, test_input, target_grid, cli_args, device)
     def value_fn(grid_s):
         try:
             out = model.forward_pretraining(grid_s.unsqueeze(0), target_shape=target_grid.shape[-2:], demos=demos)
-
-            # Handle both dict and tuple returns
-            if isinstance(out, dict):
-                v = out.get("extras", {}).get("value_logit") or out.get("value_logit")
-            elif isinstance(out, tuple) and len(out) >= 2:
-                # Tuple format: (priors, value)
-                v = out[1]
-            else:
-                v = None
-
-            if v is not None:
-                if isinstance(v, torch.Tensor):
-                    return torch.sigmoid(v)[0].item() if v.numel() > 0 else 0.1
-                else:
-                    return float(v)
-            return 0.1
+            v = out.get("extras", {}).get("value_logit")
+            return torch.sigmoid(v)[0].item() if v is not None else 0.1
         except Exception:
             return 0.1
 
@@ -768,6 +734,14 @@ def parse_args():
                         help="Beam width for evaluation beam search (overrides model config).")
     parser.add_argument("--ebr-steps", type=int, default=None,
                         help="Number of EBR refinement steps (overrides model config).")
+    parser.add_argument("--ebr-lambda-prior", type=float, default=2e-2,
+                        help="EBR regularization weight for prior energy (safe default: 2e-2)")
+    parser.add_argument("--ebr-w-phi", type=float, default=0.4,
+                        help="EBR weight for phi factor (safe default: 0.4)")
+    parser.add_argument("--ebr-w-kappa", type=float, default=0.3,
+                        help="EBR weight for kappa factor (safe default: 0.3)")
+    parser.add_argument("--ebr-w-cge", type=float, default=0.3,
+                        help="EBR weight for CGE factor (safe default: 0.3)")
     
     # Training args
     parser.add_argument("--max-steps", type=int, default=60000,
@@ -1072,8 +1046,8 @@ def create_models(device, cli_args=None):
         "halt_exploration_prob": 0.1,
         "forward_dtype": "bfloat16",
     }
-    hrm_model = HierarchicalReasoningModel_ACTV1(hrm_config).to(device)
-    print(f"✅ HRM: {sum(p.numel() for p in hrm_model.parameters()):,} parameters")
+    hrm_model = NeuroPlanner(hrm_config).to(device)
+    print(f"✅ NeuroPlanner: {sum(p.numel() for p in hrm_model.parameters()):,} parameters")
 
     # Initialize PriorNet if enabled
     if cli_args and getattr(cli_args, "enable_priornet", False):
@@ -1810,34 +1784,14 @@ def main():
     bucket_count = 8
     bucket_size = math.ceil(len(dataset) / bucket_count) if len(dataset) > 0 else 1
     
-    # Track best EM for performance-triggered bias ramping
-    best_em = 0.0
-
     for epoch in range(num_epochs):
-        # === Performance-triggered bias scheduling ===
-        current_em = globals().get("last_epoch_em", 0.0)
-
-        if getattr(topas_model.config, "use_democratic_bias", False):
-            # Stay democratic until we achieve 30% EM
-            if current_em < 0.30:
-                # Force uniform op priors
-                topas_model.config.relmem_op_bias_w = 0.0
-                print(f"[Bias] Epoch {epoch}: DEMOCRATIC bias active (EM={current_em:.1%} < 30%, relmem_op_bias_w=0.0)")
-            else:
-                # Performance milestone reached - start ramping RelMem
-                if hasattr(topas_model.config, 'relmem_op_bias_w'):
-                    # Ramp based on epochs AFTER reaching 30% EM
-                    epochs_since_milestone = epoch - globals().get("milestone_epoch", epoch)
-                    progress = min(1.0, epochs_since_milestone / 20.0)
-                    topas_model.config.relmem_op_bias_w = 0.2 + progress * (0.5 - 0.2)
-                    print(f"[RelMem] Epoch {epoch}: EM={current_em:.1%} ≥ 30%, bias_w={topas_model.config.relmem_op_bias_w:.3f}")
-
-                    # Record when we first hit the milestone
-                    if "milestone_epoch" not in globals():
-                        globals()["milestone_epoch"] = epoch
-                        print(f"[Milestone] EM ≥ 30% achieved at epoch {epoch}!")
+        # === Bias scheduling ===
+        if getattr(topas_model.config, "use_democratic_bias", False) and epoch < topas_model.config.democratic_epochs:
+            # Force uniform op priors
+            topas_model.config.relmem_op_bias_w = 0.0
+            print(f"[Bias] Epoch {epoch}: DEMOCRATIC bias active (uniform 1/41, relmem_op_bias_w=0.0)")
         else:
-            # Fallback to existing RelMem ramp (non-democratic mode)
+            # Fallback to existing RelMem ramp
             if hasattr(topas_model.config, 'relmem_op_bias_w'):
                 if epoch < 30:
                     # Hold at 0.2 for first 30 epochs (magic-run fidelity)
@@ -2080,9 +2034,7 @@ def main():
 
                             # Alpha-ARC X: Add successful programs to replay buffer (always stringified)
                             if replay_buffer is not None:
-                                # Prioritize hot traces with exponential weighting
-                                import math
-                                priority = math.exp(3.0 * float(advantage))  # k=3 exponential amplification
+                                priority = float(advantage) + 0.1  # Ensure positive priority
                                 try:
                                     for t in good_traces:
                                         if hasattr(t, "operations") and t.operations:
@@ -2503,11 +2455,6 @@ def main():
                 avg_acc = sum(epoch_metrics['accuracy']) / len(epoch_metrics['accuracy'])
                 avg_iou = sum(epoch_metrics['mean_iou']) / len(epoch_metrics['mean_iou'])
                 summary += f", EM={avg_em:.2%}, acc={avg_acc:.2%}, IoU={avg_iou:.3f}"
-
-                # Store EM for performance-triggered bias scheduling
-                globals()["last_epoch_em"] = avg_em
-                if avg_em > best_em:
-                    best_em = avg_em
                 
                 # Add EBR refined exact match if available
                 if len(epoch_metrics['exact_match_refined']) > 0:
@@ -2588,13 +2535,40 @@ def main():
                                     return float(s.get("exact_match_refined") or s.get("em_ebr") or s.get("EM_ebr") or 0.0)
                                 left_score, right_score = score(hemi_stats['left']), score(hemi_stats['right'])
                                 winner = 'left' if left_score >= right_score else 'right'
+                                loser = 'right' if winner == 'left' else 'left'
                                 logging.info(f"[Dream-UniHemi] left={left_score:.3f} right={right_score:.3f} → winner={winner}")
-                                # Small, bounded nudge to priors based on winner
+
+                                # --- Uni-hemi divergent routing (phase-locked traces) ---
+                                # Feed winning traces into dopamine buffer (positive reinforcement)
+                                winner_traces = hemi_stats.get(winner, {}).get('traces', [])
+                                loser_traces = hemi_stats.get(loser, {}).get('traces', [])
+
+                                # Winner traces → dopamine reward
+                                if winner_traces and hasattr(topas_model, '_dream_tokens'):
+                                    # Create a synthetic task from dream tokens for dopamine capture
+                                    try:
+                                        dream_task = {
+                                            'input': topas_model._dream_tokens[:, :topas_model._dream_tokens.size(1)//2],
+                                            'output': topas_model._dream_tokens[:, topas_model._dream_tokens.size(1)//2:]
+                                        }
+                                        dopamine_reward(dream_task, self_play_buffer, logging, global_step,
+                                                      score=float(score(hemi_stats[winner])),
+                                                      components={'hemisphere': winner, 'traces': len(winner_traces)})
+                                        logging.info(f"[Dream-UniHemi] Fed {len(winner_traces)} winning traces to dopamine buffer")
+                                    except Exception as e:
+                                        logging.debug(f"[Dream-UniHemi] Could not feed winner traces: {e}")
+
+                                # Loser traces → nightmare queue (pruning)
+                                if loser_traces:
+                                    recent_failures.extend(loser_traces[:5])  # Cap at 5 traces to avoid overflow
+                                    logging.info(f"[Dream-UniHemi] Fed {min(5, len(loser_traces))} losing traces to nightmare queue")
+
+                                # Small, bounded nudge to priors based on winner (now using _bias_max)
                                 if hasattr(topas_model.config, 'relmem_op_bias_w'):
                                     delta = 0.02 if winner == 'left' else -0.01
+                                    bias_max = getattr(topas_model.config, '_bias_max', 0.5)
                                     topas_model.config.relmem_op_bias_w = float(
-                                        max(0.15, min(getattr(topas_model.config, 'relmem_op_bias_w', 0.2) + delta,
-                                                      getattr(topas_model.config, '_bias_max', 0.5)))
+                                        max(0.15, min(getattr(topas_model.config, 'relmem_op_bias_w', 0.2) + delta, bias_max))
                                     )
                                 # Optionally skew planner op_bias success counts slightly
                                 if winner == 'left':

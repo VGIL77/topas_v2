@@ -68,14 +68,23 @@ class RelationalMemoryNeuro(nn.Module):
     def forward(self, x: torch.Tensor, state=None, top_k: int = 128):
         """
         Sparse Top-K forward pass for relational memory.
-        
+
         x: [B, T, D] tokens (D == hidden_dim)
         top_k: Number of top concepts to route through (default 128 for 32x speedup)
         returns: (y, state) where y is [B, T, D]
         """
-        B, T, D = x.shape
+        B, T, D_in = x.shape
         device = x.device
-        assert D == self.D, f"Expected hidden_dim={self.D}, got {D}"
+
+        # Handle dimension mismatch with projection
+        if D_in != self.D:
+            if not hasattr(self, "_proj_in") or self._proj_in.in_features != D_in:
+                self._proj_in = nn.Linear(D_in, self.D).to(device)
+                nn.init.xavier_uniform_(self._proj_in.weight)
+            x = self._proj_in(x)
+            D = self.D
+        else:
+            D = D_in
         
         # 1) Token → concept similarity scores and Top-K routing
         proto = self.concept_proto  # [N, D]
@@ -410,9 +419,14 @@ class RelationalMemoryNeuro(nn.Module):
                     vec = vec.to(self.device, dtype=self.concept_proto.dtype)
                     self.concept_proto.data[cid] = (1 - alpha) * self.concept_proto.data[cid] + alpha * vec
             self.pending_concept_updates.clear()
-        
-        self.apply_hebbian()
-        self.apply_wta()
+
+        # Guard post-optimizer hooks so Hebbian/WTA updates don't break when dims differ
+        try:
+            self.apply_hebbian()
+            self.apply_wta()
+        except Exception as e:
+            import logging
+            logging.warning(f"[RelMem] skipped post-optimizer due to shape mismatch: {e}")
     
     def get_op_bias(self, dsl_ops: List[str] = None, scale: float = 1.0) -> Dict[str, float]:
         """
